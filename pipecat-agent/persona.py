@@ -1,20 +1,13 @@
 """Build LLM system prompt from avatar persona and knowledge."""
 from loguru import logger
 
-from api_client import get_avatar_safe, get_scene_safe
 
-
-async def build_system_prompt(
-    avatar_id: str | None = None,
-    scene_id: str | None = None,
+def build_system_prompt(
+    avatar: dict | None = None,
+    scene: dict | None = None,
 ) -> str:
-    """Build a system prompt that gives the LLM the avatar's personality and scene context."""
+    """Build a system prompt from avatar persona/knowledge and scene context."""
 
-    # Fetch avatar data
-    avatar = await get_avatar_safe(avatar_id) if avatar_id else None
-    scene = await get_scene_safe(scene_id) if scene_id else None
-
-    # Build persona section
     persona_section = _build_persona_section(avatar)
     knowledge_section = _build_knowledge_section(avatar)
     scene_section = _build_scene_section(scene)
@@ -29,15 +22,21 @@ Avoid special characters, markdown formatting, or overly long responses.
 
 {scene_section}
 
+## Vision
+- You have been shown the scene's background image. You can reference what you see in it.
+- You have a tool called `capture_what_i_see` that captures a live video frame.
+- Use this tool when a visitor asks you to look at or describe what's currently on screen.
+
 ## Conversation Guidelines
 - Speak naturally as if in a real conversation
 - Keep responses concise (1-3 sentences for simple questions, longer for complex ones)
 - Stay in character with the persona described above
 - If asked about something outside your knowledge, acknowledge it honestly
 - Be warm, engaging, and helpful
-- When discussing the scene, reference specific elements you can see
 """
 
+    avatar_id = avatar.get("id") if avatar else None
+    scene_id = scene.get("id") if scene else None
     logger.info(f"Built system prompt ({len(prompt)} chars) for avatar={avatar_id}, scene={scene_id}")
     return prompt
 
@@ -69,6 +68,28 @@ def _build_persona_section(avatar: dict | None) -> str:
         else:
             parts.append(f"Your tone is: {tones}.")
 
+    if persona.get("purposes"):
+        purposes = persona["purposes"]
+        if isinstance(purposes, list):
+            parts.append(f"Your purpose: {', '.join(purposes)}.")
+        else:
+            parts.append(f"Your purpose: {purposes}.")
+
+    if persona.get("signaturePhrases"):
+        phrases = persona["signaturePhrases"]
+        if isinstance(phrases, list):
+            parts.append(f"Your signature phrases (use them naturally): {', '.join(f'"{p}"' for p in phrases)}.")
+        else:
+            parts.append(f"Your signature phrase: \"{phrases}\".")
+
+    if persona.get("relationshipToUser"):
+        parts.append(f"Your relationship to the creator: {persona['relationshipToUser']}.")
+
+    if persona.get("values"):
+        values = persona["values"]
+        if isinstance(values, list) and values:
+            parts.append(f"Your values: {', '.join(values)}.")
+
     return "\n".join(parts)
 
 
@@ -83,15 +104,42 @@ def _build_knowledge_section(avatar: dict | None) -> str:
     if knowledge.get("background"):
         parts.append(f"Background: {knowledge['background']}")
 
-    if knowledge.get("areasOfExpertise"):
-        expertise = knowledge["areasOfExpertise"]
-        if isinstance(expertise, list):
+    if knowledge.get("expertise"):
+        expertise = knowledge["expertise"]
+        if isinstance(expertise, list) and expertise:
             parts.append(f"Areas of expertise: {', '.join(expertise)}")
-        else:
+        elif expertise:
             parts.append(f"Areas of expertise: {expertise}")
 
-    if knowledge.get("customInstructions"):
-        parts.append(f"Special instructions: {knowledge['customInstructions']}")
+    if knowledge.get("importantPeople"):
+        people = knowledge["importantPeople"]
+        if isinstance(people, list) and people:
+            people_strs = [f"{p['name']} ({p.get('relationship', 'unknown')})" for p in people if p.get("name")]
+            if people_strs:
+                parts.append(f"Important people in your life: {', '.join(people_strs)}.")
+
+    if knowledge.get("preferences"):
+        parts.append(f"Preferences: {knowledge['preferences']}")
+
+    if knowledge.get("memories"):
+        memories = knowledge["memories"]
+        if isinstance(memories, list) and memories:
+            parts.append("Personal memories:")
+            for m in memories:
+                if isinstance(m, str):
+                    parts.append(f"- {m}")
+                elif isinstance(m, dict) and m.get("text"):
+                    parts.append(f"- {m['text']}")
+
+    if knowledge.get("notes"):
+        notes = knowledge["notes"]
+        if isinstance(notes, list) and notes:
+            parts.append("Notes:")
+            for n in notes:
+                if isinstance(n, str):
+                    parts.append(f"- {n}")
+                elif isinstance(n, dict) and n.get("text"):
+                    parts.append(f"- {n['text']}")
 
     return "\n".join(parts) if len(parts) > 1 else ""
 
@@ -103,18 +151,25 @@ def _build_scene_section(scene: dict | None) -> str:
 
     parts = [f"## Current Scene: {scene.get('title', 'Untitled')}"]
 
-    elements = scene.get("elements", [])
+    # Background info
+    canvas = scene.get("canvasState", {})
+    bg = canvas.get("background", {})
+    if bg.get("label"):
+        parts.append(f"Background: {bg['label']}")
+
+    # Elements are nested inside canvasState
+    elements = canvas.get("elements", [])
     if elements:
         parts.append("Elements on the canvas:")
         for el in elements:
             el_type = el.get("type", "unknown")
-            props = el.get("properties", {})
-            content = props.get("content", "")
+            content = el.get("content")
             desc = f"- {el_type}"
             if content:
                 desc += f': "{content}"'
             parts.append(desc)
 
+    # Scripts are top-level
     scripts = scene.get("scripts", [])
     if scripts:
         parts.append("\nScripts (dialogue):")

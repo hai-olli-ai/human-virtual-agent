@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Pipecat voice agent for Human Virtual avatars"
 requires-python = ">=3.12"
 dependencies = [
-    "pipecat-ai[deepgram,openai,cartesia,silero]",
+    "pipecat-ai[deepgram,openai,cartesia,silero,webrtc]",
     "pipecat-ai-small-webrtc-prebuilt",
     "httpx",
     "python-dotenv",
