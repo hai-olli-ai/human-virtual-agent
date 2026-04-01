@@ -1,0 +1,5 @@
+agent_name = "human-virtual-agent"
+secret_set = "human-virtual-agent-secrets"
+
+[scaling]
+  min_agents = 0
