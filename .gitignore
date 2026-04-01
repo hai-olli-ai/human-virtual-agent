@@ -1,4 +1,5 @@
 pipecat-agent/.env
+pipecat-agent/env.example
 
 # Python
 __pycache__/
