@@ -74,13 +74,15 @@ CAPTURE_TOOL = FunctionSchema(
 )
 
 
-async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+async def run_bot(
+    transport: BaseTransport,
+    runner_args: RunnerArguments,
+    avatar_id: str = "",
+    scene_id: str = "",
+    flow_id: str | None = None,
+):
     """Main bot pipeline."""
     logger.info("Starting Human Virtual voice agent")
-
-    # Get avatar/scene IDs from runner args or defaults
-    avatar_id = getattr(runner_args, "avatar_id", None) or DEFAULT_AVATAR_ID
-    scene_id = getattr(runner_args, "scene_id", None) or DEFAULT_SCENE_ID
 
     # Fetch avatar and scene data from the API
     avatar = await get_avatar_safe(avatar_id)
@@ -207,7 +209,14 @@ async def bot(runner_args: RunnerArguments):
     }
 
     transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport, runner_args)
+
+    # Extract custom data passed via Pipecat Cloud start API body
+    body = getattr(runner_args, "body", {}) or {}
+    avatar_id = body.get("avatar_id") or DEFAULT_AVATAR_ID
+    scene_id = body.get("scene_id") or DEFAULT_SCENE_ID
+    flow_id = body.get("flow_id")
+
+    await run_bot(transport, runner_args, avatar_id=avatar_id, scene_id=scene_id, flow_id=flow_id)
 
 
 def _daily_params():
