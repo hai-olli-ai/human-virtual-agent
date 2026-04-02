@@ -6,5 +6,3 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
 COPY . .
-
-CMD ["python", "bot.py"]

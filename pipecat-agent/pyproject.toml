@@ -10,3 +10,7 @@ dependencies = [
     "python-dotenv",
     "loguru",
 ]
+
+[tool.setuptools]
+py-modules = []
+packages = []
