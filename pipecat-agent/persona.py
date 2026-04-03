@@ -11,6 +11,7 @@ def build_system_prompt(
     persona_section = _build_persona_section(avatar)
     knowledge_section = _build_knowledge_section(avatar)
     scene_section = _build_scene_section(scene)
+    instruction_section = _build_instruction_section(scene)
 
     prompt = f"""You are an AI avatar presenting content to a visitor in a live interactive session.
 Your responses will be spoken aloud via text-to-speech, so keep them conversational and natural.
@@ -21,6 +22,8 @@ Avoid special characters, markdown formatting, or overly long responses.
 {knowledge_section}
 
 {scene_section}
+
+{instruction_section}
 
 ## Vision
 - You have been shown the scene's background image. You can reference what you see in it.
@@ -194,3 +197,15 @@ def _build_scene_section(scene: dict | None) -> str:
                 parts.append(f'- "{text[:100]}{"..." if len(text) > 100 else ""}"')
 
     return "\n".join(parts)
+
+
+def _build_instruction_section(scene: dict | None) -> str:
+    """Build the instruction portion of the system prompt."""
+    if not scene or not scene.get("instruction"):
+        return ""
+    return f"""## Scene Instruction
+Follow these specific instructions for how to interact within this scene:
+{scene['instruction']}
+
+These instructions take priority over general conversation guidelines when they conflict.
+"""
