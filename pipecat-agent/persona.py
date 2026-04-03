@@ -163,11 +163,26 @@ def _build_scene_section(scene: dict | None) -> str:
         parts.append("Elements on the canvas:")
         for el in elements:
             el_type = el.get("type", "unknown")
-            content = el.get("content")
-            desc = f"- {el_type}"
-            if content:
-                desc += f': "{content}"'
-            parts.append(desc)
+            display_mode = el.get("displayMode", "normal")
+
+            if el_type == "avatar":
+                # Tell the agent how the avatar is being displayed
+                mode_desc = {
+                    "normal": "shown as profile photo",
+                    "invisible": "hidden from canvas (voice only)",
+                    "3dgs": "displayed as 3D model",
+                    "talking": "displayed as talking head with lip sync",
+                }.get(display_mode, "shown as profile photo")
+                parts.append(f"- Avatar ({mode_desc})")
+            elif display_mode == "invisible":
+                continue  # Skip invisible non-avatar elements
+            else:
+                props = el.get("properties", {})
+                content = props.get("content", "")
+                desc = f"- {el_type}"
+                if content:
+                    desc += f': "{content}"'
+                parts.append(desc)
 
     # Scripts are top-level
     scripts = scene.get("scripts", [])
