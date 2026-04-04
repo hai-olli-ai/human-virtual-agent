@@ -1,21 +1,31 @@
 """Human Virtual Pipecat voice agent.
 
-Pipeline: Mic + Camera → VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
+Pipeline: Mic → VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
+
+Session 45: Full integration with Session 43 backend endpoints.
+- Persona prompt fetched from backend
+- Scene instruction + display mode awareness
+- Real-time transcript forwarding to frontend via Daily data channel
 
 Local dev:  python bot.py  → opens http://localhost:7860/client
-Production: Deployed to Pipecat Cloud with DailyTransport (Session 38)
+Production: Deployed to Pipecat Cloud with DailyTransport
 """
+import json
+
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.adapters.base_llm_adapter import LLMContext
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, InputImageRawFrame, LLMRunFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMRunFrame,
+    TranscriptionFrame,
+    TextFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.adapters.base_llm_adapter import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
@@ -30,7 +40,6 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 load_dotenv(override=True)
 
-from api_client import get_avatar_safe, get_scene_safe
 from config import (
     CARTESIA_API_KEY,
     CARTESIA_VOICE_ID,
@@ -38,58 +47,106 @@ from config import (
     OPENAI_API_KEY,
     LLM_MODEL,
     DEFAULT_AVATAR_ID,
+    DEFAULT_ROOM_ID,
     DEFAULT_SCENE_ID,
 )
 from persona import build_system_prompt
 
 
-# ── Vision: store the latest video frame for on-demand capture ──
+class TranscriptForwarder(FrameProcessor):
+    """Captures transcription and LLM text frames, forwards them
+    to the frontend via the Daily data channel.
 
+    The frontend listens for 'app-message' events with type 'transcript'.
+    """
 
-class LatestImageCapture(FrameProcessor):
-    """Passes all frames through, but stores the most recent video frame."""
-
-    def __init__(self):
+    def __init__(self, transport: BaseTransport):
         super().__init__()
-        self.latest_frame: InputImageRawFrame | None = None
+        self._transport = transport
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, InputImageRawFrame):
-            self.latest_frame = frame
+
+        # User speech transcription (from STT)
+        if isinstance(frame, TranscriptionFrame) and frame.text:
+            await self._send_transcript("user", frame.text)
+
+        # Bot response text (from LLM, before TTS)
+        if isinstance(frame, TextFrame) and frame.text:
+            await self._send_transcript("avatar", frame.text)
+
+        # Always pass the frame through
         await self.push_frame(frame, direction)
 
+    async def _send_transcript(self, speaker: str, text: str):
+        """Send transcript message via Daily data channel."""
+        try:
+            message = json.dumps({
+                "type": "transcript",
+                "speaker": speaker,
+                "text": text,
+            })
+            if hasattr(self._transport, "send_message"):
+                await self._transport.send_message(message)
+            elif hasattr(self._transport, "output") and hasattr(self._transport.output(), "send_app_message"):
+                await self._transport.output().send_app_message(message)
+        except Exception as e:
+            logger.debug(f"Could not forward transcript: {e}")
 
-# ── Vision: tool definition for the LLM ──
 
-CAPTURE_TOOL = FunctionSchema(
-    name="capture_what_i_see",
-    description=(
-        "Capture and analyze the current live video frame. "
-        "Use this when the visitor asks what you can see, asks you to look at something, "
-        "or asks you to describe what is currently on screen."
-    ),
-    properties={},
-    required=[],
-)
+class SpeakingStateNotifier(FrameProcessor):
+    """Notifies the frontend when the avatar starts/stops speaking.
+
+    Sends 'speaking_state' messages via Daily data channel.
+    """
+
+    def __init__(self, transport: BaseTransport):
+        super().__init__()
+        self._transport = transport
+        self._is_speaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        # TextFrame from LLM means bot is about to speak
+        if isinstance(frame, TextFrame) and frame.text and not self._is_speaking:
+            self._is_speaking = True
+            await self._send_state(True)
+
+        await self.push_frame(frame, direction)
+
+    async def _send_state(self, is_speaking: bool):
+        try:
+            message = json.dumps({
+                "type": "speaking_state",
+                "isSpeaking": is_speaking,
+            })
+            if hasattr(self._transport, "send_message"):
+                await self._transport.send_message(message)
+        except Exception as e:
+            logger.debug(f"Could not send speaking state: {e}")
 
 
 async def run_bot(
     transport: BaseTransport,
     runner_args: RunnerArguments,
+    room_id: str = "",
     avatar_id: str = "",
     scene_id: str = "",
     flow_id: str | None = None,
+    api_url: str | None = None,
 ):
     """Main bot pipeline."""
-    logger.info("Starting Human Virtual voice agent")
+    logger.info(f"Starting Human Virtual voice agent (room={room_id}, avatar={avatar_id})")
 
-    # Fetch avatar and scene data from the API
-    avatar = await get_avatar_safe(avatar_id)
-    scene = await get_scene_safe(scene_id)
-
-    # Build system prompt from avatar persona + scene context
-    system_prompt = build_system_prompt(avatar, scene)
+    # Build system prompt using Session 43 endpoints
+    system_prompt = await build_system_prompt(
+        room_id=room_id,
+        avatar_id=avatar_id,
+        scene_id=scene_id,
+        api_url=api_url,
+    )
+    logger.info(f"System prompt length: {len(system_prompt)} chars")
 
     # ── AI Services ──
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
@@ -110,62 +167,29 @@ async def run_bot(
     )
 
     # ── Conversation Context ──
-    context = LLMContext(
-        tools=ToolsSchema(standard_tools=[CAPTURE_TOOL]),
-    )
-    context_aggregator = LLMContextAggregatorPair(
+    context = LLMContext()
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
         ),
     )
 
-    # ── Vision: inject static background image at boot ──
-    bg_url = None
-    if scene:
-        bg_url = scene.get("canvasState", {}).get("background", {}).get("url")
-    if bg_url:
-        bg_message = LLMContext.create_image_url_message(
-            url=bg_url,
-            text="This is the background image of the scene you are presenting.",
-        )
-        context.add_message(bg_message)
-        logger.info(f"Injected background image into context: {bg_url}")
-
-    # ── Vision: on-demand video frame capture ──
-    image_capture = LatestImageCapture()
-
-    async def handle_capture_what_i_see(params):
-        frame = image_capture.latest_frame
-        if frame:
-            # format is a PIL mode like "RGB"/"RGBA", or None
-            fmt = frame.format or "RGB"
-            await params.context.add_image_frame_message(
-                format=fmt,
-                size=frame.size,
-                image=frame.image,
-                text="This is what you currently see in the live video feed. Describe it to the visitor.",
-            )
-            logger.info(f"Captured live video frame: {frame.size}, format={fmt}")
-            await params.result_callback("Live video frame captured. Describe what you see.")
-        else:
-            logger.warning("No video frame available for capture")
-            await params.result_callback(
-                "No video feed is available right now. Describe the scene based on what you already know."
-            )
-
-    llm.register_function("capture_what_i_see", handle_capture_what_i_see)
+    # ── Transcript forwarding ──
+    transcript_forwarder = TranscriptForwarder(transport)
+    speaking_notifier = SpeakingStateNotifier(transport)
 
     # ── Pipeline ──
     pipeline = Pipeline([
-        transport.input(),                # Visitor's mic + camera (WebRTC)
-        image_capture,                    # Store latest video frame
-        stt,                              # Deepgram: speech → text
-        context_aggregator.user(),        # Add user message to conversation history
-        llm,                              # OpenAI: generate response (with tools)
-        tts,                              # Cartesia: response → speech audio
-        transport.output(),               # Send audio back to visitor (WebRTC)
-        context_aggregator.assistant(),   # Add bot response to conversation history
+        transport.input(),       # Visitor's microphone audio (WebRTC)
+        stt,                     # Deepgram: speech → text
+        transcript_forwarder,    # Forward user transcription to frontend
+        user_aggregator,         # Add user message to conversation history
+        llm,                     # OpenAI: generate response
+        speaking_notifier,       # Notify frontend of speaking state
+        tts,                     # Cartesia: response → speech audio
+        transport.output(),      # Send audio back to visitor (WebRTC)
+        assistant_aggregator,    # Add bot response to conversation history
     ])
 
     # ── Task ──
@@ -181,6 +205,7 @@ async def run_bot(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Visitor connected to live room")
+        # Greet the visitor with the avatar's personality
         context.add_message({
             "role": "developer",
             "content": "A visitor just joined. Greet them warmly and briefly introduce yourself and the scene you're presenting. Keep it to 1-2 sentences.",
@@ -198,13 +223,16 @@ async def run_bot(
 
 
 async def bot(runner_args: RunnerArguments):
-    """Entry point called by Pipecat runner."""
+    """Entry point called by Pipecat runner.
+
+    Extracts room_id, avatar_id, scene_id, flow_id from runner_args.body
+    (passed by the backend's start-session endpoint via Pipecat Cloud API).
+    """
     transport_params = {
         "daily": lambda: _daily_params(),
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            video_in_enabled=True,
         ),
     }
 
@@ -212,11 +240,21 @@ async def bot(runner_args: RunnerArguments):
 
     # Extract custom data passed via Pipecat Cloud start API body
     body = getattr(runner_args, "body", {}) or {}
+    room_id = body.get("room_id") or DEFAULT_ROOM_ID
     avatar_id = body.get("avatar_id") or DEFAULT_AVATAR_ID
     scene_id = body.get("scene_id") or DEFAULT_SCENE_ID
     flow_id = body.get("flow_id")
+    api_url = body.get("hv_api_url")
 
-    await run_bot(transport, runner_args, avatar_id=avatar_id, scene_id=scene_id, flow_id=flow_id)
+    await run_bot(
+        transport,
+        runner_args,
+        room_id=room_id,
+        avatar_id=avatar_id,
+        scene_id=scene_id,
+        flow_id=flow_id,
+        api_url=api_url,
+    )
 
 
 def _daily_params():

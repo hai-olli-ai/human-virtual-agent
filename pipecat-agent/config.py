@@ -16,6 +16,7 @@ HV_API_TOKEN = os.getenv("HV_API_TOKEN", "")
 # Default IDs for testing
 DEFAULT_AVATAR_ID = os.getenv("DEFAULT_AVATAR_ID", "")
 DEFAULT_SCENE_ID = os.getenv("DEFAULT_SCENE_ID", "")
+DEFAULT_ROOM_ID = os.getenv("DEFAULT_ROOM_ID", "")
 
 # TTS voice configuration
 CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121")

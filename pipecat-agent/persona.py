@@ -1,211 +1,114 @@
-"""Build LLM system prompt from avatar persona and knowledge."""
+"""Build system prompts for the Pipecat voice agent.
+
+Session 45: Uses Session 43's persona-prompt endpoint for the base prompt,
+then enriches with scene snapshot data for instruction + display mode awareness.
+"""
 from loguru import logger
 
+from api_client import (
+    get_avatar,
+    get_persona_prompt,
+    get_scene,
+    get_scene_snapshot,
+)
+from scene_context import (
+    build_canvas_tools_section,
+    build_instruction_section,
+    build_scene_description,
+)
 
-def build_system_prompt(
-    avatar: dict | None = None,
-    scene: dict | None = None,
+# Fallback prompt when API is unavailable
+DEFAULT_PROMPT = """## Your Identity
+You are a friendly AI assistant for Human Virtual.
+
+## Guidelines
+- Speak naturally and conversationally
+- Keep responses concise — this is a voice conversation, not a text chat
+- Be warm and engaging — you're presenting content to a real person
+- If asked something you don't know, say so honestly"""
+
+
+async def build_system_prompt(
+    room_id: str = "",
+    avatar_id: str = "",
+    scene_id: str = "",
+    api_url: str | None = None,
 ) -> str:
-    """Build a system prompt from avatar persona/knowledge and scene context."""
+    """Build the full system prompt for the voice agent.
 
-    persona_section = _build_persona_section(avatar)
-    knowledge_section = _build_knowledge_section(avatar)
-    scene_section = _build_scene_section(scene)
-    instruction_section = _build_instruction_section(scene)
+    Strategy:
+    1. If room_id is available, use the persona-prompt endpoint (includes everything)
+    2. Supplement with scene snapshot data for instruction + display mode
+    3. If no room_id, fall back to building from avatar + scene directly
+    4. If everything fails, use a sensible default
+    """
+    prompt_parts = []
 
-    prompt = f"""You are an AI avatar presenting content to a visitor in a live interactive session.
-Your responses will be spoken aloud via text-to-speech, so keep them conversational and natural.
-Avoid special characters, markdown formatting, or overly long responses.
+    # ── Strategy 1: Use persona-prompt endpoint (Session 43) ──
+    if room_id:
+        persona_prompt = await get_persona_prompt(room_id, api_url)
+        if persona_prompt:
+            logger.info(f"Loaded persona prompt from backend for room {room_id}")
+            prompt_parts.append(persona_prompt)
 
-{persona_section}
+            # The persona-prompt endpoint already includes scene context + instruction,
+            # but we can still fetch the snapshot for enrichment
+            snapshot = await get_scene_snapshot(room_id, api_url)
+            if snapshot:
+                # Add canvas tools section (for Session 47)
+                tools = build_canvas_tools_section(snapshot)
+                if tools:
+                    prompt_parts.append(tools)
 
-{knowledge_section}
+            return "\n\n".join(prompt_parts)
 
-{scene_section}
+    # ── Strategy 2: Build locally from avatar + scene ──
+    logger.info("Building prompt locally (no room_id or persona-prompt unavailable)")
 
-{instruction_section}
+    # Avatar persona
+    if avatar_id:
+        avatar = await get_avatar(avatar_id)
+        if avatar:
+            parts = [f"## Your Identity\nYou are {avatar.get('name', 'an AI assistant')}."]
+            if avatar.get("persona"):
+                parts.append(avatar["persona"])
+            if avatar.get("gender"):
+                parts.append(f"Gender: {avatar['gender']}")
+            prompt_parts.append("\n".join(parts))
 
-## Vision
-- You have been shown the scene's background image. You can reference what you see in it.
-- You have a tool called `capture_what_i_see` that captures a live video frame.
-- Use this tool when a visitor asks you to look at or describe what's currently on screen.
+            if avatar.get("knowledge"):
+                prompt_parts.append(f"## Your Knowledge\n{avatar['knowledge']}")
 
-## Conversation Guidelines
-- Speak naturally as if in a real conversation
-- Keep responses concise (1-3 sentences for simple questions, longer for complex ones)
-- Stay in character with the persona described above
-- If asked about something outside your knowledge, acknowledge it honestly
-- Be warm, engaging, and helpful
-"""
+    # Scene context
+    if room_id:
+        snapshot = await get_scene_snapshot(room_id, api_url)
+        if snapshot:
+            prompt_parts.append(build_scene_description(snapshot))
 
-    avatar_id = avatar.get("id") if avatar else None
-    scene_id = scene.get("id") if scene else None
-    logger.info(f"Built system prompt ({len(prompt)} chars) for avatar={avatar_id}, scene={scene_id}")
-    return prompt
+            instruction = build_instruction_section(snapshot)
+            if instruction:
+                prompt_parts.append(instruction)
 
+            tools = build_canvas_tools_section(snapshot)
+            if tools:
+                prompt_parts.append(tools)
+    elif scene_id:
+        scene = await get_scene(scene_id)
+        if scene:
+            prompt_parts.append(f"## Current Scene: {scene.get('title', 'Untitled')}")
+            if scene.get("instruction"):
+                prompt_parts.append(f"## Scene Instruction\n{scene['instruction']}")
 
-def _build_persona_section(avatar: dict | None) -> str:
-    """Build the persona portion of the system prompt."""
-    if not avatar or not avatar.get("persona"):
-        return "## Your Identity\nYou are a friendly AI assistant."
+    # Guidelines (always included)
+    prompt_parts.append("""## Guidelines
+- Speak naturally and conversationally
+- Keep responses concise — this is a voice conversation, not a text chat
+- Reference elements visible on the canvas when relevant
+- If the visitor asks about something on the canvas, describe it
+- If you're in a multi-scene flow, you can navigate between scenes when appropriate
+- Be warm and engaging — you're presenting this content to a real person""")
 
-    persona = avatar["persona"]
-    parts = ["## Your Identity"]
+    if not prompt_parts:
+        return DEFAULT_PROMPT
 
-    name = persona.get("avatarName") or avatar.get("name", "AI Assistant")
-    parts.append(f"Your name is {name}.")
-
-    if persona.get("gender"):
-        parts.append(f"Gender: {persona['gender']}.")
-
-    if persona.get("speakingLanguage"):
-        parts.append(f"You speak in {persona['speakingLanguage']}.")
-
-    if persona.get("shortDescription"):
-        parts.append(f"About you: {persona['shortDescription']}")
-
-    if persona.get("toneOfVoice"):
-        tones = persona["toneOfVoice"]
-        if isinstance(tones, list):
-            parts.append(f"Your tone is: {', '.join(tones)}.")
-        else:
-            parts.append(f"Your tone is: {tones}.")
-
-    if persona.get("purposes"):
-        purposes = persona["purposes"]
-        if isinstance(purposes, list):
-            parts.append(f"Your purpose: {', '.join(purposes)}.")
-        else:
-            parts.append(f"Your purpose: {purposes}.")
-
-    if persona.get("signaturePhrases"):
-        phrases = persona["signaturePhrases"]
-        if isinstance(phrases, list):
-            parts.append(f"Your signature phrases (use them naturally): {', '.join(f'"{p}"' for p in phrases)}.")
-        else:
-            parts.append(f"Your signature phrase: \"{phrases}\".")
-
-    if persona.get("relationshipToUser"):
-        parts.append(f"Your relationship to the creator: {persona['relationshipToUser']}.")
-
-    if persona.get("values"):
-        values = persona["values"]
-        if isinstance(values, list) and values:
-            parts.append(f"Your values: {', '.join(values)}.")
-
-    return "\n".join(parts)
-
-
-def _build_knowledge_section(avatar: dict | None) -> str:
-    """Build the knowledge portion of the system prompt."""
-    if not avatar or not avatar.get("knowledge"):
-        return ""
-
-    knowledge = avatar["knowledge"]
-    parts = ["## Your Knowledge"]
-
-    if knowledge.get("background"):
-        parts.append(f"Background: {knowledge['background']}")
-
-    if knowledge.get("expertise"):
-        expertise = knowledge["expertise"]
-        if isinstance(expertise, list) and expertise:
-            parts.append(f"Areas of expertise: {', '.join(expertise)}")
-        elif expertise:
-            parts.append(f"Areas of expertise: {expertise}")
-
-    if knowledge.get("importantPeople"):
-        people = knowledge["importantPeople"]
-        if isinstance(people, list) and people:
-            people_strs = [f"{p['name']} ({p.get('relationship', 'unknown')})" for p in people if p.get("name")]
-            if people_strs:
-                parts.append(f"Important people in your life: {', '.join(people_strs)}.")
-
-    if knowledge.get("preferences"):
-        parts.append(f"Preferences: {knowledge['preferences']}")
-
-    if knowledge.get("memories"):
-        memories = knowledge["memories"]
-        if isinstance(memories, list) and memories:
-            parts.append("Personal memories:")
-            for m in memories:
-                if isinstance(m, str):
-                    parts.append(f"- {m}")
-                elif isinstance(m, dict) and m.get("text"):
-                    parts.append(f"- {m['text']}")
-
-    if knowledge.get("notes"):
-        notes = knowledge["notes"]
-        if isinstance(notes, list) and notes:
-            parts.append("Notes:")
-            for n in notes:
-                if isinstance(n, str):
-                    parts.append(f"- {n}")
-                elif isinstance(n, dict) and n.get("text"):
-                    parts.append(f"- {n['text']}")
-
-    return "\n".join(parts) if len(parts) > 1 else ""
-
-
-def _build_scene_section(scene: dict | None) -> str:
-    """Build the scene context portion of the system prompt."""
-    if not scene:
-        return ""
-
-    parts = [f"## Current Scene: {scene.get('title', 'Untitled')}"]
-
-    # Background info
-    canvas = scene.get("canvasState", {})
-    bg = canvas.get("background", {})
-    if bg.get("label"):
-        parts.append(f"Background: {bg['label']}")
-
-    # Elements are nested inside canvasState
-    elements = canvas.get("elements", [])
-    if elements:
-        parts.append("Elements on the canvas:")
-        for el in elements:
-            el_type = el.get("type", "unknown")
-            display_mode = el.get("displayMode", "normal")
-
-            if el_type == "avatar":
-                # Tell the agent how the avatar is being displayed
-                mode_desc = {
-                    "normal": "shown as profile photo",
-                    "invisible": "hidden from canvas (voice only)",
-                    "3dgs": "displayed as 3D model",
-                    "talking": "displayed as talking head with lip sync",
-                }.get(display_mode, "shown as profile photo")
-                parts.append(f"- Avatar ({mode_desc})")
-            elif display_mode == "invisible":
-                continue  # Skip invisible non-avatar elements
-            else:
-                props = el.get("properties", {})
-                content = props.get("content", "")
-                desc = f"- {el_type}"
-                if content:
-                    desc += f': "{content}"'
-                parts.append(desc)
-
-    # Scripts are top-level
-    scripts = scene.get("scripts", [])
-    if scripts:
-        parts.append("\nScripts (dialogue):")
-        for s in scripts:
-            text = s.get("text", "")
-            if text:
-                parts.append(f'- "{text[:100]}{"..." if len(text) > 100 else ""}"')
-
-    return "\n".join(parts)
-
-
-def _build_instruction_section(scene: dict | None) -> str:
-    """Build the instruction portion of the system prompt."""
-    if not scene or not scene.get("instruction"):
-        return ""
-    return f"""## Scene Instruction
-Follow these specific instructions for how to interact within this scene:
-{scene['instruction']}
-
-These instructions take priority over general conversation guidelines when they conflict.
-"""
+    return "\n\n".join(prompt_parts)
