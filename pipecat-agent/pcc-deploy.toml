@@ -1,5 +1,7 @@
 agent_name = "human-virtual-agent"
+image = "haiolli/human-virtual-agent:0.2"
 secret_set = "human-virtual-agent-secrets"
+agent_profile = "agent-1x"
 
 [scaling]
   min_agents = 0

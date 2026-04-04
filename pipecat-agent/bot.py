@@ -81,15 +81,19 @@ class TranscriptForwarder(FrameProcessor):
     async def _send_transcript(self, speaker: str, text: str):
         """Send transcript message via Daily data channel."""
         try:
-            message = json.dumps({
+            payload = {
                 "type": "transcript",
                 "speaker": speaker,
                 "text": text,
-            })
-            if hasattr(self._transport, "send_message"):
-                await self._transport.send_message(message)
-            elif hasattr(self._transport, "output") and hasattr(self._transport.output(), "send_app_message"):
-                await self._transport.output().send_app_message(message)
+            }
+            # DailyTransport uses send_app_message with a dict
+            if hasattr(self._transport, "send_app_message"):
+                await self._transport.send_app_message(payload)
+            # SmallWebRTCTransport may use send_message with a JSON string
+            elif hasattr(self._transport, "send_message"):
+                await self._transport.send_message(json.dumps(payload))
+            else:
+                logger.debug("Transport does not support data channel messages")
         except Exception as e:
             logger.debug(f"Could not forward transcript: {e}")
 
@@ -117,12 +121,14 @@ class SpeakingStateNotifier(FrameProcessor):
 
     async def _send_state(self, is_speaking: bool):
         try:
-            message = json.dumps({
+            payload = {
                 "type": "speaking_state",
                 "isSpeaking": is_speaking,
-            })
-            if hasattr(self._transport, "send_message"):
-                await self._transport.send_message(message)
+            }
+            if hasattr(self._transport, "send_app_message"):
+                await self._transport.send_app_message(payload)
+            elif hasattr(self._transport, "send_message"):
+                await self._transport.send_message(json.dumps(payload))
         except Exception as e:
             logger.debug(f"Could not send speaking state: {e}")
 

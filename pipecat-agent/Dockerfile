@@ -5,4 +5,8 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
-COPY . .
+COPY bot.py .
+COPY config.py .
+COPY persona.py .
+COPY api_client.py .
+COPY scene_context.py .

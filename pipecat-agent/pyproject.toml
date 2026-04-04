@@ -1,6 +1,6 @@
 [project]
 name = "human-virtual-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pipecat voice agent for Human Virtual avatars"
 requires-python = ">=3.12"
 dependencies = [
