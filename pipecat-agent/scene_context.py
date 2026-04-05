@@ -6,6 +6,34 @@ for the LLM system prompt.
 from loguru import logger
 
 
+def build_vision_message(image_base64: str) -> dict:
+    """Build an OpenAI-format user message with a canvas image for vision.
+
+    This message is added to the LLM context so the model can "see" the canvas.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{image_base64}",
+                    "detail": "high",
+                },
+            },
+            {
+                "type": "text",
+                "text": (
+                    "This is the current scene canvas that the visitor is seeing. "
+                    "Remember the layout, colors, positions, and content of all elements. "
+                    "When discussing the scene, reference what you see in this image. "
+                    "You can describe specific elements, their positions, colors, and relationships."
+                ),
+            },
+        ],
+    }
+
+
 def build_scene_description(snapshot: dict) -> str:
     """Build a human-readable scene description from a snapshot.
 
