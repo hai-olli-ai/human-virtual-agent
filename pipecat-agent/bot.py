@@ -10,15 +10,15 @@ Session 45: Full integration with Session 43 backend endpoints.
 Local dev:  python bot.py  → opens http://localhost:7860/client
 Production: Deployed to Pipecat Cloud with DailyTransport
 """
-import json
-
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
+    InterimTranscriptionFrame,
     LLMRunFrame,
+    OutputTransportMessageFrame,
     TranscriptionFrame,
     TextFrame,
 )
@@ -39,6 +39,9 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 load_dotenv(override=True)
+
+import pipecat
+logger.info(f"Pipecat SDK version: {pipecat.__version__}")
 
 from config import (
     CARTESIA_API_KEY,
@@ -72,7 +75,9 @@ class TranscriptForwarder(FrameProcessor):
             await self._send_transcript("user", frame.text)
 
         # Bot response text (from LLM, before TTS)
-        if isinstance(frame, TextFrame) and frame.text:
+        # Both TranscriptionFrame and InterimTranscriptionFrame are TextFrame subclasses —
+        # exclude them so only pure LLM output is sent as "avatar"
+        if isinstance(frame, TextFrame) and not isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)) and frame.text:
             await self._send_transcript("avatar", frame.text)
 
         # Always pass the frame through
@@ -86,16 +91,10 @@ class TranscriptForwarder(FrameProcessor):
                 "speaker": speaker,
                 "text": text,
             }
-            # DailyTransport uses send_app_message with a dict
-            if hasattr(self._transport, "send_app_message"):
-                await self._transport.send_app_message(payload)
-            # SmallWebRTCTransport may use send_message with a JSON string
-            elif hasattr(self._transport, "send_message"):
-                await self._transport.send_message(json.dumps(payload))
-            else:
-                logger.debug("Transport does not support data channel messages")
+            frame = OutputTransportMessageFrame(message=payload)
+            await self._transport.send_message(frame)
         except Exception as e:
-            logger.debug(f"Could not forward transcript: {e}")
+            logger.warning(f"Could not forward transcript: {e}")
 
 
 class SpeakingStateNotifier(FrameProcessor):
@@ -125,12 +124,10 @@ class SpeakingStateNotifier(FrameProcessor):
                 "type": "speaking_state",
                 "isSpeaking": is_speaking,
             }
-            if hasattr(self._transport, "send_app_message"):
-                await self._transport.send_app_message(payload)
-            elif hasattr(self._transport, "send_message"):
-                await self._transport.send_message(json.dumps(payload))
+            frame = OutputTransportMessageFrame(message=payload)
+            await self._transport.send_message(frame)
         except Exception as e:
-            logger.debug(f"Could not send speaking state: {e}")
+            logger.warning(f"Could not send speaking state: {e}")
 
 
 async def run_bot(
@@ -182,19 +179,29 @@ async def run_bot(
     )
 
     # ── Transcript forwarding ──
-    transcript_forwarder = TranscriptForwarder(transport)
-    speaking_notifier = SpeakingStateNotifier(transport)
+    # Use transport.output() which exposes send_message() for data channel.
+    # DailyTransport itself does not have send_app_message/send_message;
+    # those live on DailyOutputTransport (returned by transport.output()).
+    output_transport = transport.output()
+    # Two forwarder instances at different pipeline positions:
+    # - user_transcript_fwd: between STT and user_aggregator (catches TranscriptionFrame)
+    # - avatar_transcript_fwd: after LLM (catches TextFrame)
+    # user_aggregator consumes TranscriptionFrame, so the avatar forwarder never sees it.
+    user_transcript_fwd = TranscriptForwarder(output_transport)
+    avatar_transcript_fwd = TranscriptForwarder(output_transport)
+    speaking_notifier = SpeakingStateNotifier(output_transport)
 
     # ── Pipeline ──
     pipeline = Pipeline([
         transport.input(),       # Visitor's microphone audio (WebRTC)
         stt,                     # Deepgram: speech → text
-        transcript_forwarder,    # Forward user transcription to frontend
+        user_transcript_fwd,     # Forward user STT transcripts to frontend
         user_aggregator,         # Add user message to conversation history
         llm,                     # OpenAI: generate response
+        avatar_transcript_fwd,   # Forward avatar LLM text to frontend
         speaking_notifier,       # Notify frontend of speaking state
         tts,                     # Cartesia: response → speech audio
-        transport.output(),      # Send audio back to visitor (WebRTC)
+        output_transport,        # Send audio back to visitor (WebRTC)
         assistant_aggregator,    # Add bot response to conversation history
     ])
 
