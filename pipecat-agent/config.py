@@ -27,4 +27,5 @@ CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022e
 
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+#LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-mini")

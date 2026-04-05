@@ -111,19 +111,34 @@ Follow these specific instructions for this scene:
 
 
 def build_canvas_tools_section(snapshot: dict) -> str:
-    """Build the canvas action tools description.
-
-    These tools will be wired in Session 47. For now, describe them
-    so the LLM knows they exist but won't try to invoke them yet.
-    """
+    """Build the canvas action tools description for the system prompt."""
     elements = snapshot.get("elements", [])
-    if not elements:
-        return ""
 
-    return """## Canvas Actions (Coming Soon)
-In future updates, you will be able to:
-- Highlight specific elements on the canvas to draw attention
-- Draw arrows between elements to show relationships
-- Place text annotations on the canvas
-- Navigate to different scenes in a multi-scene flow
-For now, describe what you see on the canvas verbally."""
+    parts = ["## Canvas Actions"]
+    parts.append("You have tools to interact with the canvas visually:")
+    parts.append("- highlight_element: Highlight an element to draw attention")
+    parts.append("- draw_arrow: Draw an arrow between two elements")
+    parts.append("- place_annotation: Place a short text label near an element")
+    parts.append("- clear_annotations: Remove all visual overlays")
+
+    total = snapshot.get("total_scenes", 1)
+    if total > 1:
+        parts.append("- navigate_scene: Go to next/previous scene in the flow")
+
+    parts.append("")
+    parts.append("Use these tools naturally during conversation when they help the visitor understand the content.")
+    parts.append("Reference elements by describing what they contain (e.g., 'the title text', 'the avatar image').")
+
+    if elements:
+        parts.append("")
+        parts.append("Available elements you can reference:")
+        for el in elements:
+            el_type = el.get("type", "unknown")
+            desc = f"  - {el_type}"
+            if el.get("text"):
+                desc += f' containing "{el["text"][:50]}"'
+            if el.get("label"):
+                desc += f' labeled "{el["label"]}"'
+            parts.append(desc)
+
+    return "\n".join(parts)

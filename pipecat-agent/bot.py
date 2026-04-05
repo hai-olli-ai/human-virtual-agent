@@ -2,10 +2,11 @@
 
 Pipeline: Mic → VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
 
-Session 46: Vision — agent can see the rendered canvas.
-- Fetches scene canvas as base64 PNG on startup
-- Injects image into LLM context for GPT-4.1/4o vision
-- Graceful degradation: works text-only if image fetch fails
+Session 47: Canvas action tools — agent can highlight, draw arrows, annotate,
+navigate scenes, and clear overlays via LLM function calling.
+- 5 tools registered via FunctionSchema + ToolsSchema + llm.register_function()
+- Element resolution maps LLM descriptions to canvas coordinates
+- Actions dispatched as data channel messages to the frontend
 
 Local dev:  python bot.py  → opens http://localhost:7860/client
 Production: Deployed to Pipecat Cloud with DailyTransport
@@ -53,6 +54,7 @@ from config import (
     DEFAULT_ROOM_ID,
     DEFAULT_SCENE_ID,
 )
+from canvas_actions import get_canvas_tools, create_canvas_action_handlers
 from persona import build_system_prompt
 
 
@@ -151,15 +153,24 @@ async def run_bot(
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
-    # ── Fetch canvas image for vision ──
+    # ── Fetch canvas image for vision + scene elements for tools ──
     scene_image_b64 = None
+    scene_elements = []
     if room_id:
-        from api_client import get_scene_image_base64
+        from api_client import get_scene_image_base64, get_scene_snapshot
         scene_image_b64 = await get_scene_image_base64(room_id, api_url)
         if scene_image_b64:
             logger.info(f"Fetched scene canvas image ({len(scene_image_b64)} chars base64)")
         else:
             logger.info("No scene image available — vision disabled for this session")
+
+        scene_snapshot = await get_scene_snapshot(room_id, api_url)
+        if scene_snapshot:
+            scene_elements = scene_snapshot.get("elements", [])
+            logger.info(f"Loaded {len(scene_elements)} scene elements for canvas tools")
+
+    # ── Canvas action tools ──
+    canvas_tools = get_canvas_tools()
 
     # ── AI Services ──
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
@@ -179,13 +190,26 @@ async def run_bot(
         ),
     )
 
+    # ── Register canvas action handlers ──
+    action_handlers = create_canvas_action_handlers(
+        transport=transport,
+        elements=scene_elements,
+        room_id=room_id,
+        api_url=api_url,
+    )
+    for func_name, handler in action_handlers.items():
+        llm.register_function(func_name, handler)
+
     # ── Conversation Context ──
     initial_messages = []
     if scene_image_b64:
         from scene_context import build_vision_message
         initial_messages.append(build_vision_message(scene_image_b64))
 
-    context = LLMContext(messages=initial_messages if initial_messages else None)
+    context = LLMContext(
+        messages=initial_messages if initial_messages else None,
+        tools=canvas_tools,
+    )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
