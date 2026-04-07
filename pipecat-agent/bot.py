@@ -2,10 +2,11 @@
 
 Pipeline: Mic → VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
 
-Session 45: Full integration with Session 43 backend endpoints.
-- Persona prompt fetched from backend
-- Scene instruction + display mode awareness
-- Real-time transcript forwarding to frontend via Daily data channel
+Session 47: Canvas action tools — agent can highlight, draw arrows, annotate,
+navigate scenes, and clear overlays via LLM function calling.
+- 5 tools registered via FunctionSchema + ToolsSchema + llm.register_function()
+- Element resolution maps LLM descriptions to canvas coordinates
+- Actions dispatched as data channel messages to the frontend
 
 Local dev:  python bot.py  → opens http://localhost:7860/client
 Production: Deployed to Pipecat Cloud with DailyTransport
@@ -53,8 +54,10 @@ from config import (
     DEFAULT_ROOM_ID,
     DEFAULT_SCENE_ID,
 )
+from canvas_actions import get_canvas_tools, create_canvas_action_handlers
 from persona import build_system_prompt
 
+GREETING_TRIGGER_PROMPT = "A visitor just joined. Greet them warmly and briefly introduce yourself and what you can do. Do NOT use any canvas action tools for this greeting — just speak."
 
 class TranscriptForwarder(FrameProcessor):
     """Captures transcription and LLM text frames, forwards them
@@ -151,6 +154,19 @@ async def run_bot(
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
+    # ── Fetch canvas image for vision ──
+    scene_image_b64 = None
+    if room_id:
+        from api_client import get_scene_image_base64
+        scene_image_b64 = await get_scene_image_base64(room_id, api_url)
+        if scene_image_b64:
+            logger.info(f"Fetched scene canvas image ({len(scene_image_b64)} chars base64)")
+        else:
+            logger.info("No scene image available — vision disabled for this session")
+
+    # ── Canvas action tools ──
+    canvas_tools = get_canvas_tools()
+
     # ── AI Services ──
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
 
@@ -170,7 +186,31 @@ async def run_bot(
     )
 
     # ── Conversation Context ──
-    context = LLMContext()
+    initial_messages = []
+    if scene_image_b64:
+        from scene_context import build_vision_message
+        initial_messages.append(build_vision_message(scene_image_b64))
+
+    context = LLMContext(
+        messages=initial_messages if initial_messages else None,
+        tools=canvas_tools,
+    )
+
+    # ── Output transport (data channel) ──
+    # DailyTransport itself does not have send_message();
+    # that lives on DailyOutputTransport (returned by transport.output()).
+    output_transport = transport.output()
+
+    # ── Register canvas action handlers ──
+    action_handlers = create_canvas_action_handlers(
+        output_transport=output_transport,
+        context=context,
+        llm=llm,
+        room_id=room_id,
+        api_url=api_url,
+    )
+    for func_name, handler in action_handlers.items():
+        llm.register_function(func_name, handler)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -179,10 +219,6 @@ async def run_bot(
     )
 
     # ── Transcript forwarding ──
-    # Use transport.output() which exposes send_message() for data channel.
-    # DailyTransport itself does not have send_app_message/send_message;
-    # those live on DailyOutputTransport (returned by transport.output()).
-    output_transport = transport.output()
     # Two forwarder instances at different pipeline positions:
     # - user_transcript_fwd: between STT and user_aggregator (catches TranscriptionFrame)
     # - avatar_transcript_fwd: after LLM (catches TextFrame)
@@ -221,7 +257,7 @@ async def run_bot(
         # Greet the visitor with the avatar's personality
         context.add_message({
             "role": "developer",
-            "content": "A visitor just joined. Greet them warmly and briefly introduce yourself and the scene you're presenting. Keep it to 1-2 sentences.",
+            "content": GREETING_TRIGGER_PROMPT,
         })
         await task.queue_frames([LLMRunFrame()])
 

@@ -25,5 +25,7 @@ DEFAULT_ROOM_ID = os.getenv("DEFAULT_ROOM_ID", "")
 CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121")
 # Default: "British Reading Lady" — will be customizable per avatar later
 
-# LLM model
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+# LLM model — must support vision for scene understanding (Session 46)
+# gpt-4.1 and gpt-4o both support vision
+#LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-mini")

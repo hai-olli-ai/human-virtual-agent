@@ -78,6 +78,27 @@ async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict |
         return None
 
 
+async def get_scene_image_base64(room_id: str, api_url: str | None = None) -> str | None:
+    """Fetch the rendered scene canvas as a base64-encoded PNG.
+
+    Uses GET /live-rooms/{room_id}/scene-snapshot/image?format=base64 (no auth).
+    Returns the base64 string (no data: prefix), or None on failure.
+    """
+    base_url = api_url or HV_API_URL
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{base_url}/live-rooms/{room_id}/scene-snapshot/image",
+                params={"format": "base64"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("image")
+    except Exception as e:
+        logger.warning(f"Failed to fetch scene image for room {room_id}: {e}")
+        return None
+
+
 async def navigate_scene(
     room_id: str,
     direction: str,

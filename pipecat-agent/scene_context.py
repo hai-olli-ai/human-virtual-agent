@@ -5,6 +5,29 @@ for the LLM system prompt.
 """
 from loguru import logger
 
+VISION_MESSAGE = "This is the current scene canvas that the visitor is seeing. The canvas is 1280x720 pixels (origin top-left). Remember the layout, colors, positions, and content of all elements. When discussing the scene, reference what you see in this image. When using canvas action tools (highlight, arrow, annotation), estimate pixel coordinates from this image."
+
+def build_vision_message(image_base64: str) -> dict:
+    """Build an OpenAI-format user message with a canvas image for vision.
+
+    This message is added to the LLM context so the model can "see" the canvas.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{image_base64}",
+                    "detail": "high",
+                },
+            },
+            {
+                "type": "text",
+                "text": VISION_MESSAGE,
+            },
+        ],
+    }
 
 def build_scene_description(snapshot: dict) -> str:
     """Build a human-readable scene description from a snapshot.
@@ -83,19 +106,21 @@ Follow these specific instructions for this scene:
 
 
 def build_canvas_tools_section(snapshot: dict) -> str:
-    """Build the canvas action tools description.
+    """Build the canvas action tools description for the system prompt."""
+    parts = ["## Canvas Actions"]
+    parts.append("You have tools to interact with the canvas visually:")
+    parts.append("- highlight_element(x, y, width, height): Highlight a region to draw attention")
+    parts.append("- draw_arrow(from_x, from_y, to_x, to_y): Draw an arrow between two points")
+    parts.append("- place_annotation(text, x, y): Place a short text label at a position")
+    parts.append("- clear_annotations: Remove all visual overlays")
 
-    These tools will be wired in Session 47. For now, describe them
-    so the LLM knows they exist but won't try to invoke them yet.
-    """
-    elements = snapshot.get("elements", [])
-    if not elements:
-        return ""
+    total = snapshot.get("total_scenes", 1)
+    if total > 1:
+        parts.append("- navigate_scene: Go to next/previous scene in the flow")
 
-    return """## Canvas Actions (Coming Soon)
-In future updates, you will be able to:
-- Highlight specific elements on the canvas to draw attention
-- Draw arrows between elements to show relationships
-- Place text annotations on the canvas
-- Navigate to different scenes in a multi-scene flow
-For now, describe what you see on the canvas verbally."""
+    parts.append("")
+    parts.append("The canvas is 1280x720 pixels (origin at top-left).")
+    parts.append("Use the canvas image to estimate pixel coordinates for these tools.")
+    parts.append("Use these tools naturally during conversation when they help the visitor understand the content.")
+
+    return "\n".join(parts)

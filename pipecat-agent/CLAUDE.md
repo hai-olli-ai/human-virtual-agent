@@ -1,62 +1,73 @@
 # CLAUDE.md — pipecat-agent
 
-> Last updated: Session 45b (deployed to Pipecat Cloud with DailyTransport)
+> Last updated: Session 47 (canvas action tools — highlight, arrow, annotation, navigate, clear)
 
 ## Overview
 
-Voice agent for Human Virtual's Avatar Live URL. Deployed to **Pipecat Cloud**. Pipeline: VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Daily WebRTC.
+Voice agent for Human Virtual's Avatar Live URL. Deployed to **Pipecat Cloud**. Pipeline: VAD → STT → LLM → TTS → Daily WebRTC. Multimodal vision (sees canvas). **LLM function calling** for canvas actions.
 
 ## Commands
 
 ```bash
-uv sync              # Install
-uv run bot.py        # Run locally → http://localhost:7860/client
+uv sync && uv run bot.py    # Install + run locally → http://localhost:7860/client
 ```
 
-## Deploy to Pipecat Cloud
+## Deploy
 
 ```bash
-docker build --platform=linux/arm64 -t human-virtual-agent:0.2 .
-docker tag human-virtual-agent:0.2 YOUR_USER/human-virtual-agent:0.2
-docker push YOUR_USER/human-virtual-agent:0.2
-pcc secrets set human-virtual-agent-secrets --file .env
+docker build --platform=linux/arm64 -t human-virtual-agent:0.4 .
+docker push YOUR_USER/human-virtual-agent:0.4
 pcc deploy
-pcc agent status human-virtual-agent
 ```
 
 ## Structure
 
 ```
 pipecat-agent/
-├── bot.py              # Pipeline + TranscriptForwarder + SpeakingStateNotifier
+├── bot.py              # Pipeline + vision + tools + transcript forwarding
+├── canvas_actions.py   # 5 LLM tools + handlers + element resolution — Session 47
 ├── config.py           # Env vars
-├── persona.py          # Prompt builder (uses backend persona-prompt endpoint)
-├── scene_context.py    # Scene snapshot → agent-readable text
-├── api_client.py       # HTTP client (public + auth endpoints)
-├── pcc-deploy.toml     # Pipecat Cloud config
-└── Dockerfile          # ARM64 image
+├── persona.py          # Prompt builder (persona-prompt endpoint)
+├── scene_context.py    # Scene snapshot → text + vision message + tools section
+├── api_client.py       # HTTP client (public + auth + scene image)
+├── pcc-deploy.toml
+└── Dockerfile
 ```
 
 ## Key Decisions
 
-- **Prompt:** Calls `GET /live-rooms/{room_id}/persona-prompt` (no auth). Falls back to local build from avatar+scene. Last resort: DEFAULT_PROMPT
-- **Data channel messages (DailyTransport):** Uses `transport.send_app_message(dict)` not `send_message(string)`
-  - `{ type: "transcript", speaker, text }` — real-time transcription
-  - `{ type: "speaking_state", isSpeaking }` — avatar animation
-  - `{ type: "canvas_action", action }` — overlays (Session 47)
-- **Entry:** `bot(runner_args)` → extracts `room_id` from `runner_args.body` → `run_bot()`
-- **Pipeline order:** input → STT → TranscriptForwarder → UserAggregator → LLM → SpeakingNotifier → TTS → output → AssistantAggregator
-- **Secrets:** Managed via `pcc secrets set` — NOT baked into Docker image
-- **All API calls:** try/except wrapped — agent never crashes on API failure
-- **NEVER** imports from backend's `app/` package — completely separate service
+### Canvas Action Tools (Session 47)
+- **5 tools** registered via `FunctionSchema` + `ToolsSchema` + `llm.register_function()`:
+  - `highlight_element` — pulsing highlight box on an element (`run_llm=False`)
+  - `draw_arrow` — animated arrow between two elements (`run_llm=False`)
+  - `place_annotation` — pill text label near an element (`run_llm=False`)
+  - `navigate_scene` — go to next/previous scene, re-fetches vision (`run_llm=True`)
+  - `clear_annotations` — remove all overlays (`run_llm=False`)
+- **Element resolution:** `resolve_element_region()` maps LLM descriptions to canvas coordinates via keyword matching against element type/text/label/title. Falls back to canvas center.
+- **Dispatch:** `transport.send_app_message({ type: "canvas_action", action: { name, params } })`
+- **Colors:** orange=#C15F3C, green=#4A7C59, blue=#4A6FA5, red=#C1443C
+- **Duration:** Tool args in seconds, converted to milliseconds for frontend
 
-## Environment Variables (via Pipecat Cloud secret set)
+### Vision (Session 46)
+- Canvas image fetched as base64 via `GET /scene-snapshot/image?format=base64`
+- Injected as first `LLMContext` message with `detail: "high"`
+- Model: `gpt-4.1` (supports vision natively)
+
+### Pipeline
+- input → STT → TranscriptForwarder → UserAggregator → LLM → SpeakingNotifier → TTS → output → AssistantAggregator
+- `LLMContext(messages=[vision_message], tools=canvas_tools)`
+- `llm.register_function()` for each of 5 canvas action handlers
+
+### Rules
+- NEVER imports from backend `app/` — separate service
+- All API calls try/except — never crashes
+- `run_llm=False` on fire-and-forget tools (highlight, arrow, annotation, clear)
+- `run_llm=True` on `navigate_scene` so LLM describes the new scene
+
+## Environment Variables (Pipecat Cloud secret set)
 
 ```bash
-DEEPGRAM_API_KEY=...
-OPENAI_API_KEY=...
-CARTESIA_API_KEY=...
-HV_API_URL=https://api.hv.ai/api/v1    # Backend URL the agent calls
-CARTESIA_VOICE_ID=71a7ad14-091c-4e8e-a314-022ece01c121
-LLM_MODEL=gpt-4.1
+DEEPGRAM_API_KEY, OPENAI_API_KEY, CARTESIA_API_KEY,
+HV_API_URL=https://api.hv.ai/api/v1,
+CARTESIA_VOICE_ID, LLM_MODEL=gpt-4.1
 ```
