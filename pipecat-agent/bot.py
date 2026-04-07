@@ -57,6 +57,7 @@ from config import (
 from canvas_actions import get_canvas_tools, create_canvas_action_handlers
 from persona import build_system_prompt
 
+GREETING_TRIGGER_PROMPT = "A visitor just joined. Greet them warmly and briefly introduce yourself and what you can do. Do NOT use any canvas action tools for this greeting — just speak."
 
 class TranscriptForwarder(FrameProcessor):
     """Captures transcription and LLM text frames, forwards them
@@ -153,21 +154,15 @@ async def run_bot(
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
-    # ── Fetch canvas image for vision + scene elements for tools ──
+    # ── Fetch canvas image for vision ──
     scene_image_b64 = None
-    scene_elements = []
     if room_id:
-        from api_client import get_scene_image_base64, get_scene_snapshot
+        from api_client import get_scene_image_base64
         scene_image_b64 = await get_scene_image_base64(room_id, api_url)
         if scene_image_b64:
             logger.info(f"Fetched scene canvas image ({len(scene_image_b64)} chars base64)")
         else:
             logger.info("No scene image available — vision disabled for this session")
-
-        scene_snapshot = await get_scene_snapshot(room_id, api_url)
-        if scene_snapshot:
-            scene_elements = scene_snapshot.get("elements", [])
-            logger.info(f"Loaded {len(scene_elements)} scene elements for canvas tools")
 
     # ── Canvas action tools ──
     canvas_tools = get_canvas_tools()
@@ -190,16 +185,6 @@ async def run_bot(
         ),
     )
 
-    # ── Register canvas action handlers ──
-    action_handlers = create_canvas_action_handlers(
-        transport=transport,
-        elements=scene_elements,
-        room_id=room_id,
-        api_url=api_url,
-    )
-    for func_name, handler in action_handlers.items():
-        llm.register_function(func_name, handler)
-
     # ── Conversation Context ──
     initial_messages = []
     if scene_image_b64:
@@ -210,6 +195,22 @@ async def run_bot(
         messages=initial_messages if initial_messages else None,
         tools=canvas_tools,
     )
+
+    # ── Output transport (data channel) ──
+    # DailyTransport itself does not have send_message();
+    # that lives on DailyOutputTransport (returned by transport.output()).
+    output_transport = transport.output()
+
+    # ── Register canvas action handlers ──
+    action_handlers = create_canvas_action_handlers(
+        output_transport=output_transport,
+        context=context,
+        llm=llm,
+        room_id=room_id,
+        api_url=api_url,
+    )
+    for func_name, handler in action_handlers.items():
+        llm.register_function(func_name, handler)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -218,10 +219,6 @@ async def run_bot(
     )
 
     # ── Transcript forwarding ──
-    # Use transport.output() which exposes send_message() for data channel.
-    # DailyTransport itself does not have send_app_message/send_message;
-    # those live on DailyOutputTransport (returned by transport.output()).
-    output_transport = transport.output()
     # Two forwarder instances at different pipeline positions:
     # - user_transcript_fwd: between STT and user_aggregator (catches TranscriptionFrame)
     # - avatar_transcript_fwd: after LLM (catches TextFrame)
@@ -260,7 +257,7 @@ async def run_bot(
         # Greet the visitor with the avatar's personality
         context.add_message({
             "role": "developer",
-            "content": "A visitor just joined. Greet them warmly and briefly introduce yourself and the scene you're presenting. Keep it to 1-2 sentences. If you can see the canvas image, briefly mention what's on screen.",
+            "content": GREETING_TRIGGER_PROMPT,
         })
         await task.queue_frames([LLMRunFrame()])
 

@@ -5,16 +5,16 @@ Defines LLM function calling tools that let the agent interact with the
 frontend canvas: highlight elements, draw arrows, place annotations,
 navigate scenes, and clear overlays.
 
+The LLM uses vision to see the canvas and provides pixel coordinates
+directly in tool calls. No server-side element resolution needed.
+
 Tool calls are dispatched as data channel messages to the frontend.
 """
-import json
-from typing import Any
-
 from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.frames.frames import FunctionCallResultProperties
+from pipecat.frames.frames import FunctionCallResultProperties, OutputTransportMessageFrame
 from pipecat.services.llm_service import FunctionCallParams
 
 
@@ -22,11 +22,23 @@ from pipecat.services.llm_service import FunctionCallParams
 
 highlight_element = FunctionSchema(
     name="highlight_element",
-    description="Highlight an element or region on the scene canvas to draw the visitor's attention. Use this when pointing out specific content.",
+    description="Highlight a rectangular region on the scene canvas to draw the visitor's attention. Use the canvas image to estimate pixel coordinates of the element you want to highlight.",
     properties={
-        "element_description": {
-            "type": "string",
-            "description": "Description of the element to highlight (e.g., 'the title text', 'the avatar', 'the pricing section')",
+        "x": {
+            "type": "number",
+            "description": "X coordinate of the top-left corner of the highlight region (pixels from left edge)",
+        },
+        "y": {
+            "type": "number",
+            "description": "Y coordinate of the top-left corner of the highlight region (pixels from top edge)",
+        },
+        "width": {
+            "type": "number",
+            "description": "Width of the highlight region in pixels",
+        },
+        "height": {
+            "type": "number",
+            "description": "Height of the highlight region in pixels",
         },
         "color": {
             "type": "string",
@@ -38,20 +50,28 @@ highlight_element = FunctionSchema(
             "description": "How long the highlight stays visible in seconds. Default: 3",
         },
     },
-    required=["element_description"],
+    required=["x", "y", "width", "height"],
 )
 
 draw_arrow = FunctionSchema(
     name="draw_arrow",
-    description="Draw an arrow on the canvas pointing from one element/area to another. Use this to show relationships or flow between elements.",
+    description="Draw an arrow on the canvas from one point to another. Use the canvas image to estimate pixel coordinates of the start and end points.",
     properties={
-        "from_description": {
-            "type": "string",
-            "description": "Description of the starting point (e.g., 'the input field')",
+        "from_x": {
+            "type": "number",
+            "description": "X coordinate of the arrow start point",
         },
-        "to_description": {
-            "type": "string",
-            "description": "Description of the ending point (e.g., 'the output display')",
+        "from_y": {
+            "type": "number",
+            "description": "Y coordinate of the arrow start point",
+        },
+        "to_x": {
+            "type": "number",
+            "description": "X coordinate of the arrow end point",
+        },
+        "to_y": {
+            "type": "number",
+            "description": "Y coordinate of the arrow end point",
         },
         "color": {
             "type": "string",
@@ -59,28 +79,32 @@ draw_arrow = FunctionSchema(
             "description": "Arrow color. Default: orange",
         },
     },
-    required=["from_description", "to_description"],
+    required=["from_x", "from_y", "to_x", "to_y"],
 )
 
 place_annotation = FunctionSchema(
     name="place_annotation",
-    description="Place a short text label on the canvas near a specific element. Use this to add brief commentary or labels.",
+    description="Place a short text label at a specific position on the canvas. Use the canvas image to estimate where to place it.",
     properties={
         "text": {
             "type": "string",
             "description": "The annotation text (keep under 40 characters)",
         },
-        "near_description": {
-            "type": "string",
-            "description": "Description of the element to place the annotation near",
+        "x": {
+            "type": "number",
+            "description": "X coordinate for the annotation position",
+        },
+        "y": {
+            "type": "number",
+            "description": "Y coordinate for the annotation position",
         },
     },
-    required=["text", "near_description"],
+    required=["text", "x", "y"],
 )
 
 navigate_scene_tool = FunctionSchema(
     name="navigate_scene",
-    description="Go to the next or previous scene in a multi-scene flow. Only use this when the room has multiple scenes.",
+    description="Go to the next or previous scene in a multi-scene flow. Trigger this when the visitor says things like 'next', 'next slide', 'next one', 'go next', 'go back', 'previous', 'previous slide', 'previous one', or similar navigation requests.",
     properties={
         "direction": {
             "type": "string",
@@ -122,82 +146,21 @@ COLOR_MAP = {
 }
 
 
-# ── Element Resolution ──
-
-def resolve_element_region(description: str, elements: list[dict]) -> dict | None:
-    """Find the element that best matches the description and return its bounding box.
-
-    Uses simple keyword matching. The LLM provides descriptions like
-    "the title text" or "the avatar" — we match against element type,
-    text content, label, and title.
-
-    Returns: { x, y, width, height } or None if no match found.
-    """
-    if not elements:
-        return None
-
-    desc_lower = description.lower()
-    best_match = None
-    best_score = 0
-
-    for el in elements:
-        score = 0
-        el_type = (el.get("type") or "").lower()
-        el_text = (el.get("text") or "").lower()
-        el_label = (el.get("label") or "").lower()
-        el_title = (el.get("title") or "").lower()
-
-        # Type matching
-        if el_type and el_type in desc_lower:
-            score += 3
-        if "avatar" in desc_lower and "avatar" in el_type:
-            score += 5
-        if "text" in desc_lower and el_type == "text":
-            score += 2
-        if "image" in desc_lower and el_type == "image":
-            score += 2
-
-        # Content matching
-        for word in desc_lower.split():
-            if len(word) > 2:  # Skip short words
-                if word in el_text:
-                    score += 4
-                if word in el_label:
-                    score += 3
-                if word in el_title:
-                    score += 3
-
-        if score > best_score:
-            best_score = score
-            pos = el.get("position", {})
-            size = el.get("size", {})
-            best_match = {
-                "x": pos.get("x", 0),
-                "y": pos.get("y", 0),
-                "width": size.get("width", 100),
-                "height": size.get("height", 100),
-            }
-
-    if best_score >= 2:
-        return best_match
-
-    # Fallback: return the center of the canvas
-    return {"x": 440, "y": 260, "width": 400, "height": 200}
-
-
 # ── Tool Handler Factory ──
 
 def create_canvas_action_handlers(
-    transport,
-    elements: list[dict],
+    output_transport,
+    context=None,
+    llm=None,
     room_id: str = "",
     api_url: str | None = None,
 ):
     """Create function call handlers for all canvas action tools.
 
     Args:
-        transport: The Pipecat transport (for sending data channel messages)
-        elements: Scene elements from the snapshot (for coordinate resolution)
+        output_transport: The Pipecat output transport (from transport.output())
+        context: The LLMContext (for updating vision after scene navigation)
+        llm: The OpenAILLMService (for updating system_instruction after navigation)
         room_id: Live room ID (for scene navigation)
         api_url: Backend API URL (for scene navigation)
 
@@ -209,59 +172,47 @@ def create_canvas_action_handlers(
         """Send a canvas action to the frontend via data channel."""
         payload = {"type": "canvas_action", "action": action}
         try:
-            if hasattr(transport, "send_app_message"):
-                await transport.send_app_message(payload)
-            elif hasattr(transport, "send_message"):
-                await transport.send_message(json.dumps(payload))
+            frame = OutputTransportMessageFrame(message=payload)
+            await output_transport.send_message(frame)
         except Exception as e:
             logger.warning(f"Failed to send canvas action: {e}")
 
     async def handle_highlight_element(params: FunctionCallParams):
         """Handle highlight_element tool call."""
         args = params.arguments
-        description = args.get("element_description", "")
+        region = {
+            "x": args.get("x", 0),
+            "y": args.get("y", 0),
+            "width": args.get("width", 100),
+            "height": args.get("height", 100),
+        }
         color_name = args.get("color", "orange")
         duration = args.get("duration_seconds", 3)
-
-        region = resolve_element_region(description, elements)
         color = COLOR_MAP.get(color_name, COLOR_MAP["orange"])
+
+        logger.info(f"highlight_element: region={region} color={color_name} duration={duration}s")
 
         await _send_canvas_action({
             "name": "highlight",
             "params": {
                 "region": region,
                 "color": color,
-                "duration": int(duration * 1000),  # Convert to ms
+                "duration": int(duration * 1000),
             },
         })
 
         props = FunctionCallResultProperties(run_llm=False)
-        await params.result_callback(
-            {"status": "highlighted", "element": description},
-            properties=props,
-        )
+        await params.result_callback({"status": "highlighted"}, properties=props)
 
     async def handle_draw_arrow(params: FunctionCallParams):
         """Handle draw_arrow tool call."""
         args = params.arguments
-        from_desc = args.get("from_description", "")
-        to_desc = args.get("to_description", "")
+        from_point = {"x": args.get("from_x", 0), "y": args.get("from_y", 0)}
+        to_point = {"x": args.get("to_x", 0), "y": args.get("to_y", 0)}
         color_name = args.get("color", "orange")
-
-        from_region = resolve_element_region(from_desc, elements)
-        to_region = resolve_element_region(to_desc, elements)
         color = COLOR_MAP.get(color_name, COLOR_MAP["orange"])
 
-        # Arrow goes from center of source to center of target
-        from_point = {
-            "x": from_region["x"] + from_region["width"] // 2,
-            "y": from_region["y"] + from_region["height"] // 2,
-        } if from_region else {"x": 300, "y": 360}
-
-        to_point = {
-            "x": to_region["x"] + to_region["width"] // 2,
-            "y": to_region["y"] + to_region["height"] // 2,
-        } if to_region else {"x": 900, "y": 360}
+        logger.info(f"draw_arrow: from={from_point} to={to_point} color={color_name}")
 
         await _send_canvas_action({
             "name": "draw_arrow",
@@ -274,24 +225,15 @@ def create_canvas_action_handlers(
         })
 
         props = FunctionCallResultProperties(run_llm=False)
-        await params.result_callback(
-            {"status": "arrow_drawn", "from": from_desc, "to": to_desc},
-            properties=props,
-        )
+        await params.result_callback({"status": "arrow_drawn"}, properties=props)
 
     async def handle_place_annotation(params: FunctionCallParams):
         """Handle place_annotation tool call."""
         args = params.arguments
-        text = args.get("text", "")[:40]  # Limit length
-        near_desc = args.get("near_description", "")
+        text = args.get("text", "")[:40]
+        position = {"x": args.get("x", 0), "y": args.get("y", 0)}
 
-        region = resolve_element_region(near_desc, elements)
-
-        # Place annotation above the element
-        position = {
-            "x": region["x"] + region["width"] // 2,
-            "y": max(region["y"] - 30, 10),
-        } if region else {"x": 640, "y": 100}
+        logger.info(f"place_annotation: text='{text}' position={position}")
 
         await _send_canvas_action({
             "name": "place_annotation",
@@ -303,53 +245,48 @@ def create_canvas_action_handlers(
         })
 
         props = FunctionCallResultProperties(run_llm=False)
-        await params.result_callback(
-            {"status": "annotation_placed", "text": text},
-            properties=props,
-        )
+        await params.result_callback({"status": "annotation_placed", "text": text}, properties=props)
 
     async def handle_navigate_scene(params: FunctionCallParams):
         """Handle navigate_scene tool call."""
         args = params.arguments
         direction = args.get("direction", "next")
 
+        logger.info(f"navigate_scene: direction={direction}")
+
+        # 1. Tell frontend to navigate (before backend, so frontend navigates
+        #    relative to the current backend state — avoids double-navigation)
+        await _send_canvas_action({
+            "name": "navigate",
+            "params": {"direction": direction},
+        })
+
+        # 2. Update backend state so image endpoint returns the new scene
         if room_id:
             from api_client import navigate_scene as api_navigate
-            result = await api_navigate(room_id, direction, api_url=api_url)
+            await api_navigate(room_id, direction, api_url=api_url)
 
-            if result:
-                # Send navigation action to frontend
-                await _send_canvas_action({
-                    "name": "navigate",
-                    "params": {"direction": direction},
-                })
+        # 3. Rebuild system prompt with new scene's instruction
+        if room_id and llm:
+            from persona import build_system_prompt
+            new_prompt = await build_system_prompt(room_id=room_id, api_url=api_url)
+            llm._settings.system_instruction = new_prompt
+            logger.info(f"Updated system prompt for new scene ({len(new_prompt)} chars)")
 
-                # Also re-fetch vision image for the new scene
-                from api_client import get_scene_image_base64
-                new_image = await get_scene_image_base64(room_id, api_url)
-                if new_image:
-                    from scene_context import build_vision_message
-                    # Note: Updating vision context mid-conversation requires
-                    # adding a new message to the context. This is handled
-                    # by returning a result that tells the LLM about the new scene.
-                    logger.info(f"Navigated to scene {result.get('current_scene_index', '?')}")
-
-                props = FunctionCallResultProperties(run_llm=True)
-                await params.result_callback(
-                    {
-                        "status": "navigated",
-                        "direction": direction,
-                        "current_scene_index": result.get("current_scene_index"),
-                        "scene_title": result.get("scene_title"),
-                        "total_scenes": result.get("total_scenes"),
-                    },
-                    properties=props,
-                )
-                return
+        # 4. Fetch new scene image and update LLM vision context
+        if room_id and context:
+            from api_client import get_scene_image_base64
+            from scene_context import build_vision_message
+            new_image = await get_scene_image_base64(room_id, api_url)
+            if new_image:
+                context.add_message(build_vision_message(new_image))
+                logger.info("Updated vision context with new scene image")
+            else:
+                logger.warning("Could not fetch new scene image after navigation")
 
         props = FunctionCallResultProperties(run_llm=True)
         await params.result_callback(
-            {"status": "error", "message": "Navigation not available for this room"},
+            {"status": "navigated", "direction": direction},
             properties=props,
         )
 
@@ -361,10 +298,7 @@ def create_canvas_action_handlers(
         })
 
         props = FunctionCallResultProperties(run_llm=False)
-        await params.result_callback(
-            {"status": "cleared"},
-            properties=props,
-        )
+        await params.result_callback({"status": "cleared"}, properties=props)
 
     return {
         "highlight_element": handle_highlight_element,

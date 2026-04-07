@@ -5,6 +5,7 @@ for the LLM system prompt.
 """
 from loguru import logger
 
+VISION_MESSAGE = "This is the current scene canvas that the visitor is seeing. The canvas is 1280x720 pixels (origin top-left). Remember the layout, colors, positions, and content of all elements. When discussing the scene, reference what you see in this image. When using canvas action tools (highlight, arrow, annotation), estimate pixel coordinates from this image."
 
 def build_vision_message(image_base64: str) -> dict:
     """Build an OpenAI-format user message with a canvas image for vision.
@@ -23,16 +24,10 @@ def build_vision_message(image_base64: str) -> dict:
             },
             {
                 "type": "text",
-                "text": (
-                    "This is the current scene canvas that the visitor is seeing. "
-                    "Remember the layout, colors, positions, and content of all elements. "
-                    "When discussing the scene, reference what you see in this image. "
-                    "You can describe specific elements, their positions, colors, and relationships."
-                ),
+                "text": VISION_MESSAGE,
             },
         ],
     }
-
 
 def build_scene_description(snapshot: dict) -> str:
     """Build a human-readable scene description from a snapshot.
@@ -112,13 +107,11 @@ Follow these specific instructions for this scene:
 
 def build_canvas_tools_section(snapshot: dict) -> str:
     """Build the canvas action tools description for the system prompt."""
-    elements = snapshot.get("elements", [])
-
     parts = ["## Canvas Actions"]
     parts.append("You have tools to interact with the canvas visually:")
-    parts.append("- highlight_element: Highlight an element to draw attention")
-    parts.append("- draw_arrow: Draw an arrow between two elements")
-    parts.append("- place_annotation: Place a short text label near an element")
+    parts.append("- highlight_element(x, y, width, height): Highlight a region to draw attention")
+    parts.append("- draw_arrow(from_x, from_y, to_x, to_y): Draw an arrow between two points")
+    parts.append("- place_annotation(text, x, y): Place a short text label at a position")
     parts.append("- clear_annotations: Remove all visual overlays")
 
     total = snapshot.get("total_scenes", 1)
@@ -126,19 +119,8 @@ def build_canvas_tools_section(snapshot: dict) -> str:
         parts.append("- navigate_scene: Go to next/previous scene in the flow")
 
     parts.append("")
+    parts.append("The canvas is 1280x720 pixels (origin at top-left).")
+    parts.append("Use the canvas image to estimate pixel coordinates for these tools.")
     parts.append("Use these tools naturally during conversation when they help the visitor understand the content.")
-    parts.append("Reference elements by describing what they contain (e.g., 'the title text', 'the avatar image').")
-
-    if elements:
-        parts.append("")
-        parts.append("Available elements you can reference:")
-        for el in elements:
-            el_type = el.get("type", "unknown")
-            desc = f"  - {el_type}"
-            if el.get("text"):
-                desc += f' containing "{el["text"][:50]}"'
-            if el.get("label"):
-                desc += f' labeled "{el["label"]}"'
-            parts.append(desc)
 
     return "\n".join(parts)
