@@ -122,5 +122,6 @@ def build_canvas_tools_section(snapshot: dict) -> str:
     parts.append("The canvas is 1280x720 pixels (origin at top-left).")
     parts.append("Use the canvas image to estimate pixel coordinates for these tools.")
     parts.append("Use these tools naturally during conversation when they help the visitor understand the content.")
+    parts.append("When describing yourself, note that the visitor may see your profile photo on the canvas.")
 
     return "\n".join(parts)

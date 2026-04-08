@@ -39,6 +39,26 @@ async def get_scene(scene_id: str) -> dict | None:
 
 # ── Public endpoints (Session 43 — no auth required) ──
 
+async def get_avatar_config(room_id: str, api_url: str | None = None) -> dict | None:
+    """Fetch structured avatar configuration for a live room.
+
+    Uses GET /live-rooms/{room_id}/avatar-config (no auth).
+    Returns dict with avatarId, name, thumbnailUrl, profilePhotoUrl,
+    voiceRecordUrl, voiceModelId — or None on failure.
+    """
+    base_url = api_url or HV_API_URL
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{base_url}/live-rooms/{room_id}/avatar-config",
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch avatar config for room {room_id}: {e}")
+        return None
+
+
 async def get_persona_prompt(room_id: str, api_url: str | None = None) -> str | None:
     """Fetch the assembled persona system prompt for a live room.
 

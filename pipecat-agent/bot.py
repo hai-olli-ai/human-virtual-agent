@@ -154,6 +154,16 @@ async def run_bot(
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
+    # ── Fetch avatar config for TTS voice ──
+    avatar_config = None
+    if room_id:
+        from api_client import get_avatar_config
+        avatar_config = await get_avatar_config(room_id, api_url)
+        if avatar_config:
+            logger.info(f"Avatar config: name={avatar_config.get('name')}, voiceModelId={avatar_config.get('voiceModelId')}")
+        else:
+            logger.info("No avatar config available — using default voice")
+
     # ── Fetch canvas image for vision ──
     scene_image_b64 = None
     if room_id:
@@ -170,10 +180,12 @@ async def run_bot(
     # ── AI Services ──
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
 
+    # Use avatar-specific Cartesia voice clone if available, else fall back to default
+    voice_id = (avatar_config or {}).get("voiceModelId") or CARTESIA_VOICE_ID
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
         settings=CartesiaTTSService.Settings(
-            voice=CARTESIA_VOICE_ID,
+            voice=voice_id,
         ),
     )
 
