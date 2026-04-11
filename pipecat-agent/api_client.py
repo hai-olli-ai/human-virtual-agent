@@ -92,7 +92,9 @@ async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict |
                 f"{base_url}/live-rooms/{room_id}/scene-snapshot",
             )
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            data.setdefault("scripts", [])
+            return data
     except Exception as e:
         logger.warning(f"Failed to fetch scene snapshot for room {room_id}: {e}")
         return None

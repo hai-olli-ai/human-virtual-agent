@@ -1,73 +1,103 @@
 # CLAUDE.md — pipecat-agent
 
-> Last updated: Session 47 (canvas action tools — highlight, arrow, annotation, navigate, clear)
+## Project
 
-## Overview
+Human Virtual (hv.ai) — Voice agent for live rooms. Completely separate service from backend/frontend.
 
-Voice agent for Human Virtual's Avatar Live URL. Deployed to **Pipecat Cloud**. Pipeline: VAD → STT → LLM → TTS → Daily WebRTC. Multimodal vision (sees canvas). **LLM function calling** for canvas actions.
+## Tech Stack
+
+- Python 3.12, Pipecat framework
+- Pipeline: VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → WebRTC
+- SmallWebRTCTransport for local dev, DailyTransport in production
+- Deployed to Pipecat Cloud
+
+## Transport Divergence (CRITICAL)
+
+```python
+# DailyTransport (production):
+await transport.send_app_message({"type": "some_event"})  # dict
+
+# SmallWebRTCTransport (local dev):
+await transport.send_message(json.dumps({"type": "some_event"}))  # string
+```
+
+Always use the existing `_send_data_message` helper that abstracts this.
+
+## Key Files
+
+- `bot.py` — Main pipeline setup, event handlers (on_client_connected, etc.)
+- `api_client.py` — Fetches data from backend API (persona prompt, scene snapshot, scene image)
+- `scene_context.py` — Builds system prompt from scene data (instruction, elements, scripts)
+- `canvas_actions.py` — 5 LLM tools (highlight, arrow, annotation, navigate, clear)
+
+## Canvas Action Conventions
+
+- `run_llm=False` for fire-and-forget tools (highlight, arrow, annotation, clear)
+- `run_llm=True` only for `navigate_scene` (LLM describes the new scene)
+- Element coordinate resolution uses keyword matching (not AI)
+
+## Session 49 Changes
+
+### What to do
+
+1. **`api_client.py`** — Ensure the scene snapshot parsing preserves the `"scripts"` key. If missing from response, default to `[]`.
+
+2. **`scene_context.py`** — When building the system prompt, if `scene_snapshot.get("scripts")` is non-empty, append:
+   ```
+   Scene Scripts (you will present these via TTS before conversation begins):
+   1. {text}
+   2. {text}
+   ```
+
+3. **`bot.py`** — In `on_client_connected` (or `on_first_participant_joined`):
+   ```python
+   from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame
+
+   if scene_snapshot and scene_snapshot.get("scripts"):
+       scripts = sorted(scene_snapshot["scripts"], key=lambda s: s.get("order", 0))
+       for script in scripts:
+           text = script.get("text", "").strip()
+           if text:
+               await task.queue_frames([TTSSpeakFrame(text=text)])
+
+       await _send_data_message(transport, {"type": "script_complete"})
+
+       context.add_message(
+           "developer",
+           "You just finished presenting the scene scripts to the visitor. "
+           "They heard your full presentation. Now respond naturally to any "
+           "questions or comments they have. Don't repeat what you already said.",
+       )
+       await task.queue_frames([LLMRunFrame()])
+   else:
+       # Existing greeting behavior
+       context.add_message(
+           "developer",
+           "A visitor just joined. Greet them warmly and briefly introduce "
+           "yourself and the scene you're presenting. Keep it to 1-2 sentences.",
+       )
+       await task.queue_frames([LLMRunFrame()])
+   ```
+
+### Key Points
+
+- `TTSSpeakFrame` bypasses the LLM — direct text-to-speech
+- Scripts queue sequentially; Pipecat processes them in order
+- VAD handles visitor interruption natively during script playback
+- The `developer` context message after scripts ensures LLM doesn't repeat content
+- `script_complete` data channel message tells frontend to transition UI
+
+## Environment Variables
+
+```
+DEEPGRAM_API_KEY=
+OPENAI_API_KEY=
+CARTESIA_API_KEY=
+HV_API_URL=http://localhost:8000  # or https://api.hv.ai
+```
 
 ## Commands
 
 ```bash
-uv sync && uv run bot.py    # Install + run locally → http://localhost:7860/client
-```
-
-## Deploy
-
-```bash
-docker build --platform=linux/arm64 -t human-virtual-agent:0.4 .
-docker push YOUR_USER/human-virtual-agent:0.4
-pcc deploy
-```
-
-## Structure
-
-```
-pipecat-agent/
-├── bot.py              # Pipeline + vision + tools + transcript forwarding
-├── canvas_actions.py   # 5 LLM tools + handlers + element resolution — Session 47
-├── config.py           # Env vars
-├── persona.py          # Prompt builder (persona-prompt endpoint)
-├── scene_context.py    # Scene snapshot → text + vision message + tools section
-├── api_client.py       # HTTP client (public + auth + scene image)
-├── pcc-deploy.toml
-└── Dockerfile
-```
-
-## Key Decisions
-
-### Canvas Action Tools (Session 47)
-- **5 tools** registered via `FunctionSchema` + `ToolsSchema` + `llm.register_function()`:
-  - `highlight_element` — pulsing highlight box on an element (`run_llm=False`)
-  - `draw_arrow` — animated arrow between two elements (`run_llm=False`)
-  - `place_annotation` — pill text label near an element (`run_llm=False`)
-  - `navigate_scene` — go to next/previous scene, re-fetches vision (`run_llm=True`)
-  - `clear_annotations` — remove all overlays (`run_llm=False`)
-- **Element resolution:** `resolve_element_region()` maps LLM descriptions to canvas coordinates via keyword matching against element type/text/label/title. Falls back to canvas center.
-- **Dispatch:** `transport.send_app_message({ type: "canvas_action", action: { name, params } })`
-- **Colors:** orange=#C15F3C, green=#4A7C59, blue=#4A6FA5, red=#C1443C
-- **Duration:** Tool args in seconds, converted to milliseconds for frontend
-
-### Vision (Session 46)
-- Canvas image fetched as base64 via `GET /scene-snapshot/image?format=base64`
-- Injected as first `LLMContext` message with `detail: "high"`
-- Model: `gpt-4.1` (supports vision natively)
-
-### Pipeline
-- input → STT → TranscriptForwarder → UserAggregator → LLM → SpeakingNotifier → TTS → output → AssistantAggregator
-- `LLMContext(messages=[vision_message], tools=canvas_tools)`
-- `llm.register_function()` for each of 5 canvas action handlers
-
-### Rules
-- NEVER imports from backend `app/` — separate service
-- All API calls try/except — never crashes
-- `run_llm=False` on fire-and-forget tools (highlight, arrow, annotation, clear)
-- `run_llm=True` on `navigate_scene` so LLM describes the new scene
-
-## Environment Variables (Pipecat Cloud secret set)
-
-```bash
-DEEPGRAM_API_KEY, OPENAI_API_KEY, CARTESIA_API_KEY,
-HV_API_URL=https://api.hv.ai/api/v1,
-CARTESIA_VOICE_ID, LLM_MODEL=gpt-4.1
+python bot.py  # local dev (SmallWebRTCTransport)
 ```

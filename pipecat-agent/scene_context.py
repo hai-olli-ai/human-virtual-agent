@@ -105,6 +105,29 @@ Follow these specific instructions for this scene:
 {instruction}"""
 
 
+def build_scripts_section(snapshot: dict) -> str:
+    """Build the scripts section from a snapshot.
+
+    Gives the LLM awareness of script content so it can reference it
+    during conversation without repeating it verbatim.
+    """
+    scripts = snapshot.get("scripts", [])
+    if not scripts:
+        return ""
+
+    sorted_scripts = sorted(scripts, key=lambda s: s.get("order", 0))
+    lines = []
+    for i, script in enumerate(sorted_scripts, 1):
+        text = script.get("text", "").strip()
+        if text:
+            lines.append(f"{i}. {text}")
+
+    if not lines:
+        return ""
+
+    return "Scene Scripts (you will present these to the visitor via TTS before conversation begins):\n" + "\n".join(lines)
+
+
 def build_canvas_tools_section(snapshot: dict) -> str:
     """Build the canvas action tools description for the system prompt."""
     parts = ["## Canvas Actions"]

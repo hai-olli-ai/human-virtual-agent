@@ -15,6 +15,7 @@ from scene_context import (
     build_canvas_tools_section,
     build_instruction_section,
     build_scene_description,
+    build_scripts_section,
 )
 
 # Fallback prompt when API is unavailable
@@ -60,6 +61,11 @@ async def build_system_prompt(
                 if tools:
                     prompt_parts.append(tools)
 
+                # Add scripts section (for Session 49)
+                scripts_section = build_scripts_section(snapshot)
+                if scripts_section:
+                    prompt_parts.append(scripts_section)
+
             return "\n\n".join(prompt_parts)
 
     # ── Strategy 2: Build locally from avatar + scene ──
@@ -92,6 +98,10 @@ async def build_system_prompt(
             tools = build_canvas_tools_section(snapshot)
             if tools:
                 prompt_parts.append(tools)
+
+            scripts_section = build_scripts_section(snapshot)
+            if scripts_section:
+                prompt_parts.append(scripts_section)
     elif scene_id:
         scene = await get_scene(scene_id)
         if scene:

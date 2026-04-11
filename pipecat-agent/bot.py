@@ -1,22 +1,21 @@
 """Human Virtual Pipecat voice agent.
 
-Pipeline: Mic → VAD → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
+Dual-pipeline architecture based on avatar display mode:
 
-Session 47: Canvas action tools — agent can highlight, draw arrows, annotate,
-navigate scenes, and clear overlays via LLM function calling.
-- 5 tools registered via FunctionSchema + ToolsSchema + llm.register_function()
-- Element resolution maps LLM descriptions to canvas coordinates
-- Actions dispatched as data channel messages to the frontend
+Classic pipeline (normal / invisible / 3dgs):
+    Mic → STT (Deepgram) → LLM (OpenAI) → TTS (Cartesia) → Speaker
+    Simple event handlers, direct greeting, standard duplex conversation.
+
+Relay avatar pipeline (talking):
+    Mic → AudioFilter → STT → LLM → text relay → SoulX avatar bot
+    Complex participant management, relay protocol, no local TTS.
+    SoulX server handles TTS + avatar video rendering in the same Daily room.
+
+Pipeline selection is automatic based on the avatar's display_mode field
+in the scene snapshot. Falls back to CLOUD_OUTPUT_MODE env var.
 
 Local dev:  python bot.py  → opens http://localhost:7860/client
 Production: Deployed to Pipecat Cloud with DailyTransport
-
-Default mode:
-    Mic -> STT (Deepgram) -> LLM (OpenAI) -> TTS (Cartesia) -> Speaker
-
-Relay mode:
-    Mic -> STT (Deepgram) -> LLM (OpenAI) -> raw TTS-bound text relay over Daily app messages
-    The remote SoulX/TTS bot handles speech and avatar rendering.
 """
 
 import asyncio
@@ -39,6 +38,7 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     OutputTransportMessageFrame,
     StartFrame,
+    TTSSpeakFrame,
     TranscriptionFrame,
     TextFrame,
     UserAudioRawFrame,
@@ -76,10 +76,17 @@ from config import (
 from canvas_actions import create_canvas_action_handlers, get_canvas_tools
 from persona import build_system_prompt
 
+# ──────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────
+
 GREETING_TRIGGER_PROMPT = (
-    "A visitor just joined. Greet them warmly and briefly introduce yourself and what you can do. "
-    "Do NOT use any canvas action tools for this greeting - just speak."
+    "A visitor just joined. Greet them warmly and briefly introduce yourself "
+    "and what you can do. Do NOT use any canvas action tools for this greeting "
+    "- just speak."
 )
+
+# Relay protocol
 RELAY_PROTOCOL = "avatar-relay.v1"
 RELAY_READY = "avatar_relay.ready"
 RELAY_TURN_START = "avatar_relay.turn_start"
@@ -87,6 +94,8 @@ RELAY_TEXT = "avatar_relay.text"
 RELAY_SENTENCE = "avatar_relay.sentence"
 RELAY_TURN_END = "avatar_relay.turn_end"
 RELAY_INTERRUPT = "avatar_relay.interrupt"
+
+# Output mode fallback (env var used when scene snapshot unavailable)
 VALID_OUTPUT_MODES = {"cartesia", "relay_avatar"}
 CLOUD_OUTPUT_MODE = os.getenv("CLOUD_OUTPUT_MODE", "cartesia").strip().lower() or "cartesia"
 if CLOUD_OUTPUT_MODE not in VALID_OUTPUT_MODES:
@@ -95,9 +104,15 @@ if CLOUD_OUTPUT_MODE not in VALID_OUTPUT_MODES:
         CLOUD_OUTPUT_MODE,
     )
     CLOUD_OUTPUT_MODE = "cartesia"
+
+# Bot names
 CLOUD_BOT_NAME = os.getenv("CLOUD_BOT_NAME", "Human Virtual Cloud").strip() or "Human Virtual Cloud"
 AVATAR_BOT_NAME = os.getenv("SOULX_AVATAR_BOT_NAME", "Digital Twin Avatar").strip() or "Digital Twin Avatar"
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Participant helpers (relay pipeline)
+# ──────────────────────────────────────────────────────────────────────
 
 def _participant_id(participant: object) -> str:
     if not isinstance(participant, dict):
@@ -133,8 +148,8 @@ def _participant_name(participant: object) -> str:
 def _participant_is_local(participant: object) -> bool:
     if not isinstance(participant, dict):
         return False
-    participant_id = _participant_id(participant)
-    if participant_id == "local":
+    pid = _participant_id(participant)
+    if pid == "local":
         return True
     info = _participant_info(participant)
     return bool(participant.get("local") or info.get("isLocal"))
@@ -192,6 +207,10 @@ def _build_transport_message(message: dict[str, object], participant_id: str | N
     return OutputTransportMessageFrame(message=message)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Shared frame processors
+# ──────────────────────────────────────────────────────────────────────
+
 class TranscriptForwarder(FrameProcessor):
     """Forward user STT and bot text updates over the transport data channel."""
 
@@ -225,6 +244,46 @@ class TranscriptForwarder(FrameProcessor):
         except Exception as exc:
             logger.warning("Could not forward transcript: {}", exc)
 
+
+class SpeakingStateNotifier(FrameProcessor):
+    """Notify listeners when the bot starts and stops speaking."""
+
+    def __init__(self, transport: BaseTransport):
+        super().__init__()
+        self._transport = transport
+        self._is_speaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if (
+            isinstance(frame, TextFrame)
+            and not isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
+            and frame.text
+            and not self._is_speaking
+        ):
+            self._is_speaking = True
+            await self._send_state(True)
+        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._is_speaking:
+            self._is_speaking = False
+            await self._send_state(False)
+
+        await self.push_frame(frame, direction)
+
+    async def _send_state(self, is_speaking: bool):
+        try:
+            payload = {
+                "type": "speaking_state",
+                "isSpeaking": is_speaking,
+            }
+            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
+        except Exception as exc:
+            logger.warning("Could not send speaking state: {}", exc)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Relay-only frame processors
+# ──────────────────────────────────────────────────────────────────────
 
 class HumanOnlyAudioInputFilter(FrameProcessor):
     """Drops SoulX/local bot audio before it reaches STT in relay mode."""
@@ -263,42 +322,6 @@ class HumanOnlyAudioInputFilter(FrameProcessor):
             user_id,
             reason,
         )
-
-
-class SpeakingStateNotifier(FrameProcessor):
-    """Notify listeners when the bot starts and stops speaking."""
-
-    def __init__(self, transport: BaseTransport):
-        super().__init__()
-        self._transport = transport
-        self._is_speaking = False
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if (
-            isinstance(frame, TextFrame)
-            and not isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
-            and frame.text
-            and not self._is_speaking
-        ):
-            self._is_speaking = True
-            await self._send_state(True)
-        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._is_speaking:
-            self._is_speaking = False
-            await self._send_state(False)
-
-        await self.push_frame(frame, direction)
-
-    async def _send_state(self, is_speaking: bool):
-        try:
-            payload = {
-                "type": "speaking_state",
-                "isSpeaking": is_speaking,
-            }
-            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
-        except Exception as exc:
-            logger.warning("Could not send speaking state: {}", exc)
 
 
 class AvatarReadyGateProcessor(FrameProcessor):
@@ -434,7 +457,56 @@ class AvatarRelayProcessor(FrameProcessor):
             logger.exception("Failed to send avatar relay message type={}", message_type)
 
 
-async def run_bot(
+# ──────────────────────────────────────────────────────────────────────
+# Output mode resolution
+# ──────────────────────────────────────────────────────────────────────
+
+async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
+    """Determine output mode from the avatar's display mode in the scene.
+
+    Mapping:
+      "talking"   -> "relay_avatar" (SoulX avatar with lip-sync video)
+      everything else (normal, invisible, 3dgs) -> "cartesia" (classic voice)
+
+    Falls back to CLOUD_OUTPUT_MODE env var when the scene snapshot
+    cannot be fetched (no room_id, API error, etc.).
+    """
+    if room_id:
+        from api_client import get_scene_snapshot
+
+        snapshot = await get_scene_snapshot(room_id, api_url)
+        if snapshot:
+            display_mode = snapshot.get("avatar_display_mode", "normal")
+            if display_mode == "talking":
+                logger.info(
+                    "Avatar display_mode={} -> output_mode=relay_avatar",
+                    display_mode,
+                )
+                return "relay_avatar"
+            logger.info(
+                "Avatar display_mode={} -> output_mode=cartesia",
+                display_mode,
+            )
+            return "cartesia"
+    logger.info(
+        "Could not resolve display mode from scene; falling back to CLOUD_OUTPUT_MODE={}",
+        CLOUD_OUTPUT_MODE,
+    )
+    return CLOUD_OUTPUT_MODE
+
+
+# ======================================================================
+#
+#  CLASSIC PIPELINE  (avatar display: normal / invisible / 3dgs)
+#
+#  Mic -> STT (Deepgram) -> LLM (OpenAI) -> TTS (Cartesia) -> Speaker
+#
+#  Simple event handlers.  Any connecting client triggers greeting;
+#  any disconnect cancels the pipeline.
+#
+# ======================================================================
+
+async def run_bot_classic(
     transport: BaseTransport,
     runner_args: RunnerArguments,
     room_id: str = "",
@@ -443,12 +515,8 @@ async def run_bot(
     flow_id: str | None = None,
     api_url: str | None = None,
 ):
-    logger.info(
-        "Starting Human Virtual voice agent (room={}, avatar={}, output_mode={})",
-        room_id,
-        avatar_id,
-        CLOUD_OUTPUT_MODE,
-    )
+    """Classic voice agent pipeline with Cartesia TTS."""
+    logger.info("Starting classic voice agent (room={}, avatar={})", room_id, avatar_id)
 
     system_prompt = await build_system_prompt(
         room_id=room_id,
@@ -472,16 +540,28 @@ async def run_bot(
     scene_image_b64 = None
     if room_id:
         from api_client import get_scene_image_base64
-
         scene_image_b64 = await get_scene_image_base64(room_id, api_url)
         if scene_image_b64:
             logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
         else:
             logger.info("No scene image available; vision disabled for this session")
 
+    # ── Fetch scene snapshot for scripts ──
+    scene_snapshot = None
+    if room_id:
+        from api_client import get_scene_snapshot
+        scene_snapshot = await get_scene_snapshot(room_id, api_url)
+        if scene_snapshot:
+            logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
+
+    # ── AI Services ──
     canvas_tools = get_canvas_tools()
     stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
     voice_id = (avatar_config or {}).get("voiceModelId") or CARTESIA_VOICE_ID
+    tts = CartesiaTTSService(
+        api_key=CARTESIA_API_KEY,
+        settings=CartesiaTTSService.Settings(voice=voice_id),
+    )
     llm = OpenAILLMService(
         api_key=OPENAI_API_KEY,
         settings=OpenAILLMService.Settings(
@@ -489,19 +569,11 @@ async def run_bot(
             system_instruction=system_prompt,
         ),
     )
-    tts = None
-    if CLOUD_OUTPUT_MODE == "cartesia":
-        tts = CartesiaTTSService(
-            api_key=CARTESIA_API_KEY,
-            settings=CartesiaTTSService.Settings(
-                voice=voice_id,
-            ),
-        )
 
+    # ── Conversation context ──
     initial_messages = []
     if scene_image_b64:
         from scene_context import build_vision_message
-
         initial_messages.append(build_vision_message(scene_image_b64))
 
     context = LLMContext(
@@ -509,6 +581,7 @@ async def run_bot(
         tools=canvas_tools,
     )
 
+    # ── Output transport + canvas action handlers ──
     output_transport = transport.output()
     action_handlers = create_canvas_action_handlers(
         output_transport=output_transport,
@@ -520,6 +593,7 @@ async def run_bot(
     for func_name, handler in action_handlers.items():
         llm.register_function(func_name, handler)
 
+    # ── Aggregators with VAD ──
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -527,10 +601,176 @@ async def run_bot(
         ),
     )
 
+    # ── Transcript forwarding + speaking state ──
     user_transcript_fwd = TranscriptForwarder(output_transport)
     avatar_transcript_fwd = TranscriptForwarder(output_transport)
     speaking_notifier = SpeakingStateNotifier(output_transport)
 
+    # ── Pipeline ──
+    pipeline = Pipeline([
+        transport.input(),       # Visitor's microphone audio (WebRTC)
+        stt,                     # Deepgram: speech -> text
+        user_transcript_fwd,     # Forward user STT transcripts to frontend
+        user_aggregator,         # Add user message to conversation history
+        llm,                     # OpenAI: generate response
+        avatar_transcript_fwd,   # Forward avatar LLM text to frontend
+        speaking_notifier,       # Notify frontend of speaking state
+        tts,                     # Cartesia: response -> speech audio
+        output_transport,        # Send audio back to visitor (WebRTC)
+        assistant_aggregator,    # Add bot response to conversation history
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    # ── Event handlers (simple — no participant role detection) ──
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Visitor connected to live room")
+
+        if scene_snapshot and scene_snapshot.get("scripts"):
+            scripts = sorted(scene_snapshot["scripts"], key=lambda s: s.get("order", 0))
+            for script in scripts:
+                text = script.get("text", "").strip()
+                if text:
+                    await task.queue_frames([TTSSpeakFrame(text=text)])
+
+            await task.queue_frames([
+                TTSSpeakFrame(text="Please feel free to ask me if you have any questions.")
+            ])
+
+            await output_transport.send_message(
+                OutputTransportMessageFrame(message={"type": "script_complete"})
+            )
+
+            context.add_message({
+                "role": "developer",
+                "content": (
+                    "You just finished presenting the scene scripts to the visitor. "
+                    "They heard your full presentation. Don't repeat what you already said."
+                ),
+            })
+        else:
+            context.add_message({
+                "role": "developer",
+                "content": GREETING_TRIGGER_PROMPT,
+            })
+            await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Visitor disconnected")
+        await task.cancel()
+
+    # ── Run ──
+    runner = PipelineRunner(handle_sigint=False)
+    await runner.run(task)
+
+
+# ======================================================================
+#
+#  RELAY AVATAR PIPELINE  (avatar display: talking)
+#
+#  Mic -> AudioFilter -> STT -> LLM -> text relay -> SoulX avatar bot
+#
+#  No local TTS.  Cloud bot is silent; SoulX handles speech + video.
+#  Complex participant management: role detection, audio filtering,
+#  avatar readiness gating, relay protocol.
+#
+# ======================================================================
+
+async def run_bot_relay(
+    transport: BaseTransport,
+    runner_args: RunnerArguments,
+    room_id: str = "",
+    avatar_id: str = "",
+    scene_id: str = "",
+    flow_id: str | None = None,
+    api_url: str | None = None,
+):
+    """Relay avatar pipeline — forwards LLM text to SoulX for speech + video."""
+    logger.info("Starting relay avatar agent (room={}, avatar={})", room_id, avatar_id)
+
+    system_prompt = await build_system_prompt(
+        room_id=room_id,
+        avatar_id=avatar_id,
+        scene_id=scene_id,
+        api_url=api_url,
+    )
+    logger.info(f"System prompt length: {len(system_prompt)} chars")
+
+    # ── Fetch canvas image for vision ──
+    scene_image_b64 = None
+    if room_id:
+        from api_client import get_scene_image_base64
+        scene_image_b64 = await get_scene_image_base64(room_id, api_url)
+        if scene_image_b64:
+            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
+        else:
+            logger.info("No scene image available; vision disabled for this session")
+
+    # ── Fetch scene snapshot for scripts ──
+    scene_snapshot = None
+    if room_id:
+        from api_client import get_scene_snapshot
+        scene_snapshot = await get_scene_snapshot(room_id, api_url)
+        if scene_snapshot:
+            logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
+
+    # ── AI Services (no TTS — SoulX handles speech) ──
+    canvas_tools = get_canvas_tools()
+    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+    llm = OpenAILLMService(
+        api_key=OPENAI_API_KEY,
+        settings=OpenAILLMService.Settings(
+            model=LLM_MODEL,
+            system_instruction=system_prompt,
+        ),
+    )
+
+    # ── Conversation context ──
+    initial_messages = []
+    if scene_image_b64:
+        from scene_context import build_vision_message
+        initial_messages.append(build_vision_message(scene_image_b64))
+
+    context = LLMContext(
+        messages=initial_messages if initial_messages else None,
+        tools=canvas_tools,
+    )
+
+    # ── Output transport + canvas action handlers ──
+    output_transport = transport.output()
+    action_handlers = create_canvas_action_handlers(
+        output_transport=output_transport,
+        context=context,
+        llm=llm,
+        room_id=room_id,
+        api_url=api_url,
+    )
+    for func_name, handler in action_handlers.items():
+        llm.register_function(func_name, handler)
+
+    # ── Aggregators with VAD ──
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    # ── Transcript forwarding + speaking state ──
+    user_transcript_fwd = TranscriptForwarder(output_transport)
+    avatar_transcript_fwd = TranscriptForwarder(output_transport)
+    speaking_notifier = SpeakingStateNotifier(output_transport)
+
+    # ── Participant tracking ──
     avatar_participant_id: str | None = None
     active_human_id: str | None = None
     avatar_ready_event = asyncio.Event()
@@ -541,36 +781,33 @@ async def run_bot(
         return avatar_participant_id
 
     def get_local_participant_id() -> str | None:
-        participant_id = str(getattr(transport, "participant_id", "")).strip()
-        return participant_id or None
+        pid = str(getattr(transport, "participant_id", "")).strip()
+        return pid or None
 
-    def get_active_human_id() -> str | None:
-        return active_human_id
-
-    def _remove_pending_audio_capture(participant_id: str | None):
-        if not participant_id:
+    def _remove_pending_audio_capture(pid: str | None):
+        if not pid:
             return
         input_transport = getattr(transport, "_input", None)
         pending = getattr(input_transport, "_capture_participant_audio", None)
         if not isinstance(pending, list):
             return
-        filtered = [item for item in pending if not item or str(item[0]) != participant_id]
+        filtered = [item for item in pending if not item or str(item[0]) != pid]
         if len(filtered) != len(pending):
             pending[:] = filtered
-            logger.info("Removed pending audio capture for participant_id={}", participant_id)
+            logger.info("Removed pending audio capture for participant_id={}", pid)
 
-    async def _ensure_avatar_participant_ignored(participant_id: str | None):
+    async def _ensure_avatar_participant_ignored(pid: str | None):
         nonlocal captured_audio_participant_id, active_human_id
-        if CLOUD_OUTPUT_MODE != "relay_avatar" or not participant_id:
+        if not pid:
             return
 
-        _remove_pending_audio_capture(participant_id)
+        _remove_pending_audio_capture(pid)
 
         update_subscriptions = getattr(transport, "update_subscriptions", None)
         if callable(update_subscriptions):
             await update_subscriptions(
                 participant_settings={
-                    participant_id: {
+                    pid: {
                         "media": {
                             "microphone": "unsubscribed",
                             "screenAudio": "unsubscribed",
@@ -579,27 +816,25 @@ async def run_bot(
                 }
             )
 
-        if captured_audio_participant_id == participant_id:
+        if captured_audio_participant_id == pid:
             captured_audio_participant_id = None
-        if active_human_id == participant_id:
+        if active_human_id == pid:
             active_human_id = None
 
-        logger.info("Ensured SoulX avatar participant is ignored participant_id={}", participant_id)
+        logger.info("Ensured SoulX avatar participant is ignored participant_id={}", pid)
 
-    async def _start_human_audio_capture(participant_id: str | None):
+    async def _start_human_audio_capture(pid: str | None):
         nonlocal captured_audio_participant_id
-        if CLOUD_OUTPUT_MODE != "relay_avatar":
+        if not pid or pid == avatar_participant_id:
             return
-        if not participant_id or participant_id == avatar_participant_id:
-            return
-        if captured_audio_participant_id == participant_id:
+        if captured_audio_participant_id == pid:
             return
 
         _remove_pending_audio_capture(avatar_participant_id)
 
         capture_participant_audio = getattr(transport, "capture_participant_audio", None)
         if callable(capture_participant_audio):
-            await capture_participant_audio(participant_id, "microphone")
+            await capture_participant_audio(pid, "microphone")
 
         input_transport = getattr(transport, "_input", None)
         start_audio_in_streaming = getattr(input_transport, "start_audio_in_streaming", None)
@@ -607,56 +842,32 @@ async def run_bot(
             await start_audio_in_streaming()
             logger.info("Started Daily audio input streaming")
 
-        captured_audio_participant_id = participant_id
-        logger.info("Started human-only audio capture for participant_id={}", participant_id)
+        captured_audio_participant_id = pid
+        logger.info("Started human-only audio capture for participant_id={}", pid)
 
-    human_audio_filter = None
-    relay_processor = None
-    avatar_ready_gate = None
-    if CLOUD_OUTPUT_MODE == "relay_avatar":
-        human_audio_filter = HumanOnlyAudioInputFilter(
-            get_avatar_participant_id,
-            get_local_participant_id,
-        )
-        avatar_ready_gate = AvatarReadyGateProcessor(avatar_ready_event)
-        relay_processor = AvatarRelayProcessor(output_transport, get_avatar_participant_id)
+    # ── Relay-mode processors ──
+    human_audio_filter = HumanOnlyAudioInputFilter(
+        get_avatar_participant_id,
+        get_local_participant_id,
+    )
+    avatar_ready_gate = AvatarReadyGateProcessor(avatar_ready_event)
+    relay_processor = AvatarRelayProcessor(output_transport, get_avatar_participant_id)
 
-    if CLOUD_OUTPUT_MODE == "cartesia":
-        assert tts is not None
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                user_transcript_fwd,
-                user_aggregator,
-                llm,
-                avatar_transcript_fwd,
-                speaking_notifier,
-                tts,
-                output_transport,
-                assistant_aggregator,
-            ]
-        )
-    else:
-        assert human_audio_filter is not None
-        assert avatar_ready_gate is not None
-        assert relay_processor is not None
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                human_audio_filter,
-                stt,
-                user_transcript_fwd,
-                user_aggregator,
-                avatar_ready_gate,
-                llm,
-                avatar_transcript_fwd,
-                speaking_notifier,
-                relay_processor,
-                assistant_aggregator,
-                output_transport,
-            ]
-        )
+    # ── Pipeline ──
+    pipeline = Pipeline([
+        transport.input(),       # Participant audio (per-track)
+        human_audio_filter,      # Drop avatar/local bot audio
+        stt,                     # Deepgram: speech -> text
+        user_transcript_fwd,     # Forward user STT transcripts to frontend
+        user_aggregator,         # Add user message to conversation history
+        avatar_ready_gate,       # Block until avatar bot is ready
+        llm,                     # OpenAI: generate response
+        avatar_transcript_fwd,   # Forward avatar LLM text to frontend
+        speaking_notifier,       # Notify frontend of speaking state
+        relay_processor,         # Relay text to SoulX avatar bot
+        assistant_aggregator,    # Add bot response to conversation history
+        output_transport,        # Data channel (no audio out)
+    ])
 
     task = PipelineTask(
         pipeline,
@@ -666,79 +877,123 @@ async def run_bot(
         ),
     )
 
+    # ── Relay helpers ──
+
+    async def _send_relay(msg_type: str, **fields):
+        """Send a relay protocol message directly to the avatar bot."""
+        pid = get_avatar_participant_id()
+        if not pid:
+            logger.warning("Cannot send relay {}: no avatar participant", msg_type)
+            return
+        payload = {"type": msg_type, "protocol": RELAY_PROTOCOL, **fields}
+        try:
+            await output_transport.send_message(
+                _build_transport_message(payload, participant_id=pid)
+            )
+        except Exception:
+            logger.exception("Failed to send relay message type={}", msg_type)
+
+    # ── Greeting (waits for avatar readiness) ──
+
     async def _queue_greeting():
         nonlocal greeting_sent
         if greeting_sent:
             return
-        if CLOUD_OUTPUT_MODE == "relay_avatar" and not avatar_ready_event.is_set():
+        if not avatar_ready_event.is_set():
             logger.info("Waiting for avatar relay bot to become ready before greeting visitor")
             await avatar_ready_event.wait()
         if greeting_sent:
             return
 
         greeting_sent = True
-        context.add_message(
-            {
+
+        if scene_snapshot and scene_snapshot.get("scripts"):
+            # Send scripts directly to SoulX via relay protocol
+            turn_id = str(uuid.uuid4())
+            seq = 0
+
+            await _send_relay(RELAY_TURN_START, turn_id=turn_id)
+
+            scripts = sorted(scene_snapshot["scripts"], key=lambda s: s.get("order", 0))
+            for script in scripts:
+                text = script.get("text", "").strip()
+                if text:
+                    await _send_relay(RELAY_TEXT, turn_id=turn_id, seq=seq, text=text)
+                    seq += 1
+
+            await _send_relay(
+                RELAY_TEXT, turn_id=turn_id, seq=seq,
+                text="Please feel free to ask me if you have any questions.",
+            )
+
+            await _send_relay(RELAY_TURN_END, turn_id=turn_id)
+
+            await output_transport.send_message(
+                OutputTransportMessageFrame(message={"type": "script_complete"})
+            )
+
+            context.add_message({
+                "role": "developer",
+                "content": (
+                    "You just finished presenting the scene scripts to the visitor. "
+                    "They heard your full presentation. Don't repeat what you already said."
+                ),
+            })
+        else:
+            context.add_message({
                 "role": "developer",
                 "content": GREETING_TRIGGER_PROMPT,
-            }
-        )
-        await task.queue_frames([LLMRunFrame()])
+            })
+            await task.queue_frames([LLMRunFrame()])
 
-    async def _cancel_for_human_leave(reason: str, participant_id: str | None):
+    async def _cancel_for_human_leave(reason: str, pid: str | None):
         nonlocal active_human_id, captured_audio_participant_id, greeting_sent
         logger.info(
-            "Human participant left reason={} participant_id={}; cancelling cloud bot",
+            "Human participant left reason={} participant_id={}; cancelling relay bot",
             reason,
-            participant_id,
+            pid,
         )
         active_human_id = None
         captured_audio_participant_id = None
         greeting_sent = False
         await task.cancel()
 
-    if CLOUD_OUTPUT_MODE == "relay_avatar":
-        @transport.event_handler("on_app_message")
-        async def on_app_message(transport, message, sender):
-            nonlocal avatar_participant_id
-            if not _is_relay_ready_message(message):
-                return
-            avatar_participant_id = str(sender or "").strip() or avatar_participant_id
-            avatar_ready_event.set()
-            await _ensure_avatar_participant_ignored(avatar_participant_id)
-            logger.info("Avatar relay bot is ready: participant_id={}", avatar_participant_id)
+    # ── Event handlers (complex — participant role detection) ──
+
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        nonlocal avatar_participant_id
+        if not _is_relay_ready_message(message):
+            return
+        avatar_participant_id = str(sender or "").strip() or avatar_participant_id
+        avatar_ready_event.set()
+        await _ensure_avatar_participant_ignored(avatar_participant_id)
+        logger.info("Avatar relay bot is ready: participant_id={}", avatar_participant_id)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         nonlocal active_human_id, avatar_participant_id
 
         role = _participant_role(client)
-        participant_id = _participant_id(client)
-        participant_name = _participant_name(client)
-        if avatar_participant_id and participant_id and participant_id == avatar_participant_id:
+        pid = _participant_id(client)
+        pname = _participant_name(client)
+        if avatar_participant_id and pid and pid == avatar_participant_id:
             role = "avatar_bot"
-        logger.info(
-            "Participant connected role={} id={} name={}",
-            role,
-            participant_id,
-            participant_name,
-        )
+        logger.info("Participant connected role={} id={} name={}", role, pid, pname)
 
         if role == "avatar_bot":
-            avatar_participant_id = participant_id or avatar_participant_id
-            if CLOUD_OUTPUT_MODE == "relay_avatar":
-                avatar_ready_event.set()
-                await _ensure_avatar_participant_ignored(participant_id)
+            avatar_participant_id = pid or avatar_participant_id
+            avatar_ready_event.set()
+            await _ensure_avatar_participant_ignored(pid)
             return
 
         if role != "human":
             return
 
-        active_human_id = participant_id or active_human_id
-        if CLOUD_OUTPUT_MODE == "relay_avatar":
-            await _start_human_audio_capture(active_human_id)
-            if not avatar_ready_event.is_set():
-                logger.info("Human joined before avatar relay bot was ready; cloud bot will wait")
+        active_human_id = pid or active_human_id
+        await _start_human_audio_capture(active_human_id)
+        if not avatar_ready_event.is_set():
+            logger.info("Human joined before avatar relay bot was ready; cloud bot will wait")
         asyncio.create_task(_queue_greeting())
 
     @transport.event_handler("on_client_disconnected")
@@ -746,18 +1001,18 @@ async def run_bot(
         nonlocal avatar_participant_id
 
         role = _participant_role(client)
-        participant_id = _participant_id(client)
-        if avatar_participant_id and participant_id and participant_id == avatar_participant_id:
+        pid = _participant_id(client)
+        if avatar_participant_id and pid and pid == avatar_participant_id:
             role = "avatar_bot"
         logger.info(
             "Participant disconnected role={} id={} name={}",
             role,
-            participant_id,
+            pid,
             _participant_name(client),
         )
 
         if role == "avatar_bot":
-            if participant_id and participant_id == avatar_participant_id:
+            if pid and pid == avatar_participant_id:
                 avatar_participant_id = None
                 avatar_ready_event.clear()
             return
@@ -765,26 +1020,26 @@ async def run_bot(
         if role != "human":
             return
 
-        await _cancel_for_human_leave("client_disconnected", participant_id)
+        await _cancel_for_human_leave("client_disconnected", pid)
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         nonlocal avatar_participant_id
 
         role = _participant_role(participant)
-        participant_id = _participant_id(participant)
-        if avatar_participant_id and participant_id and participant_id == avatar_participant_id:
+        pid = _participant_id(participant)
+        if avatar_participant_id and pid and pid == avatar_participant_id:
             role = "avatar_bot"
         logger.info(
             "Participant left role={} id={} name={} reason={}",
             role,
-            participant_id,
+            pid,
             _participant_name(participant),
             reason,
         )
 
         if role == "avatar_bot":
-            if participant_id and participant_id == avatar_participant_id:
+            if pid and pid == avatar_participant_id:
                 avatar_participant_id = None
                 avatar_ready_event.clear()
             return
@@ -792,14 +1047,31 @@ async def run_bot(
         if role != "human":
             return
 
-        await _cancel_for_human_leave("participant_left", participant_id)
+        await _cancel_for_human_leave("participant_left", pid)
 
+    # ── Run ──
     runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────
+
 async def bot(runner_args: RunnerArguments):
-    """Entry point called by Pipecat runner."""
+    """Entry point called by Pipecat runner.
+
+    Resolves the output mode from the avatar's display_mode in the scene,
+    then dispatches to either the classic or relay pipeline.
+    """
+    body = getattr(runner_args, "body", {}) or {}
+    room_id = body.get("room_id") or DEFAULT_ROOM_ID
+    avatar_id = body.get("avatar_id") or DEFAULT_AVATAR_ID
+    scene_id = body.get("scene_id") or DEFAULT_SCENE_ID
+    flow_id = body.get("flow_id")
+    api_url = body.get("hv_api_url")
+
+    output_mode = await _resolve_output_mode(room_id, api_url)
 
     if isinstance(runner_args, DailyRunnerArguments):
         from pipecat.transports.daily.transport import DailyTransport
@@ -808,42 +1080,46 @@ async def bot(runner_args: RunnerArguments):
             runner_args.room_url,
             runner_args.token,
             CLOUD_BOT_NAME,
-            params=_daily_params(),
+            params=_daily_params(output_mode),
         )
     else:
         transport_params = {
-            "daily": lambda: _daily_params(),
+            "daily": lambda: _daily_params(output_mode),
             "webrtc": lambda: TransportParams(
                 audio_in_enabled=True,
-                audio_out_enabled=CLOUD_OUTPUT_MODE == "cartesia",
+                audio_out_enabled=output_mode == "cartesia",
             ),
         }
 
         transport = await create_transport(runner_args, transport_params)
 
-    body = getattr(runner_args, "body", {}) or {}
-    room_id = body.get("room_id") or DEFAULT_ROOM_ID
-    avatar_id = body.get("avatar_id") or DEFAULT_AVATAR_ID
-    scene_id = body.get("scene_id") or DEFAULT_SCENE_ID
-    flow_id = body.get("flow_id")
-    api_url = body.get("hv_api_url")
+    if output_mode == "relay_avatar":
+        await run_bot_relay(
+            transport,
+            runner_args,
+            room_id=room_id,
+            avatar_id=avatar_id,
+            scene_id=scene_id,
+            flow_id=flow_id,
+            api_url=api_url,
+        )
+    else:
+        await run_bot_classic(
+            transport,
+            runner_args,
+            room_id=room_id,
+            avatar_id=avatar_id,
+            scene_id=scene_id,
+            flow_id=flow_id,
+            api_url=api_url,
+        )
 
-    await run_bot(
-        transport,
-        runner_args,
-        room_id=room_id,
-        avatar_id=avatar_id,
-        scene_id=scene_id,
-        flow_id=flow_id,
-        api_url=api_url,
-    )
 
-
-def _daily_params():
+def _daily_params(output_mode: str = "cartesia"):
     """Lazy import DailyParams so the daily extra isn't required for local dev."""
     from pipecat.transports.daily.transport import DailyParams
 
-    if CLOUD_OUTPUT_MODE == "relay_avatar":
+    if output_mode == "relay_avatar":
         return DailyParams(
             audio_in_enabled=True,
             audio_in_user_tracks=True,
