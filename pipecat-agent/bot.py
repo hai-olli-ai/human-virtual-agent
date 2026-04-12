@@ -281,6 +281,37 @@ class SpeakingStateNotifier(FrameProcessor):
             logger.warning("Could not send speaking state: {}", exc)
 
 
+class ThinkingNotifier(FrameProcessor):
+    """Notify frontend when the LLM starts and finishes processing."""
+
+    def __init__(self, transport: BaseTransport):
+        super().__init__()
+        self._transport = transport
+        self._is_thinking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseStartFrame) and not self._is_thinking:
+            self._is_thinking = True
+            await self._send_state(True)
+        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._is_thinking:
+            self._is_thinking = False
+            await self._send_state(False)
+
+        await self.push_frame(frame, direction)
+
+    async def _send_state(self, thinking: bool):
+        try:
+            payload = {
+                "type": "llm_thinking",
+                "thinking": thinking,
+            }
+            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
+        except Exception as exc:
+            logger.warning("Could not send thinking state: {}", exc)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Relay-only frame processors
 # ──────────────────────────────────────────────────────────────────────
@@ -601,10 +632,11 @@ async def run_bot_classic(
         ),
     )
 
-    # ── Transcript forwarding + speaking state ──
+    # ── Transcript forwarding + speaking/thinking state ──
     user_transcript_fwd = TranscriptForwarder(output_transport)
     avatar_transcript_fwd = TranscriptForwarder(output_transport)
     speaking_notifier = SpeakingStateNotifier(output_transport)
+    thinking_notifier = ThinkingNotifier(output_transport)
 
     # ── Pipeline ──
     pipeline = Pipeline([
@@ -613,6 +645,7 @@ async def run_bot_classic(
         user_transcript_fwd,     # Forward user STT transcripts to frontend
         user_aggregator,         # Add user message to conversation history
         llm,                     # OpenAI: generate response
+        thinking_notifier,       # Notify frontend of LLM thinking state
         avatar_transcript_fwd,   # Forward avatar LLM text to frontend
         speaking_notifier,       # Notify frontend of speaking state
         tts,                     # Cartesia: response -> speech audio
@@ -765,10 +798,11 @@ async def run_bot_relay(
         ),
     )
 
-    # ── Transcript forwarding + speaking state ──
+    # ── Transcript forwarding + speaking/thinking state ──
     user_transcript_fwd = TranscriptForwarder(output_transport)
     avatar_transcript_fwd = TranscriptForwarder(output_transport)
     speaking_notifier = SpeakingStateNotifier(output_transport)
+    thinking_notifier = ThinkingNotifier(output_transport)
 
     # ── Participant tracking ──
     avatar_participant_id: str | None = None
@@ -862,6 +896,7 @@ async def run_bot_relay(
         user_aggregator,         # Add user message to conversation history
         avatar_ready_gate,       # Block until avatar bot is ready
         llm,                     # OpenAI: generate response
+        thinking_notifier,       # Notify frontend of LLM thinking state
         avatar_transcript_fwd,   # Forward avatar LLM text to frontend
         speaking_notifier,       # Notify frontend of speaking state
         relay_processor,         # Relay text to SoulX avatar bot
