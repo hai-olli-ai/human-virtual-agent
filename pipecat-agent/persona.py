@@ -12,8 +12,10 @@ from api_client import (
     get_scene_snapshot,
 )
 from scene_context import (
+    KNOWLEDGE_PREAMBLE,
     build_canvas_tools_section,
     build_instruction_section,
+    build_knowledge_context,
     build_scene_description,
     build_scripts_section,
 )
@@ -27,6 +29,28 @@ You are a friendly AI assistant for Human Virtual.
 - Keep responses concise — this is a voice conversation, not a text chat
 - Be warm and engaging — you're presenting content to a real person
 - If asked something you don't know, say so honestly"""
+
+
+def _build_knowledge_block(snapshot: dict) -> str:
+    """Build the knowledge section for the system prompt.
+
+    Returns preamble + formatted knowledge, or "" when the snapshot has no
+    usable knowledge. Emits one log line with snapshot metadata when content
+    is injected — helps debug why the avatar does/doesn't know something.
+    """
+    knowledge = snapshot.get("knowledge")
+    knowledge_context = build_knowledge_context(knowledge)
+    if not knowledge_context:
+        return ""
+
+    logger.info(
+        "Knowledge injected into system prompt: total_chars={tc}, budget_exceeded={be}, scene_sources={ss}, flow_sources={fs}",
+        tc=knowledge.get("total_chars", 0),
+        be=knowledge.get("budget_exceeded", False),
+        ss=len((knowledge.get("scene") or {}).get("sources") or []),
+        fs=len((knowledge.get("flow") or {}).get("sources") or []),
+    )
+    return f"{KNOWLEDGE_PREAMBLE}\n{knowledge_context}"
 
 
 async def build_system_prompt(
@@ -56,6 +80,11 @@ async def build_system_prompt(
             # but we can still fetch the snapshot for enrichment
             snapshot = await get_scene_snapshot(room_id, api_url)
             if snapshot:
+                # Knowledge section (S56) — after persona, before tools
+                knowledge_block = _build_knowledge_block(snapshot)
+                if knowledge_block:
+                    prompt_parts.append(knowledge_block)
+
                 # Add canvas tools section (for Session 47)
                 tools = build_canvas_tools_section(snapshot)
                 if tools:
@@ -89,6 +118,11 @@ async def build_system_prompt(
     if room_id:
         snapshot = await get_scene_snapshot(room_id, api_url)
         if snapshot:
+            # Knowledge section (S56) — between avatar persona and scene details
+            knowledge_block = _build_knowledge_block(snapshot)
+            if knowledge_block:
+                prompt_parts.append(knowledge_block)
+
             prompt_parts.append(build_scene_description(snapshot))
 
             instruction = build_instruction_section(snapshot)

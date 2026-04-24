@@ -4,6 +4,104 @@ Takes a scene snapshot dict from the API and builds descriptive text
 for the LLM system prompt.
 """
 from loguru import logger
+from typing import Any
+
+KNOWLEDGE_PREAMBLE = (
+    "You have access to the following knowledge base. When visitors ask "
+    "questions, prefer answers grounded in this knowledge. If the visitor "
+    "asks something not covered here, you can answer from general knowledge, "
+    "but mention when you're outside the provided context."
+)
+
+
+def _format_scope(scope_data: dict[str, Any] | None, scope_label: str) -> str:
+    """Format one knowledge scope (scene or flow) into a markdown section.
+    Returns empty string if scope is None or has no content.
+
+    Priority order within a scope: FAQ → Documents → URLs.
+    (FAQ first because it's curated and highest-signal.)
+    """
+    if not scope_data:
+        return ""
+
+    parts: list[str] = []
+
+    faqs = scope_data.get("faqs") or []
+    if faqs:
+        faq_lines = ["## FAQ"]
+        for faq in faqs:
+            q = (faq.get("question") or "").strip()
+            a = (faq.get("answer") or "").strip()
+            if not q or not a:
+                continue
+            faq_lines.append(f"Q: {q}")
+            faq_lines.append(f"A: {a}")
+            faq_lines.append("")
+        if len(faq_lines) > 1:
+            parts.append("\n".join(faq_lines))
+
+    sources = scope_data.get("sources") or []
+    for src in sources:
+        text = (src.get("extracted_text") or "").strip()
+        if not text:
+            continue
+        name = src.get("file_name") or "document"
+        parts.append(f"## Document: {name}\n{text}")
+
+    urls = scope_data.get("urls") or []
+    for url in urls:
+        text = (url.get("markdown_content") or "").strip()
+        if not text:
+            continue
+        header = (url.get("title") or "").strip() or url.get("url") or "web page"
+        parts.append(f"## Web Page: {header}\n{text}")
+
+    if not parts:
+        return ""
+
+    return f"\n# {scope_label} KNOWLEDGE\n\n" + "\n\n---\n\n".join(parts)
+
+
+def build_knowledge_context(knowledge: dict[str, Any] | None) -> str:
+    """Format the snapshot's knowledge dict into a system-prompt section.
+
+    Args:
+      knowledge: The `knowledge` object from scene-snapshot, or None.
+
+    Shape:
+      {
+        "scene": { "sources": [...], "urls": [...], "faqs": [...] } | None,
+        "flow":  { ... same shape ... } | None,
+        "budget_exceeded": bool,
+        "total_chars": int,
+      }
+
+    Returns:
+      A markdown string with FLOW section first (broader context), SCENE
+      section second (more specific). Empty string when no usable knowledge
+      is present. Never raises — defensive against missing keys.
+    """
+    if not knowledge:
+        return ""
+
+    sections: list[str] = []
+
+    # FLOW first — broader, applies across scenes
+    flow_scope = knowledge.get("flow")
+    if flow_scope:
+        flow_str = _format_scope(flow_scope, "FLOW")
+        if flow_str:
+            sections.append(flow_str)
+
+    # SCENE second — specific to this scene
+    scene_scope = knowledge.get("scene")
+    if scene_scope:
+        scene_str = _format_scope(scene_scope, "SCENE")
+        if scene_str:
+            sections.append(scene_str)
+
+    return "\n\n".join(sections)
+
 
 VISION_MESSAGE = "This is the current scene canvas that the visitor is seeing. The canvas is 1280x720 pixels (origin top-left). Remember the layout, colors, positions, and content of all elements. When discussing the scene, reference what you see in this image. When using canvas action tools (highlight, arrow, annotation), estimate pixel coordinates from this image."
 
