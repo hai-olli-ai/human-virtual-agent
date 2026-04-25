@@ -161,6 +161,13 @@ def build_scene_description(snapshot: dict) -> str:
     elements = snapshot.get("elements", [])
     if elements:
         parts.append("\nElements on the canvas:")
+        # Note (S59): Element type "button" is a visitor-clickable CTA on
+        # the scene canvas. The agent has no canvas-click tool — it should
+        # describe buttons by their `title` (e.g. "the 'Sign up now' button
+        # in the lower right") and may use the existing highlight_element
+        # canvas action to point at one, but it must NOT attempt to "click"
+        # buttons on the visitor's behalf. Buttons are part of the visual
+        # scene; clicks are exclusively the visitor's affordance.
         for el in elements:
             el_type = el.get("type", "unknown")
             desc = f"- {el_type}"

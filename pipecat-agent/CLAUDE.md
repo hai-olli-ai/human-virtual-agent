@@ -1,280 +1,264 @@
-# CLAUDE.md — pipecat-agent
+# CLAUDE.md — `pipecat-agent/`
 
-> **For Claude Code.** Ground truth for this repo. Read top-to-bottom before editing. Last synced after **Session 56 (Knowledge RAG — agent half)**. Next agent-touching session is **S58 or later** — S57 may or may not touch this repo depending on whether survey display requires agent coordination.
+> Last updated: Session 59 (Interactive Button Elements). Version: V2.10.
+
+This is the operating manual for Claude Code working in the voice agent. Read before making changes.
 
 ---
 
 ## What this repo is
 
-The Pipecat voice agent service for **Human Virtual** (hv.ai). Runs as a Pipecat pipeline (VAD → STT → LLM → TTS → WebRTC transport) and connects visitors on `/live/[slug]` to an avatar that can hold a real-time voice conversation, see the scene canvas, trigger canvas actions, and — as of S56 — answer grounded in Scene/Flow knowledge.
+The Pipecat-powered voice agent that drives real-time conversation in **Human Virtual** Live Rooms. It connects via WebRTC to the visitor's browser, listens, thinks, talks, and looks at the scene — all under one orchestrated pipeline.
 
-Deployed to **Pipecat Cloud**. Local dev uses `SmallWebRTCTransport`; production uses `DailyTransport`.
+It is a **separate service** from the FastAPI backend. It runs locally (for development) via `SmallWebRTCTransport` and in production via `DailyTransport` on **Pipecat Cloud**.
+
+It is the **only** component that talks to the visitor in real time. The backend serves data; the frontend renders UI; this service IS the avatar's voice and eyes.
+
+---
+
+## Pipeline (Pipecat)
+
+```
+Visitor mic
+    │
+    ▼
+SmallWebRTCTransport (local)  /  DailyTransport (prod)
+    │
+    ▼
+Silero VAD            (S37)
+    │
+    ▼
+Deepgram STT          (S45 — multilingual config in S61)
+    │
+    ▼
+LLM (OpenAI/Anthropic via OpenAI-compatible API)   (S45)
+    │
+    ├──► CanvasActionsObserver        (S47) — emits highlight / arrow / annotation / navigate / clear
+    ├──► VisionInjector               (S46) — fetches scene snapshot PNG, injects as image_url
+    ├──► KnowledgeContext             (S56) — fetched once at session start
+    └──► (S60+) LanguageDirective + RecipientPrompt — prepended to system prompt
+    │
+    ▼
+Cartesia TTS          (S45, S51a)
+    │
+    ▼
+Visitor speaker
+```
+
+Other observers / services running alongside:
+
+- **TranscriptForwarder** (S45) — streams STT/LLM transcripts to the backend for chat-panel display.
+- **SpeakingStateNotifier** (S45) — pushes `speaking_started` / `speaking_stopped` events so the frontend can drive the talking-avatar (S48 SoulX) animation.
+- **Script auto-speak** (S49) — fires the scene's first script line on agent join.
 
 ---
 
 ## Tech stack
 
-| Component | Stack |
+| Layer | Choice |
 |---|---|
-| Language | Python 3.11+ |
-| Framework | Pipecat |
+| Framework | Pipecat 0.0.x |
+| Transport (local) | SmallWebRTCTransport |
+| Transport (prod) | DailyTransport |
 | VAD | Silero |
-| STT | Deepgram streaming |
-| LLM | OpenAI (GPT-4o family — see `OPENAI_LLM_MODEL`) |
-| TTS | Cartesia (streaming) |
-| Transport (prod) | DailyTransport → Pipecat Cloud → Daily.co WebRTC |
-| Transport (local) | SmallWebRTCTransport for loopback testing |
-| Package manager | uv |
-| Logging | Python `logging` (Pipecat logger hierarchy) |
+| STT | Deepgram (`nova-2`; `language=multi` fallback in S61) |
+| TTS | Cartesia (`sonic-2`) |
+| LLM | OpenAI-compatible (GPT-4.1 vision for scene understanding) |
+| HTTP | httpx (async) |
+| Logger | structlog |
+| Package mgr | `uv` |
+| Deploy | Pipecat Cloud |
+
+Local dev: `uv run python bot.py` from `pipecat-agent/`.
 
 ---
 
-## Directory structure
+## Repository layout
 
 ```
 pipecat-agent/
-  bot.py                          # pipeline entry point — assembles VAD/STT/LLM/TTS/transport
-  scene_context.py                # builds the LLM system prompt from scene snapshot
-                                  # (S56: now includes build_knowledge_context + KNOWLEDGE_PREAMBLE)
-  canvas_actions.py               # LLM function tools (highlight/arrow/annotation/navigate/clear)
-  hv_api.py                       # thin client for human-virtual-backend
-  config.py                       # env vars
-  Dockerfile
-  pcc-deploy.toml                 # Pipecat Cloud deployment config
+  bot.py                     # entrypoint — pipeline assembly, transport selection
+  scene_context.py           # builds system prompt from snapshot
+  hv_client.py               # async client for backend's public endpoints
+  observers/
+    canvas_actions.py        # S47 — function-call observer
+    transcript_forwarder.py  # S45
+    speaking_state.py        # S45
+    script_auto_speak.py     # S49
+  services/
+    vision_injector.py       # S46 — pulls snapshot PNG as image_url
+    knowledge_context.py     # S56 — formats knowledge into system prompt
+  config.py                  # env vars, Deepgram language map (post-S61)
   pyproject.toml
-  tests/
-    test_scene_context_knowledge.py    # S56 — pure-function tests for build_knowledge_context
-  README.md, DEPLOY.md
+  README.md
+  .env.example
 ```
 
 ---
 
-## Pipeline architecture
+## Critical conventions — read before editing
 
-```
-Visitor browser (WebRTC)
-        │
-        ▼
-[Daily.co / Pipecat Cloud]  ← or SmallWebRTCTransport locally
-        │
-        ▼
-┌─────────────────────────────────────────┐
-│  Pipecat Pipeline (bot.py)               │
-│                                           │
-│  Audio IN                                 │
-│    → Silero VAD                           │
-│    → Deepgram STT (streaming)             │
-│    → LLM Service (OpenAI)                 │
-│        + tools (canvas actions)           │
-│        + system prompt                    │
-│           1. Persona                      │
-│           2. Knowledge (NEW in S56) ─┐    │
-│           3. Scene instruction       │    │
-│           4. Display mode context    │    │
-│           5. Scene elements summary  │    │
-│           6. Canvas action guidance  │    │
-│           + base64 scene PNG          │    │
-│    → Cartesia TTS (streaming)             │
-│  Audio OUT                                │
-│                                           │
-│  Data channel events:                     │
-│    speaking_state / transcription /       │
-│    thinking_state / canvas_action         │
-└─────────────────────────────────────────┘
-        │
-        ▼
-[Human Virtual Frontend]
-  /live/[slug] page
-  - renders avatar (display mode)
-  - shows transcription
-  - listens for canvas_action on data channel
-```
+### 1. The agent doesn't own data — the snapshot does
 
----
+- On session start, the agent calls `GET /api/v1/live-rooms/{slug}/scene-snapshot` (public, unauthenticated).
+- That snapshot is the **single source of truth** for: persona, knowledge, survey (NOTE: ignored — see #4), display mode, scene elements (incl. buttons from S59), instruction, scripts, flow state, and (post-S60) language + recipient prompt.
+- **Don't add new endpoint calls to the agent** for data that should be in the snapshot. Add to the snapshot instead — backend repo, `LiveRoomService.get_scene_snapshot`.
 
-## Current state (post-S56)
+### 2. System prompt assembly lives in `scene_context.py`
 
-**Wired and working:**
-- Real-time voice conversation (STT → LLM → TTS) on Pipecat Cloud
-- Persona prompt fetched from backend on session start
-- Scene instruction injected into system prompt
-- Scene canvas rendered to PNG via Pillow (backend), base64 sent to LLM (vision)
-- 5 canvas action tools with deterministic keyword-based element lookup
-- Script auto-speak on connect (pre-generated Cartesia audio chunks streamed on start)
-- Thinking state indicator via data channel
-- Transcription forwarded via Daily data channel
-- Connection quality + reconnection handled by transport
-- **Knowledge RAG (S56):** `build_knowledge_context` in `scene_context.py` formats scene + flow knowledge (FAQ → docs → URLs) into a markdown block. Injected with `KNOWLEDGE_PREAMBLE` after persona, before scene instruction. Flow scope prepended before Scene scope.
+The agent's system prompt is composed from snapshot data. The order (post-S61) will be:
 
-**Not yet:** Survey integration (TBD in S58 — may need agent awareness for "on exit" trigger, or may be handled entirely client-side via beforeunload + session-end events).
+1. Language directive (top — strong steering) — S61
+2. Persona
+3. Audience / recipient prompt (if non-empty) — S60
+4. Knowledge — S56
+5. Scene instruction
+6. Display mode context
+7. Scene elements summary (incl. buttons — S59)
+8. Canvas action tool usage guidance
+9. Language reminder (bottom — reinforcement) — S61
 
----
+If you add a section, put it in `build_system_prompt()` in `scene_context.py`. Don't fork prompt-building elsewhere.
 
-## Non-negotiable conventions
+### 3. Canvas tools — five and only five
 
-### Transport differences — CRITICAL
-| Transport | Message method | Payload |
-|---|---|---|
-| `DailyTransport` (prod) | `send_app_message(dict)` | dict, auto-JSONified |
-| `SmallWebRTCTransport` (local) | `send_message(str)` | string, JSON-stringify yourself |
+The agent has these LLM function-callable tools (S47):
 
-Frontend handler is tolerant to both. Adding new data-channel events: test both transports.
+- `highlight_element(element_id_or_title)`
+- `draw_arrow(from_x, from_y, to_x, to_y, label?)`
+- `add_annotation(x, y, text)`
+- `navigate_to_scene(scene_id_or_title)`
+- `clear_canvas()`
 
-### Canvas action tools
-- `run_llm=False` for all EXCEPT `navigate_scene` (needs `run_llm=True` so the LLM speaks about the transition)
-- Fire-and-forget: tool emits data-channel event, returns quickly, LLM continues talking
-- Coordinates from **keyword matching** in `canvas_actions.py` — not AI inference
+**The agent has NO tool to click buttons.** Buttons (S59) are visitor-clickable only. The agent can describe them by title and use `highlight_element` to point at them, but it must NOT attempt to "click" anything — there is no such affordance. See the in-line comment in `scene_context.py` (S59).
 
-### Scene context assembly (S56-updated order)
-`scene_context.py::build_system_prompt(snapshot)` assembles the full system prompt. Section order (top → bottom):
-1. **Persona** (avatar's prompt)
-2. **Knowledge** (NEW in S56) — prefixed with `KNOWLEDGE_PREAMBLE`, then FLOW KNOWLEDGE section, then SCENE KNOWLEDGE section. Inside each scope: FAQ → Documents → URLs.
-3. **Scene instruction**
-4. **Display mode context**
-5. **Scene elements summary**
-6. **Canvas action tool usage guidance**
+### 4. Survey snapshot field is intentionally ignored
 
-The reasoning: persona defines character first, knowledge primes the model with domain context second, instruction steers tone/behavior third, then technical scene details and tool specifics fill in the rest.
+The `survey` field in the snapshot (added in S58) is **for the frontend, not the agent**. The agent must not echo survey question text to the visitor; doing so creates a confusing dual-experience (avatar reading questions out loud while the modal also shows them). If the agent is referencing survey content unprompted, debug on the BACKEND side (snapshot assembly) — don't band-aid in the agent.
 
-### Knowledge conventions (S56)
-- `build_knowledge_context(knowledge)` is a pure function — pass the `knowledge` dict from the snapshot or `None`.
-- Returns `""` for None / empty / all-items-empty (graceful no-op; no preamble appears in prompt).
-- Format:
-  ```
-  {KNOWLEDGE_PREAMBLE}
+### 5. Knowledge is loaded once per session, not per turn
 
-  # FLOW KNOWLEDGE
+S56 wires Knowledge into the system prompt at session start. **Don't make the agent call the knowledge endpoint per turn** — it's expensive and the snapshot already carries it. If knowledge needs to update mid-session, that's a future feature (live snapshot polling), not part of S56's contract.
 
-  ## FAQ
-  Q: ...
-  A: ...
+### 6. Display mode awareness
 
-  ---
+Snapshot includes `display_mode` ∈ `normal | invisible | 3dgs | talking`. The agent's system prompt mentions this so the LLM knows whether the visitor sees a static avatar, a 3D one, or a talking-mouth video (SoulX, S48). The agent does NOT change voice or behavior based on display mode — it just gets context.
 
-  ## Document: file_name.pdf
-  [extracted_text]
+### 7. Auto-speak the first script on join
 
-  ---
+S49 fires the scene's first script line via TTS as soon as the agent connects. **This is in addition to the LLM** — the script is a static line, not LLM-generated, so the visitor gets an immediate greeting that matches the creator's authoring. Subsequent turns are LLM-driven.
 
-  ## Web Page: Title
-  [markdown_content]
+### 8. Transport selection by environment
 
-  # SCENE KNOWLEDGE
-  [same structure]
-  ```
-- Defensive `.get(key) or default` everywhere — old snapshots lacking the `knowledge` key must not crash.
-
-### Backend API
-- Single unauthenticated endpoint: `GET /api/v1/live-rooms/{id}/scene-snapshot` returns the full agent context in one call.
-- **After S56, response includes `knowledge: {scene, flow, budget_exceeded, total_chars}`.**
-- Public intentionally — Pipecat agent cannot hold a user token; the slug's existence is the authorization.
-- Agent does NOT call knowledge endpoints directly. It reads only the snapshot.
-
-### Error handling
-- Snapshot fetch fails → fallback greeting with minimal context (don't crash).
-- Canvas action tool fails to find keyword → graceful verbal acknowledgment ("I can't seem to point that out right now").
-- Knowledge present but visitor asks off-topic → agent should say it's outside the provided context (per preamble guidance).
-
-### Data channel event format
 ```python
-{
-  "type": "speaking_state" | "transcription" | "thinking_state" | "canvas_action",
-  "payload": { ... }
-}
+# bot.py (sketch)
+if os.getenv("PIPECAT_CLOUD") == "1":
+    transport = DailyTransport(...)
+else:
+    transport = SmallWebRTCTransport(...)
 ```
+
+Pipecat Cloud sets `PIPECAT_CLOUD=1`. Local dev defaults to SmallWebRTC. Don't hardcode either; respect the env var.
+
+### 9. Multi-language prep (S61, not yet shipped)
+
+After S60–61:
+- Read `language` from snapshot.
+- Map to Deepgram's language code (`en`, `es`, `fr`, `de`, `pt`, `ja`, `ko`, `vi`, `zh`).
+- Pass `language=<code>` to Deepgram service init. Fall back to `language=multi` if a specific model isn't available.
+- Cartesia's `sonic-2` is multilingual at the LLM-output level — no per-language model selection. Voice ID matters: voice clones from English source produce English-accented multilingual output (known caveat).
+- LLM gets a hard "respond in {Language}" directive at top AND bottom of the system prompt (LLMs weight first/last most heavily — belt-and-suspenders).
+
+### 10. Recipient prompt (S60, not yet shipped)
+
+A creator-authored "audience" description (e.g. "Sales team at Acme Corp evaluating renewal — focus on ROI"). Inserted into the system prompt as a `# AUDIENCE` section between persona and knowledge. Empty / whitespace-only prompts produce no section.
+
+---
+
+## Cross-repo contracts
+
+- **Backend's snapshot endpoint is public.** Don't add auth headers to the agent's snapshot fetch — it's a public contract by design (S43).
+- **Snapshot field additions must be Optional.** Older agents shouldn't crash on newer snapshots, and vice versa. The agent must read snapshot fields with `.get()` defaults.
+- **Canvas action events flow agent → frontend** through the Pipecat data channel (S47). Frontend listens for the events and renders SVG overlays. Don't try to render canvas actions from the agent side; the agent only emits events.
+
+---
+
+## Testing
+
+```bash
+uv run pytest                          # unit tests
+uv run pytest tests/test_scene_context.py -v
+```
+
+Manual smoke: run `uv run python bot.py` against a local backend with a real Live Room. Speak through your laptop mic (after `pipecat-agent/.env` is configured); listen for response.
+
+For S60+ multi-language verification, the test is end-to-end: change `language` on the live_room row in the DB, restart the agent, speak English, hear the configured language.
+
+---
+
+## Common gotchas
+
+1. **Pipecat versions move fast.** Pin in `pyproject.toml`. When updating, re-test the entire pipeline; minor versions break observer APIs.
+2. **Cartesia voice IDs are multilingual-capable but quality varies.** Cloned voices from English source sound English-accented in other languages. Document for creators; don't try to fix in the agent.
+3. **Vision injection is expensive.** S46 injects the scene snapshot PNG every N turns (configurable). Don't inject every turn — token cost balloons.
+4. **Don't `await` cold paths inside hot ones.** The pipeline is real-time; latency adds. Cache the snapshot at session start; don't re-fetch on every turn.
+5. **Pipecat Cloud has cold starts.** If a session takes >5s to connect, that's a cold start, not a bug. Pre-warming is in the S69 polish backlog.
+6. **Daily room URLs expire.** Backend creates them on session-start; the agent joins via the room URL passed in the start-session payload. Don't cache room URLs on the agent side.
+7. **Deepgram supports 9 languages directly.** Beyond that, use `language=multi` (auto-detect). Multi-detect is slower and lower-accuracy for short utterances; document as a caveat.
+8. **`OPENAI_API_KEY` is the LLM key, not necessarily OpenAI.** The agent uses an OpenAI-compatible API; could be Anthropic via a proxy. Treat the env var as opaque "LLM key".
+
+---
+
+## Session history (agent-relevant)
+
+| # | Title | Status | Agent change |
+|---|---|---|---|
+| 37–38 | Pipecat scaffold + Cloud deployment | ✅ | Initial bot.py, transport selection |
+| 45 | Live room voice agent integration | ✅ | TranscriptForwarder, SpeakingStateNotifier |
+| 45b | Daily WebRTC hardening | ✅ | DailyTransport, agent participant tracking |
+| 46 | Scene understanding (vision) | ✅ | VisionInjector — base64 PNG into LLM context |
+| 47 | Canvas actions | ✅ | CanvasActionsObserver + 5 LLM tools |
+| 48 | Talking display mode (SoulX) | ✅ | speaking_state events frontend-side |
+| 49 | Script auto-speak | ✅ | ScriptAutoSpeak observer |
+| 50 | Live room polish + analytics | ✅ | session timing telemetry |
+| 51a | Cartesia voice + speech | ✅ | Cartesia TTS replaced earlier provider |
+| 56 | Knowledge RAG | ✅ | KnowledgeContext loaded once per session |
+| 57 | Survey backend + editor | ✅ | (no agent change — visitor UX) |
+| 58 | Survey live + responses | ✅ | (no agent change — survey field ignored) |
+| **59** | **Interactive Button Elements** | **✅ Current** | **Comment-only update in scene_context.py** |
+| 60 | Live Room language + recipient prompt | ⬜ Next | (no agent change — backend + studio) |
+| 61 | Live Room i18n + voice agent multi-language | ⬜ Planned | **Deepgram language, system prompt LANGUAGE + AUDIENCE sections** |
+
+S59 in this repo is documentation-only:
+- A multi-line in-line comment in `scene_context.py` clarifying that buttons are visitor-clickable; the agent describes (not clicks) them and may use `highlight_element` to point at one.
+- (Optional) A `button` branch in the elements summary formatter for nicer prose.
 
 ---
 
 ## Environment variables
 
-```bash
-HV_API_URL=http://localhost:3001           # or https://api.hv.ai in prod
+```
+HV_API_URL=http://localhost:3001          # backend (S45b)
+LIVE_ROOM_SLUG=...                        # set per-session by backend on agent spawn
+PIPECAT_CLOUD=0                           # 1 in production
+PIPECAT_CLOUD_API_KEY=...                 # prod only
+
 DEEPGRAM_API_KEY=...
-OPENAI_API_KEY=...
-OPENAI_LLM_MODEL=gpt-4o                    # or another GPT-4 class
-CARTESIA_API_KEY=...                        # shared with backend
-PIPECAT_CLOUD_API_KEY=...                   # only when deploying
-DAILY_API_KEY=...                           # only in prod transport path
+CARTESIA_API_KEY=...
+OPENAI_API_KEY=...                        # LLM (could be proxy to Anthropic)
+
+DAILY_API_KEY=...                         # prod only
+DAILY_DOMAIN=...                          # prod only
 ```
 
-**No new env vars in S56.** Knowledge comes over HTTP from the snapshot; no new service credentials.
+**S59 added no new env vars.** S61 will not add any either — Deepgram and Cartesia are already configured.
 
 ---
 
-## Dev commands
+## When in doubt
 
-```bash
-uv sync
-
-# Local (SmallWebRTC loopback)
-uv run python bot.py
-
-# Tests
-uv run pytest tests/ -v
-uv run pytest tests/test_scene_context_knowledge.py -v  # S56
-
-# Deploy to Pipecat Cloud
-pcc deploy       # uses pcc-deploy.toml
-pcc logs -f      # tail
-```
-
----
-
-## Session history (agent-touching sessions)
-
-- S37–38: Pipecat scaffold + Cloud deployment
-- S45: Wired to backend for persona prompts; real-time transcription + speaking state via Daily data channel
-- S45b: End-to-end WebRTC hardening, agent participant tracking, cold-start UX
-- S46: Multimodal vision — consumes scene canvas PNG, injects base64 into LLM context
-- S47: LLM function calling for 5 canvas action tools with keyword-based element lookup
-- S49: Script auto-speak on session start
-- S50: Polish — thinking state indicator, connection quality reporting, graceful reconnect
-- (S51a–S55 were all backend or frontend; agent untouched)
-- **S56: Knowledge RAG — `build_knowledge_context` in `scene_context.py`, `KNOWLEDGE_PREAMBLE` constant, injected into `build_system_prompt` between persona and scene instruction. FLOW scope prepended before SCENE scope. FAQ → Docs → URLs within each scope.**
-
----
-
-## Gotchas
-
-1. **Pipecat Cloud cold start.** First session after idle takes 10–20s. Don't try to fix in the agent — it's a Pipecat Cloud property.
-
-2. **Transport message shape.** Local works but Cloud breaks (or vice-versa) → almost always this.
-
-3. **Tool call bloat.** Every tool adds prompt tokens. Canvas actions are deliberately 5.
-
-4. **Don't call the DB from the agent.** All DB access via the backend's snapshot endpoint. Keep the agent stateless.
-
-5. **Don't reintroduce BuddyOS.** Voice-agent pivot to Pipecat replaced it. Enum value `buddyos` exists for legacy records, but agent uses Cartesia.
-
-6. **Image size matters.** Canvas PNG is base64'd into LLM context. If prompt bloat appears, talk to the backend — don't resize in the agent.
-
-7. **System prompt order matters.** LLM weights earlier sections more. Don't rearrange without a good reason. Current order (post-S56): Persona → Knowledge → Scene instruction → Display mode → Scene elements → Tools guidance.
-
-8. **Knowledge is snapshot at connect, not live (S56).** Visitor sees knowledge as it was when their session started. Creator edits mid-session require visitor reconnect. Intentional — alternative would invalidate the LLM's accumulated conversation state.
-
-9. **Preamble wording is tuned.** The `KNOWLEDGE_PREAMBLE` string wording matters — it steers the LLM to prefer grounded answers AND to flag when answering off-knowledge. Don't tweak casually.
-
-10. **Defensive key access.** `snapshot.get("knowledge")` may be missing on older backends or in tests; `build_knowledge_context` handles this. Don't assume keys exist.
-
-11. **No RAG/embeddings/vector search.** S56 is pass-all-text-as-context. If you're reaching for a vector store, stop — that's deferred until someone proves the current approach has real user-visible problems.
-
----
-
-## When starting a new session in this repo
-
-1. Confirm the session actually touches the agent (check the V2.9 guide).
-2. Sanity-check locally with SmallWebRTC before deploying.
-3. Verify both transport paths work — add print/log lines if needed.
-4. Update this file afterward — bump the "last synced after" line and add to session history.
-
----
-
-## For the next agent session (S58 or later)
-
-Session 57 adds the Survey system (backend + frontend editor). It probably does NOT touch this repo — survey display logic lives in the live-room frontend (on-exit beforeunload handler + CTA button + modal).
-
-Session 58 may touch this repo IF survey collection needs to coordinate with the agent lifecycle (e.g. "don't fire on-exit survey while the agent is still speaking" or "the agent should acknowledge when the user opens the survey"). Reading S58 ahead of time: the design is primarily client-side (beforeunload + Pipecat session-end events). If this repo stays untouched, great — more time for S59 scene generation.
-
-Session 59 (knowledge-aware scene generation) is backend-only — does not touch this repo.
-
-**Most likely next agent work: S62 or later.** The current LLM prompt + RAG setup should hold for a while; major agent changes are not planned until post-launch tuning.
+- **New snapshot field in the backend?** Read it via `snapshot.get("new_field", default)` in `scene_context.py`. Older snapshots without the field must not crash.
+- **Adding to the system prompt?** Put it in `scene_context.py::build_system_prompt`. Document order in this file.
+- **New LLM tool?** Add to the canvas-actions observer (S47) only if it's a canvas-side effect (highlight, arrow, etc.). Side effects in the visitor's browser go through the Pipecat data channel. Server-side mutations go via httpx to the backend.
+- **Survey-related agent behavior?** **Stop.** Survey UX is 100% client-side. The agent's job is to ignore the `survey` snapshot field. If you're tempted to read it, debug the issue you're trying to fix elsewhere first.
+- **Canvas button click handling?** The agent has no click tool. If you find yourself adding one, that's out of scope for S59 and likely all of v2 — buttons are visitor-only.
