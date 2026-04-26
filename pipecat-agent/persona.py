@@ -16,6 +16,9 @@ from scene_context import (
     build_canvas_tools_section,
     build_instruction_section,
     build_knowledge_context,
+    build_language_directive,
+    build_language_reminder,
+    build_recipient_context,
     build_scene_description,
     build_scripts_section,
 )
@@ -61,41 +64,64 @@ async def build_system_prompt(
 ) -> str:
     """Build the full system prompt for the voice agent.
 
+    Section order (S61 sandwich pattern):
+      1. LANGUAGE directive            (top — strong steering)
+      2. PERSONA + scene context       (varies by strategy)
+      3. AUDIENCE                      (only when recipient_prompt is non-empty;
+                                        injected between persona and knowledge)
+      4. KNOWLEDGE                     (S56)
+      5. SCENE DESCRIPTION / INSTRUCTION
+      6. CANVAS ACTION TOOL GUIDANCE
+      7. SCRIPTS                       (when present)
+      8. LANGUAGE reminder             (bottom — sandwich)
+
     Strategy:
-    1. If room_id is available, use the persona-prompt endpoint (includes everything)
-    2. Supplement with scene snapshot data for instruction + display mode
-    3. If no room_id, fall back to building from avatar + scene directly
-    4. If everything fails, use a sensible default
+    1. If room_id is available, use the persona-prompt endpoint (includes
+       persona + scene context); supplement with snapshot enrichment.
+    2. Otherwise, build locally from avatar + scene.
+    3. If everything fails, fall back to DEFAULT_PROMPT.
+
+    The snapshot is fetched at most once and reused for the LANGUAGE
+    directive, the AUDIENCE section, and per-strategy enrichment.
     """
-    prompt_parts = []
+    # ── Snapshot fetched once; powers LANGUAGE + AUDIENCE + body ──
+    snapshot: dict | None = None
+    if room_id:
+        snapshot = await get_scene_snapshot(room_id, api_url)
+
+    language = (snapshot or {}).get("language") or "en"
+    audience_section = build_recipient_context((snapshot or {}).get("recipient_prompt"))
+
+    body_parts: list[str] = []
 
     # ── Strategy 1: Use persona-prompt endpoint (Session 43) ──
     if room_id:
         persona_prompt = await get_persona_prompt(room_id, api_url)
         if persona_prompt:
             logger.info(f"Loaded persona prompt from backend for room {room_id}")
-            prompt_parts.append(persona_prompt)
+            body_parts.append(persona_prompt)
 
-            # The persona-prompt endpoint already includes scene context + instruction,
-            # but we can still fetch the snapshot for enrichment
-            snapshot = await get_scene_snapshot(room_id, api_url)
+            # AUDIENCE — between persona and knowledge (S61)
+            if audience_section:
+                body_parts.append(audience_section.lstrip("\n"))
+
             if snapshot:
-                # Knowledge section (S56) — after persona, before tools
+                # Knowledge section (S56) — after persona/audience, before tools
                 knowledge_block = _build_knowledge_block(snapshot)
                 if knowledge_block:
-                    prompt_parts.append(knowledge_block)
+                    body_parts.append(knowledge_block)
 
                 # Add canvas tools section (for Session 47)
                 tools = build_canvas_tools_section(snapshot)
                 if tools:
-                    prompt_parts.append(tools)
+                    body_parts.append(tools)
 
                 # Add scripts section (for Session 49)
                 scripts_section = build_scripts_section(snapshot)
                 if scripts_section:
-                    prompt_parts.append(scripts_section)
+                    body_parts.append(scripts_section)
 
-            return "\n\n".join(prompt_parts)
+            return _wrap_language_sandwich(body_parts, language, audience_section)
 
     # ── Strategy 2: Build locally from avatar + scene ──
     logger.info("Building prompt locally (no room_id or persona-prompt unavailable)")
@@ -109,42 +135,44 @@ async def build_system_prompt(
                 parts.append(avatar["persona"])
             if avatar.get("gender"):
                 parts.append(f"Gender: {avatar['gender']}")
-            prompt_parts.append("\n".join(parts))
+            body_parts.append("\n".join(parts))
 
             if avatar.get("knowledge"):
-                prompt_parts.append(f"## Your Knowledge\n{avatar['knowledge']}")
+                body_parts.append(f"## Your Knowledge\n{avatar['knowledge']}")
 
-    # Scene context
-    if room_id:
-        snapshot = await get_scene_snapshot(room_id, api_url)
-        if snapshot:
-            # Knowledge section (S56) — between avatar persona and scene details
-            knowledge_block = _build_knowledge_block(snapshot)
-            if knowledge_block:
-                prompt_parts.append(knowledge_block)
+    # AUDIENCE — between persona and knowledge/scene (S61)
+    if audience_section:
+        body_parts.append(audience_section.lstrip("\n"))
 
-            prompt_parts.append(build_scene_description(snapshot))
+    # Scene context (re-uses snapshot fetched at the top)
+    if snapshot:
+        # Knowledge section (S56) — between persona/audience and scene details
+        knowledge_block = _build_knowledge_block(snapshot)
+        if knowledge_block:
+            body_parts.append(knowledge_block)
 
-            instruction = build_instruction_section(snapshot)
-            if instruction:
-                prompt_parts.append(instruction)
+        body_parts.append(build_scene_description(snapshot))
 
-            tools = build_canvas_tools_section(snapshot)
-            if tools:
-                prompt_parts.append(tools)
+        instruction = build_instruction_section(snapshot)
+        if instruction:
+            body_parts.append(instruction)
 
-            scripts_section = build_scripts_section(snapshot)
-            if scripts_section:
-                prompt_parts.append(scripts_section)
+        tools = build_canvas_tools_section(snapshot)
+        if tools:
+            body_parts.append(tools)
+
+        scripts_section = build_scripts_section(snapshot)
+        if scripts_section:
+            body_parts.append(scripts_section)
     elif scene_id:
         scene = await get_scene(scene_id)
         if scene:
-            prompt_parts.append(f"## Current Scene: {scene.get('title', 'Untitled')}")
+            body_parts.append(f"## Current Scene: {scene.get('title', 'Untitled')}")
             if scene.get("instruction"):
-                prompt_parts.append(f"## Scene Instruction\n{scene['instruction']}")
+                body_parts.append(f"## Scene Instruction\n{scene['instruction']}")
 
     # Guidelines (always included)
-    prompt_parts.append("""## Guidelines
+    body_parts.append("""## Guidelines
 - Speak naturally and conversationally
 - Keep responses concise — this is a voice conversation, not a text chat
 - Reference elements visible on the canvas when relevant
@@ -152,7 +180,32 @@ async def build_system_prompt(
 - If you're in a multi-scene flow, you can navigate between scenes when appropriate
 - Be warm and engaging — you're presenting this content to a real person""")
 
-    if not prompt_parts:
-        return DEFAULT_PROMPT
+    if not body_parts:
+        body_parts = [DEFAULT_PROMPT]
 
-    return "\n\n".join(prompt_parts)
+    return _wrap_language_sandwich(body_parts, language, audience_section)
+
+
+def _wrap_language_sandwich(
+    body_parts: list[str], language: str, audience_section: str
+) -> str:
+    """Wrap the body with the LANGUAGE directive (top) + reminder (bottom).
+
+    Logs a structured summary of the assembled prompt's shape so we can
+    debug later why an avatar did or didn't pick up the language /
+    audience steering for a given session.
+    """
+    sections = [
+        f"# LANGUAGE\n{build_language_directive(language)}",
+        *body_parts,
+        build_language_reminder(language),
+    ]
+    prompt = "\n\n".join(sections)
+    logger.info(
+        "System prompt assembled: language={} audience_present={} body_sections={} prompt_chars={}",
+        language,
+        bool(audience_section),
+        len(body_parts),
+        len(prompt),
+    )
+    return prompt

@@ -14,6 +14,73 @@ KNOWLEDGE_PREAMBLE = (
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Language directives (Session 61)
+# Sandwich pattern: directive at the top of the system prompt + a short
+# reminder at the bottom. LLMs weight the first and last sections most
+# heavily, so this is materially more drift-resistant than top-only.
+# ──────────────────────────────────────────────────────────────────────
+
+LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "pt": "Portuguese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "vi": "Vietnamese",
+    "zh": "Chinese (Mandarin)",
+}
+
+
+def build_language_directive(language: str | None) -> str:
+    """Top-of-prompt directive: 'always speak in {language}'.
+
+    The backend's CHECK constraint and Pydantic Literal both prevent unknown
+    values from reaching us, so the English fallback here is purely
+    belt-and-suspenders.
+    """
+    name = LANGUAGE_NAMES.get(language or "en", "English")
+    return (
+        f"You are speaking in {name}. "
+        f"Always respond in {name} regardless of the language the visitor uses. "
+        f"If the visitor speaks a different language, gently continue in {name}."
+    )
+
+
+def build_language_reminder(language: str | None) -> str:
+    """Bottom-of-prompt language reminder. Short and emphatic."""
+    name = LANGUAGE_NAMES.get(language or "en", "English")
+    return f"Remember: respond in {name}."
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Recipient prompt / audience steering (Session 61)
+# Steering, not knowledge — describes WHO the avatar is talking to, not
+# WHAT it knows. Empty/whitespace-only prompts produce no section, which
+# is the signal "general visitors".
+# ──────────────────────────────────────────────────────────────────────
+
+RECIPIENT_PREAMBLE = (
+    "This live conversation is addressed to a specific audience. "
+    "Tailor your tone, vocabulary, and emphasis to this audience "
+    "throughout the conversation."
+)
+
+
+def build_recipient_context(recipient_prompt: str | None) -> str:
+    """The AUDIENCE section, or "" when no recipient_prompt was provided.
+
+    Returns a string starting with a leading newline so it slots cleanly
+    when concatenated; call sites that join with "\\n\\n" should strip the
+    leading newline (see persona.build_system_prompt).
+    """
+    if not recipient_prompt or not recipient_prompt.strip():
+        return ""
+    return f"\n# AUDIENCE\n{RECIPIENT_PREAMBLE}\n\n{recipient_prompt.strip()}"
+
+
 def _format_scope(scope_data: dict[str, Any] | None, scope_label: str) -> str:
     """Format one knowledge scope (scene or flow) into a markdown section.
     Returns empty string if scope is None or has no content.
@@ -253,3 +320,91 @@ def build_canvas_tools_section(snapshot: dict) -> str:
     parts.append("When describing yourself, note that the visitor may see your profile photo on the canvas.")
 
     return "\n".join(parts)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sync prompt assembly (Session 61)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Snapshot-only assembly path. Used by callers that already have a
+# snapshot in hand (and by unit tests). The runtime path in
+# persona.build_system_prompt is async and still integrates the legacy
+# persona-prompt endpoint (Strategy 1) — these two paths are
+# intentionally parallel until that legacy endpoint is retired.
+# When you add or remove a section here, mirror the change in
+# persona.build_system_prompt.
+
+def build_system_prompt(snapshot: dict | None) -> str:
+    """Assemble the agent's system prompt from a scene snapshot.
+
+    Section order (S61 sandwich pattern):
+      1. LANGUAGE directive            (top — strong steering)
+      2. PERSONA                       (when snapshot.persona is non-empty)
+      3. AUDIENCE                      (when snapshot.recipient_prompt is non-empty)
+      4. KNOWLEDGE                     (S56)
+      5. SCENE INSTRUCTION             (instruction or scene_instruction)
+      6. SCENE / DISPLAY / ELEMENTS    (build_scene_description)
+      7. CANVAS ACTION TOOL GUIDANCE
+      8. SCRIPTS                       (when present)
+      9. LANGUAGE reminder             (bottom — sandwich)
+    """
+    snapshot = snapshot or {}
+    language = snapshot.get("language") or "en"
+    sections: list[str] = []
+
+    # 1. LANGUAGE directive (top)
+    sections.append(f"# LANGUAGE\n{build_language_directive(language)}")
+
+    # 2. PERSONA
+    persona = (snapshot.get("persona") or "").strip()
+    if persona:
+        sections.append(f"# PERSONA\n{persona}")
+
+    # 3. AUDIENCE (only when recipient_prompt is non-empty)
+    audience = build_recipient_context(snapshot.get("recipient_prompt"))
+    if audience:
+        sections.append(audience.lstrip("\n"))
+
+    # 4. KNOWLEDGE (S56)
+    knowledge_section = build_knowledge_context(snapshot.get("knowledge"))
+    if knowledge_section:
+        sections.append(knowledge_section.lstrip("\n"))
+
+    # 5. SCENE INSTRUCTION — accept either "instruction" (current backend)
+    #    or "scene_instruction" (forward-compat with snapshot rename).
+    instruction_text = (
+        snapshot.get("scene_instruction")
+        or snapshot.get("instruction")
+        or ""
+    ).strip()
+    if instruction_text:
+        sections.append(f"# SCENE INSTRUCTION\n{instruction_text}")
+
+    # 6. SCENE / DISPLAY / ELEMENTS — existing combined helper.
+    scene_block = build_scene_description(snapshot)
+    if scene_block:
+        sections.append(scene_block)
+
+    # 7. CANVAS ACTION TOOL GUIDANCE
+    canvas_tools = build_canvas_tools_section(snapshot)
+    if canvas_tools:
+        sections.append(canvas_tools)
+
+    # 8. SCRIPTS
+    scripts_section = build_scripts_section(snapshot)
+    if scripts_section:
+        sections.append(scripts_section)
+
+    # 9. LANGUAGE reminder (bottom)
+    sections.append(build_language_reminder(language))
+
+    prompt = "\n\n".join(sections)
+
+    logger.info(
+        "Sync system prompt assembled: language={} audience_present={} sections={} prompt_chars={}",
+        language,
+        bool(audience),
+        len(sections),
+        len(prompt),
+    )
+    return prompt

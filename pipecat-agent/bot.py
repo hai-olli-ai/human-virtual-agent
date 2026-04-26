@@ -67,11 +67,13 @@ from config import (
     CARTESIA_API_KEY,
     CARTESIA_VOICE_ID,
     DEEPGRAM_API_KEY,
+    DEEPGRAM_LANGUAGE_MAP,
     OPENAI_API_KEY,
     LLM_MODEL,
     DEFAULT_AVATAR_ID,
     DEFAULT_ROOM_ID,
     DEFAULT_SCENE_ID,
+    resolve_deepgram_language,
 )
 from canvas_actions import create_canvas_action_handlers, get_canvas_tools
 from persona import build_system_prompt
@@ -587,7 +589,25 @@ async def run_bot_classic(
 
     # ── AI Services ──
     canvas_tools = get_canvas_tools()
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+
+    # STT language driven by the live-room language (S61).
+    snapshot_language = (scene_snapshot or {}).get("language")
+    deepgram_language = resolve_deepgram_language(snapshot_language)
+    logger.info(
+        "Deepgram language configured: snapshot_language={} deepgram_language={}",
+        snapshot_language,
+        deepgram_language,
+    )
+    if snapshot_language and snapshot_language not in DEEPGRAM_LANGUAGE_MAP:
+        logger.warning(
+            "Snapshot language not in Deepgram map; falling back to multi: snapshot_language={}",
+            snapshot_language,
+        )
+
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        settings=DeepgramSTTService.Settings(language=deepgram_language),
+    )
     voice_id = (avatar_config or {}).get("voiceModelId") or CARTESIA_VOICE_ID
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
@@ -758,7 +778,25 @@ async def run_bot_relay(
 
     # ── AI Services (no TTS — SoulX handles speech) ──
     canvas_tools = get_canvas_tools()
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+
+    # STT language driven by the live-room language (S61).
+    snapshot_language = (scene_snapshot or {}).get("language")
+    deepgram_language = resolve_deepgram_language(snapshot_language)
+    logger.info(
+        "Deepgram language configured: snapshot_language={} deepgram_language={}",
+        snapshot_language,
+        deepgram_language,
+    )
+    if snapshot_language and snapshot_language not in DEEPGRAM_LANGUAGE_MAP:
+        logger.warning(
+            "Snapshot language not in Deepgram map; falling back to multi: snapshot_language={}",
+            snapshot_language,
+        )
+
+    stt = DeepgramSTTService(
+        api_key=DEEPGRAM_API_KEY,
+        settings=DeepgramSTTService.Settings(language=deepgram_language),
+    )
     llm = OpenAILLMService(
         api_key=OPENAI_API_KEY,
         settings=OpenAILLMService.Settings(

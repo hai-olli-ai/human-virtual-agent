@@ -29,3 +29,41 @@ CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022e
 # gpt-4.1 and gpt-4o both support vision
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-mini")
 #LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Deepgram language mapping (Session 61 — voice agent multi-language)
+# ──────────────────────────────────────────────────────────────────────
+
+# Maps live-room language codes (the backend's LiveRoomLanguage Literal)
+# to the Deepgram `language` parameter. The 9 codes here mirror the
+# nine-language enum the backend enforces via CHECK constraint, and
+# Deepgram's nova-2 / nova-3 models support all of them directly.
+DEEPGRAM_LANGUAGE_MAP: dict[str, str] = {
+    "en": "en",
+    "es": "es",
+    "fr": "fr",
+    "de": "de",
+    "pt": "pt",
+    "ja": "ja",
+    "ko": "ko",
+    "vi": "vi",
+    "zh": "zh",
+}
+
+# Forward-compat: if the backend ever ships a code we haven't mapped
+# (e.g. a 10th language added before this file is updated), fall back
+# to Deepgram's multilingual auto-detect rather than crashing.
+DEEPGRAM_FALLBACK_LANGUAGE: str = "multi"
+
+
+def resolve_deepgram_language(snapshot_language: str | None) -> str:
+    """Map a scene-snapshot language code to a Deepgram language parameter.
+
+    - None / empty → "en" (matches the backend's default).
+    - Mapped code  → its Deepgram value.
+    - Unknown code → "multi" (auto-detect, slower but always works).
+    """
+    if not snapshot_language:
+        return "en"
+    return DEEPGRAM_LANGUAGE_MAP.get(snapshot_language, DEEPGRAM_FALLBACK_LANGUAGE)
