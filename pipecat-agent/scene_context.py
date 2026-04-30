@@ -81,6 +81,63 @@ def build_recipient_context(recipient_prompt: str | None) -> str:
     return f"\n# AUDIENCE\n{RECIPIENT_PREAMBLE}\n\n{recipient_prompt.strip()}"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Link narration directive (Session 63, Block 7)
+# Tells the LLM HOW to use linked content already injected into the
+# KNOWLEDGE section. Sits after KNOWLEDGE, before SCENE INSTRUCTION.
+# ──────────────────────────────────────────────────────────────────────
+
+NARRATION_MODE_DIRECTIVES: dict[str, str] = {
+    "walk_through": (
+        "Walk the visitor through the linked content step-by-step. "
+        "Surface the key points in narrative order. Pause for questions "
+        "after each major section."
+    ),
+    "summarize": (
+        "Summarize the key points of the linked content concisely when "
+        "it becomes relevant. Don't enumerate everything — pick the most "
+        "salient 2-3 points and offer to go deeper if asked."
+    ),
+    "answer_questions": (
+        "Reference the linked content reactively, only when the visitor "
+        "asks about it. Don't volunteer details unprompted."
+    ),
+    "reference_as_needed": (
+        "Treat the linked content as background. Mention it only when "
+        "directly relevant to the visitor's question. Otherwise, don't "
+        "reference it."
+    ),
+}
+
+
+def build_link_narration_directive(link: dict | None) -> str:
+    """Return a system-prompt section that tells the LLM how to use the
+    linked content. Returns an empty string when no link is set or the
+    narration_mode is unknown.
+
+    Place AFTER the KNOWLEDGE section (S56) and BEFORE SCENE INSTRUCTION
+    in the system-prompt sandwich. Defensive against stale snapshots that
+    reference modes added in a future session — unknown modes drop out.
+    """
+    if not link:
+        return ""
+    mode = link.get("narration_mode", "walk_through")
+    directive = NARRATION_MODE_DIRECTIVES.get(mode)
+    if not directive:
+        return ""
+
+    source = link.get("source", "linked content")
+    url = link.get("url", "")
+
+    return (
+        "# LINK NARRATION\n"
+        f"The creator has attached a {source} link to this scene "
+        f"({url}). Knowledge from this link has been included in the "
+        f"KNOWLEDGE section above.\n"
+        f"How to use it: {directive}"
+    )
+
+
 def _format_scope(scope_data: dict[str, Any] | None, scope_label: str) -> str:
     """Format one knowledge scope (scene or flow) into a markdown section.
     Returns empty string if scope is None or has no content.
@@ -337,16 +394,17 @@ def build_canvas_tools_section(snapshot: dict) -> str:
 def build_system_prompt(snapshot: dict | None) -> str:
     """Assemble the agent's system prompt from a scene snapshot.
 
-    Section order (S61 sandwich pattern):
+    Section order (S61 sandwich pattern + S63 Block 7):
       1. LANGUAGE directive            (top — strong steering)
       2. PERSONA                       (when snapshot.persona is non-empty)
       3. AUDIENCE                      (when snapshot.recipient_prompt is non-empty)
       4. KNOWLEDGE                     (S56)
-      5. SCENE INSTRUCTION             (instruction or scene_instruction)
-      6. SCENE / DISPLAY / ELEMENTS    (build_scene_description)
-      7. CANVAS ACTION TOOL GUIDANCE
-      8. SCRIPTS                       (when present)
-      9. LANGUAGE reminder             (bottom — sandwich)
+      5. LINK NARRATION                (S63 — when snapshot.link is set)
+      6. SCENE INSTRUCTION             (instruction or scene_instruction)
+      7. SCENE / DISPLAY / ELEMENTS    (build_scene_description)
+      8. CANVAS ACTION TOOL GUIDANCE
+      9. SCRIPTS                       (when present)
+      10. LANGUAGE reminder            (bottom — sandwich)
     """
     snapshot = snapshot or {}
     language = snapshot.get("language") or "en"
@@ -370,7 +428,12 @@ def build_system_prompt(snapshot: dict | None) -> str:
     if knowledge_section:
         sections.append(knowledge_section.lstrip("\n"))
 
-    # 5. SCENE INSTRUCTION — accept either "instruction" (current backend)
+    # 5. LINK NARRATION (S63 Block 7) — between KNOWLEDGE and SCENE INSTRUCTION
+    link_narration = build_link_narration_directive(snapshot.get("link"))
+    if link_narration:
+        sections.append(link_narration)
+
+    # 6. SCENE INSTRUCTION — accept either "instruction" (current backend)
     #    or "scene_instruction" (forward-compat with snapshot rename).
     instruction_text = (
         snapshot.get("scene_instruction")

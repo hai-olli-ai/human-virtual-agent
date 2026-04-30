@@ -18,6 +18,7 @@ from scene_context import (
     build_knowledge_context,
     build_language_directive,
     build_language_reminder,
+    build_link_narration_directive,
     build_recipient_context,
     build_scene_description,
     build_scripts_section,
@@ -64,16 +65,17 @@ async def build_system_prompt(
 ) -> str:
     """Build the full system prompt for the voice agent.
 
-    Section order (S61 sandwich pattern):
+    Section order (S61 sandwich pattern + S63 Block 7):
       1. LANGUAGE directive            (top — strong steering)
       2. PERSONA + scene context       (varies by strategy)
       3. AUDIENCE                      (only when recipient_prompt is non-empty;
                                         injected between persona and knowledge)
       4. KNOWLEDGE                     (S56)
-      5. SCENE DESCRIPTION / INSTRUCTION
-      6. CANVAS ACTION TOOL GUIDANCE
-      7. SCRIPTS                       (when present)
-      8. LANGUAGE reminder             (bottom — sandwich)
+      5. LINK NARRATION                (S63 — only when snapshot.link is set)
+      6. SCENE DESCRIPTION / INSTRUCTION
+      7. CANVAS ACTION TOOL GUIDANCE
+      8. SCRIPTS                       (when present)
+      9. LANGUAGE reminder             (bottom — sandwich)
 
     Strategy:
     1. If room_id is available, use the persona-prompt endpoint (includes
@@ -110,6 +112,11 @@ async def build_system_prompt(
                 knowledge_block = _build_knowledge_block(snapshot)
                 if knowledge_block:
                     body_parts.append(knowledge_block)
+
+                # LINK NARRATION (S63 Block 7) — after KNOWLEDGE
+                link_narration = build_link_narration_directive(snapshot.get("link"))
+                if link_narration:
+                    body_parts.append(link_narration)
 
                 # Add canvas tools section (for Session 47)
                 tools = build_canvas_tools_section(snapshot)
@@ -150,6 +157,11 @@ async def build_system_prompt(
         knowledge_block = _build_knowledge_block(snapshot)
         if knowledge_block:
             body_parts.append(knowledge_block)
+
+        # LINK NARRATION (S63 Block 7) — after KNOWLEDGE, before scene details
+        link_narration = build_link_narration_directive(snapshot.get("link"))
+        if link_narration:
+            body_parts.append(link_narration)
 
         body_parts.append(build_scene_description(snapshot))
 
