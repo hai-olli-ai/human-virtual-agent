@@ -22,6 +22,7 @@ from scene_context import (
     build_recipient_context,
     build_scene_description,
     build_scripts_section,
+    compute_element_aliases,
 )
 
 # Fallback prompt when API is unavailable
@@ -62,8 +63,17 @@ async def build_system_prompt(
     avatar_id: str = "",
     scene_id: str = "",
     api_url: str | None = None,
+    aliases_out: dict[str, str] | None = None,
 ) -> str:
     """Build the full system prompt for the voice agent.
+
+    When ``aliases_out`` is provided (mutable dict), it is cleared and
+    populated with the snapshot's element-alias map (S64c) — the same
+    mapping the prompt's "Available canvas elements" listing uses. The
+    voice agent stores this on ``CanvasToolContext.element_alias_map``
+    so the tool handlers can translate aliases back to real UUIDs
+    before dispatching canvas commands. Pass ``None`` to skip alias
+    population.
 
     Section order (S61 sandwich pattern + S63 Block 7):
       1. LANGUAGE directive            (top — strong steering)
@@ -94,6 +104,16 @@ async def build_system_prompt(
     language = (snapshot or {}).get("language") or "en"
     audience_section = build_recipient_context((snapshot or {}).get("recipient_prompt"))
 
+    # S64c — element aliases for the canvas tools section. Computed from
+    # the same snapshot used for everything else, so the prompt's listing
+    # and the agent's translation map are guaranteed in sync.
+    element_aliases: dict[str, str] = {}
+    if snapshot:
+        element_aliases = compute_element_aliases(snapshot.get("elements") or [])
+    if aliases_out is not None:
+        aliases_out.clear()
+        aliases_out.update(element_aliases)
+
     body_parts: list[str] = []
 
     # ── Strategy 1: Use persona-prompt endpoint (Session 43) ──
@@ -118,8 +138,10 @@ async def build_system_prompt(
                 if link_narration:
                     body_parts.append(link_narration)
 
-                # Add canvas tools section (for Session 47)
-                tools = build_canvas_tools_section(snapshot)
+                # Add canvas tools section (for Session 47).
+                # S64c — aliases are computed once above and threaded here so
+                # the LLM-facing listing surfaces alias names instead of UUIDs.
+                tools = build_canvas_tools_section(snapshot, aliases=element_aliases)
                 if tools:
                     body_parts.append(tools)
 
@@ -163,13 +185,13 @@ async def build_system_prompt(
         if link_narration:
             body_parts.append(link_narration)
 
-        body_parts.append(build_scene_description(snapshot))
+        body_parts.append(build_scene_description(snapshot, aliases=element_aliases))
 
         instruction = build_instruction_section(snapshot)
         if instruction:
             body_parts.append(instruction)
 
-        tools = build_canvas_tools_section(snapshot)
+        tools = build_canvas_tools_section(snapshot, aliases=element_aliases)
         if tools:
             body_parts.append(tools)
 

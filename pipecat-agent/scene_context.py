@@ -251,10 +251,75 @@ def build_vision_message(image_base64: str) -> dict:
         ],
     }
 
-def build_scene_description(snapshot: dict) -> str:
+# ──────────────────────────────────────────────────────────────────────
+# Element aliases (S64c)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Elements come from the backend with UUID7-shaped ids — long, opaque
+# strings that often share long prefixes (because UUID7 is timestamp-
+# ordered). LLMs fail to copy these reliably as `target.element_id` for
+# canvas_highlight or `from`/`to` for canvas_action(verb=draw_arrow):
+# the model picks the right element conceptually but mis-types the id
+# mid-stream, which surfaces as "highlighted the wrong element".
+#
+# The alias layer fixes this without changing the wire protocol. We
+# derive a short, distinctive name per element (e.g. text_1, avatar_1,
+# emoji_2) and surface those in the prompt instead of the raw UUIDs.
+# bot.py stores the alias→UUID map on canvas_ctx; the tool handlers
+# translate aliases back to real UUIDs before sending the canvas.command
+# to the frontend. The LLM only ever needs to copy the short alias.
+
+def compute_element_aliases(elements: list[dict]) -> dict[str, str]:
+    """Return ``{alias: element_id}`` for the given elements list.
+
+    Aliases are formatted ``<type>_<ordinal>`` (1-based, scoped per type),
+    so a scene with one text + one avatar + two emojis produces:
+    ``{"text_1": "...", "avatar_1": "...", "emoji_1": "...", "emoji_2": "..."}``.
+
+    Ordering is the elements list's natural order, which matches the
+    visual stacking the creator intended. Deterministic — given the same
+    list, the alias mapping is stable across calls. Elements without an
+    ``id`` are skipped.
+    """
+    counts: dict[str, int] = {}
+    aliases: dict[str, str] = {}
+    for el in elements:
+        eid = el.get("id")
+        if not eid:
+            continue
+        et = (el.get("type") or "unknown").lower()
+        counts[et] = counts.get(et, 0) + 1
+        aliases[f"{et}_{counts[et]}"] = eid
+    return aliases
+
+
+def _summarize_element(el: dict) -> str:
+    """Short human-readable description of an element for the alias list.
+
+    The goal is to give the LLM enough to disambiguate when the visitor
+    refers to "the title text" or "the sign-up button". Falls back to
+    bare type when no descriptive content is available.
+    """
+    et = el.get("type") or "unknown"
+    if et == "text" and el.get("text"):
+        return f'text "{el["text"]}"'
+    if et == "button" and el.get("title"):
+        return f'button "{el["title"]}"'
+    if et == "emoji" and el.get("emoji_character"):
+        return f'emoji {el["emoji_character"]}'
+    if el.get("label"):
+        return f"{et} ({el['label']})"
+    return et
+
+
+def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = None) -> str:
     """Build a human-readable scene description from a snapshot.
 
     The snapshot comes from GET /live-rooms/{room_id}/scene-snapshot.
+
+    When ``aliases`` (alias → element_id) is provided, each element's
+    ``[id: …]`` annotation in the prompt uses the short alias instead of
+    the raw UUID. See ``compute_element_aliases`` for why.
     """
     if not snapshot:
         return "No scene is currently loaded."
@@ -288,13 +353,23 @@ def build_scene_description(snapshot: dict) -> str:
         # Note (S59): Element type "button" is a visitor-clickable CTA on
         # the scene canvas. The agent has no canvas-click tool — it should
         # describe buttons by their `title` (e.g. "the 'Sign up now' button
-        # in the lower right") and may use the existing highlight_element
-        # canvas action to point at one, but it must NOT attempt to "click"
-        # buttons on the visitor's behalf. Buttons are part of the visual
-        # scene; clicks are exclusively the visitor's affordance.
+        # in the lower right") and may use canvas_highlight to point at one,
+        # but it must NOT attempt to "click" buttons on the visitor's behalf.
+        # Buttons are part of the visual scene; clicks are exclusively the
+        # visitor's affordance.
+        # Reverse map for O(1) UUID → alias lookup when aliases are provided.
+        uuid_to_alias = {uuid: alias for alias, uuid in (aliases or {}).items()}
+
         for el in elements:
             el_type = el.get("type", "unknown")
             desc = f"- {el_type}"
+            # S64c — surface the element id (or its short alias when
+            # available) so the LLM can pass it as
+            # `target={element_id: "..."}` to canvas_highlight.
+            eid = el.get("id")
+            if eid:
+                display_id = uuid_to_alias.get(eid, eid)
+                desc += f" [id: {display_id}]"
 
             if el.get("text"):
                 desc += f': "{el["text"]}"'
@@ -302,6 +377,12 @@ def build_scene_description(snapshot: dict) -> str:
                 desc += f' (label: {el["label"]})'
             if el.get("title"):
                 desc += f' (title: {el["title"]})'
+            # S64c (Option 2) — surface emoji_character so the LLM can tell
+            # one emoji from another, and so emoji elements aren't a
+            # content-less line in the prompt that the LLM might mistake
+            # for "the title".
+            if el.get("emoji_character"):
+                desc += f' (emoji: {el["emoji_character"]})'
             if el.get("display_mode"):
                 desc += f" [display: {el['display_mode']}]"
 
@@ -357,26 +438,107 @@ def build_scripts_section(snapshot: dict) -> str:
     return "Scene Scripts (you will present these to the visitor via TTS before conversation begins):\n" + "\n".join(lines)
 
 
-def build_canvas_tools_section(snapshot: dict) -> str:
-    """Build the canvas action tools description for the system prompt."""
-    parts = ["## Canvas Actions"]
-    parts.append("You have tools to interact with the canvas visually:")
-    parts.append("- highlight_element(x, y, width, height): Highlight a region to draw attention")
-    parts.append("- draw_arrow(from_x, from_y, to_x, to_y): Draw an arrow between two points")
-    parts.append("- place_annotation(text, x, y): Place a short text label at a position")
-    parts.append("- clear_annotations: Remove all visual overlays")
+def build_canvas_tools_section(
+    snapshot: dict,
+    aliases: dict[str, str] | None = None,
+) -> str:
+    """Build the canvas action tools description for the system prompt.
 
+    Describes the 5 generic ``canvas_*`` tools available on the active
+    Canvas Page. The dynamic CANVAS PAGE section in
+    context.prompt_builder eventually subsumes this once bot.py is
+    rewired to call build_system_prompt_split.
+
+    When ``aliases`` (alias → element_id) is provided, the "Available
+    canvas elements" listing surfaces short, distinctive aliases
+    (e.g. ``text_1``, ``avatar_1``) instead of UUID7 ids. The LLM uses
+    these aliases as ``target.element_id`` (highlight) or
+    ``args.from`` / ``args.to`` (draw_arrow); the tool handlers in
+    ``tools/canvas_protocol_tools.py`` translate aliases back to real
+    UUIDs before sending the canvas.command. See
+    ``compute_element_aliases`` for the rationale.
+    """
     total = snapshot.get("total_scenes", 1)
-    if total > 1:
-        parts.append("- navigate_scene: Go to next/previous scene in the flow")
+    control_verbs = "next_scene, previous_scene, goto_scene, clear" if total > 1 else "clear"
 
-    parts.append("")
-    parts.append("The canvas is 1280x720 pixels (origin at top-left).")
-    parts.append("Use the canvas image to estimate pixel coordinates for these tools.")
-    parts.append("Use these tools naturally during conversation when they help the visitor understand the content.")
-    parts.append("When describing yourself, note that the visitor may see your profile photo on the canvas.")
+    # Element listing: when aliases are provided, render alias + short
+    # description so the LLM has a complete authoritative reference. Strategy
+    # 1 in persona.build_system_prompt skips build_scene_description, so this
+    # section is the only reliable place to surface element ids on the live
+    # path.
+    elements = snapshot.get("elements") or []
+    if aliases:
+        # Stable iteration order: follow the elements list (which matches the
+        # creator's stacking) rather than the dict's insertion order — they
+        # should be the same since compute_element_aliases iterates elements
+        # in order, but using `elements` keeps it tied to the source of truth.
+        uuid_to_alias = {uuid: alias for alias, uuid in aliases.items()}
+        listed: list[str] = []
+        for el in elements:
+            eid = el.get("id")
+            if not eid:
+                continue
+            alias = uuid_to_alias.get(eid)
+            if not alias:
+                continue
+            listed.append(f"  - `{alias}` — {_summarize_element(el)}")
+        if listed:
+            ids_line = (
+                "- Available canvas elements (pass these aliases as "
+                "`element_id` for canvas_highlight, and as `from` / `to` "
+                "for canvas_action with verb=draw_arrow):\n"
+                + "\n".join(listed)
+            )
+        else:
+            ids_line = (
+                "- No canvas elements are available on this scene — "
+                "`canvas_highlight` and `canvas_action(verb='draw_arrow')` cannot be called."
+            )
+    else:
+        # Fallback path: aliases not wired (sync test builder, older callers).
+        # Surface raw UUIDs so the existing behavior is preserved.
+        element_ids = [el.get("id") for el in elements if el.get("id")]
+        if element_ids:
+            ids_line = "- Available element ids: " + ", ".join(f"`{eid}`" for eid in element_ids) + "."
+        else:
+            ids_line = "- No element ids are available on this scene — `canvas_highlight` cannot be called."
 
-    return "\n".join(parts)
+    return "\n".join([
+        "## Canvas Actions",
+        "",
+        "**Use ONLY the 5 tools below for any canvas interaction.**",
+        "",
+        "1. `canvas_analyze(question, options={})` — answer a question about what is "
+        "visible on the canvas using the active page's semantic state. Use when the "
+        "visitor asks something you cannot determine from your existing context.",
+        "",
+        "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
+        "`target` MUST be `{element_id: \"<id>\"}` using one of the ids listed in Notes "
+        "below. Box-coordinate targets (`{box: [x, y, w, h]}`) are NOT supported on the "
+        "v0.1 Composition page — do not use them.",
+        "",
+        f"3. `canvas_control(verb, args={{}})` — state-transition verbs. Supported: "
+        f"{control_verbs}. Most take `args={{}}`.",
+        "",
+        "4. `canvas_action(verb, args)` — content-producing verbs. **Verb-specific "
+        "fields go INSIDE `args` (a nested object), not at the top level next to `verb`.**",
+        "   - `draw_arrow`: pass `args = {\"from\": \"<element_id>\", \"to\": \"<element_id>\"}`. "
+        "Both ids MUST come from the Available element ids list in Notes below "
+        "(UUID-shaped). Do NOT use overlay ids (e.g. `ovl_3`) or any other id-shaped "
+        "strings returned from earlier tool results — those are not element ids.",
+        "   - `add_annotation`: pass `args = {\"text\": \"<string>\", \"x\": <number>, "
+        "\"y\": <number>}`. `x` and `y` are in 1280x720 design-space coordinates.",
+        "",
+        "5. `canvas_set_page(pageType, pageInit={})` — switch the active canvas page. "
+        "`pageType` must be one of `composition`, `youtube`, `quiz`. v0.1 only allows "
+        "`composition` — only call this if the visitor explicitly asks for a different mode.",
+        "",
+        "Notes:",
+        "- The canvas is 1280x720 pixels (origin top-left).",
+        ids_line,
+        "- For arg-less verbs (next_scene, previous_scene, clear), call with verb only and args={}.",
+        "- Use these tools naturally during conversation when they help the visitor.",
+    ])
 
 
 # ──────────────────────────────────────────────────────────────────────

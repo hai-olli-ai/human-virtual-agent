@@ -7,6 +7,8 @@ load_dotenv(override=True)
 # AI Service keys
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 
 # Human Virtual API
@@ -29,6 +31,34 @@ CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022e
 # gpt-4.1 and gpt-4o both support vision
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
 #LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Canvas-protocol LLM provider selection (S64c)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Selects which LLM service handles the Canvas Protocol tool surface.
+# Vision (S46) stays hardcoded on OpenAI GPT-4.1 regardless — they're
+# separate services. See CLAUDE.md "Vision (S46) — separate, hardcoded".
+#
+# Default is "openai" because that's the only LLM SDK extra currently
+# installed (pipecat-ai[openai]). To use anthropic or gemini, install
+# the corresponding pipecat extra (pipecat-ai[anthropic] /
+# pipecat-ai[google]) and set this env var. CLAUDE.md targets anthropic
+# as the eventual default; that flip happens once the extras land in
+# pyproject.toml + uv.lock.
+LLM_CANVAS_PROVIDER = os.getenv("LLM_CANVAS_PROVIDER", "openai").strip().lower()
+
+_VALID_CANVAS_PROVIDERS = {"anthropic", "openai", "gemini"}
+if LLM_CANVAS_PROVIDER not in _VALID_CANVAS_PROVIDERS:
+    raise ValueError(
+        f"LLM_CANVAS_PROVIDER must be one of {sorted(_VALID_CANVAS_PROVIDERS)}, "
+        f"got '{LLM_CANVAS_PROVIDER}'"
+    )
+
+# Per-provider model overrides (defaults match CLAUDE.md's documented choices).
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 
 # ──────────────────────────────────────────────────────────────────────

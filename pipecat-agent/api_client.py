@@ -84,12 +84,20 @@ async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict |
 
     Uses GET /live-rooms/{room_id}/scene-snapshot (no auth).
     Returns scene data with elements, instruction, display mode.
+
+    Always passes ``include_all_scene_knowledge=true`` (S64c) so the
+    snapshot's ``knowledge.flow`` payload aggregates every sibling
+    scene's scene-scope knowledge alongside whatever is attached at
+    the flow level. This keeps the agent's flow-knowledge prompt
+    block stable across scene navigations and lets the agent answer
+    from any scene's knowledge regardless of which scene is current.
     """
     base_url = api_url or HV_API_URL
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{base_url}/live-rooms/{room_id}/scene-snapshot",
+                params={"include_all_scene_knowledge": "true"},
             )
             response.raise_for_status()
             data = response.json()

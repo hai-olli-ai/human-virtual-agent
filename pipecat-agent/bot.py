@@ -73,10 +73,24 @@ from config import (
     DEFAULT_AVATAR_ID,
     DEFAULT_ROOM_ID,
     DEFAULT_SCENE_ID,
+    LLM_CANVAS_PROVIDER,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_MODEL,
+    GOOGLE_AI_API_KEY,
+    GEMINI_MODEL,
     resolve_deepgram_language,
 )
-from canvas_actions import create_canvas_action_handlers, get_canvas_tools
 from persona import build_system_prompt
+# S64c — Canvas Protocol generic tool surface (registered alongside V2.13 tools
+# until Block 7 cutover). See CLAUDE.md "Coming in S64c".
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from tools.canvas_protocol_tools import (
+    CanvasToolContext,
+    PendingCommandRegistry,
+    make_handlers as make_canvas_protocol_handlers,
+    make_tool_schemas as make_canvas_protocol_schemas,
+)
+from context.canvas_manifest import CanvasManifestRegistry
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -528,6 +542,70 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
     return CLOUD_OUTPUT_MODE
 
 
+# ──────────────────────────────────────────────────────────────────────
+# LLM provider selection (S64c)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Per-provider branching with lazy imports — only the SDK for the
+# selected provider needs to be installed. CLAUDE.md S64c documents
+# anthropic as the eventual default; today the default is openai
+# because that's the only LLM extra in pyproject.toml. Override via
+# LLM_CANVAS_PROVIDER env var after installing the corresponding extra.
+
+def _build_llm_and_eager_hook(
+    *,
+    provider: str,
+    system_prompt: str,
+    canvas_pending: PendingCommandRegistry,
+    send_canvas_message,
+):
+    """Construct the per-provider LLM service + eager-dispatch hook.
+
+    Returns (llm_service, eager_hook). The hook is instantiated but not
+    yet wired into the streaming loop — see the NOTE in run_bot_classic.
+    """
+    if provider == "openai":
+        from services.eager_dispatch.openai_adapter import OpenAIEagerHook
+        llm = OpenAILLMService(
+            api_key=OPENAI_API_KEY,
+            settings=OpenAILLMService.Settings(
+                model=LLM_MODEL,
+                system_instruction=system_prompt,
+            ),
+        )
+        return llm, OpenAIEagerHook(canvas_pending, send_canvas_message)
+
+    if provider == "anthropic":
+        from pipecat.services.anthropic.llm import AnthropicLLMService
+        from services.eager_dispatch.anthropic_adapter import AnthropicEagerHook
+        llm = AnthropicLLMService(
+            api_key=ANTHROPIC_API_KEY,
+            model=ANTHROPIC_MODEL,
+        )
+        # Anthropic services in Pipecat typically take system prompt via
+        # context messages or a service-specific setter; until S64c Block 7
+        # restructures the prompt assembly, we fall back to setting it on
+        # an attribute the service exposes (matches the pattern V2.13 uses
+        # for the OpenAI service).
+        try:
+            llm._settings.system_instruction = system_prompt  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("Anthropic LLM service did not accept system_instruction setter")
+        return llm, AnthropicEagerHook(canvas_pending, send_canvas_message)
+
+    if provider == "gemini":
+        from pipecat.services.google.llm import GoogleLLMService
+        from services.eager_dispatch.gemini_adapter import GeminiEagerHook
+        llm = GoogleLLMService(
+            api_key=GOOGLE_AI_API_KEY,
+            model=GEMINI_MODEL,
+            system_instruction=system_prompt,
+        )
+        return llm, GeminiEagerHook(canvas_pending, send_canvas_message)
+
+    raise ValueError(f"unknown LLM_CANVAS_PROVIDER={provider!r}")
+
+
 # ======================================================================
 #
 #  CLASSIC PIPELINE  (avatar display: normal / invisible / 3dgs)
@@ -551,11 +629,18 @@ async def run_bot_classic(
     """Classic voice agent pipeline with Cartesia TTS."""
     logger.info("Starting classic voice agent (room={}, avatar={})", room_id, avatar_id)
 
+    # S64c — initial element alias map. Populated by build_system_prompt
+    # below and passed into CanvasToolContext when it's constructed
+    # further down. The same dict object is reused across the session;
+    # post_scene_change clears + repopulates it on every scene nav so
+    # the tool handlers always see the current scene's aliases.
+    element_alias_map: dict[str, str] = {}
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
         scene_id=scene_id,
         api_url=api_url,
+        aliases_out=element_alias_map,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
@@ -587,8 +672,33 @@ async def run_bot_classic(
         if scene_snapshot:
             logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
 
+    # ── Canvas Protocol substrate (S64c) ──
+    # Manifest + pending command registries are per-session; an instance pair
+    # is created here and threaded through the eager hook, the new tool
+    # handlers, and the on_app_message router below.
+    output_transport = transport.output()
+    canvas_manifest = CanvasManifestRegistry()
+    canvas_pending = PendingCommandRegistry()
+
+    async def send_canvas_message(payload: dict) -> None:
+        """Send a Canvas Protocol Daily app-message to the frontend."""
+        try:
+            await output_transport.send_message(OutputTransportMessageFrame(message=payload))
+        except Exception as exc:
+            logger.warning("Failed to send canvas message: {}", exc)
+
+    canvas_ctx = CanvasToolContext(
+        manifest_registry=canvas_manifest,
+        pending=canvas_pending,
+        send_app_message=send_canvas_message,
+        element_alias_map=element_alias_map,
+        command_timeout_s=6.0,
+    )
+
     # ── AI Services ──
-    canvas_tools = get_canvas_tools()
+    canvas_tools = ToolsSchema(
+        standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
+    )
 
     # STT language driven by the live-room language (S61).
     snapshot_language = (scene_snapshot or {}).get("language")
@@ -613,13 +723,22 @@ async def run_bot_classic(
         api_key=CARTESIA_API_KEY,
         settings=CartesiaTTSService.Settings(voice=voice_id),
     )
-    llm = OpenAILLMService(
-        api_key=OPENAI_API_KEY,
-        settings=OpenAILLMService.Settings(
-            model=LLM_MODEL,
-            system_instruction=system_prompt,
-        ),
+
+    llm, eager_hook = _build_llm_and_eager_hook(
+        provider=LLM_CANVAS_PROVIDER,
+        system_prompt=system_prompt,
+        canvas_pending=canvas_pending,
+        send_canvas_message=send_canvas_message,
     )
+    logger.info(
+        "Canvas Protocol LLM provider={} eager_hook={}",
+        LLM_CANVAS_PROVIDER, eager_hook.__class__.__name__,
+    )
+    # NOTE: eager_hook is instantiated but not yet wired into the LLM
+    # service's streaming loop — that's a per-provider integration that
+    # depends on Pipecat's hook surface and lands in a follow-up. Until
+    # then, all canvas tool calls go through the regular tool-handler
+    # path (no eager-dispatch latency win, but correctness is identical).
 
     # ── Conversation context ──
     initial_messages = []
@@ -632,17 +751,50 @@ async def run_bot_classic(
         tools=canvas_tools,
     )
 
-    # ── Output transport + canvas action handlers ──
-    output_transport = transport.output()
-    action_handlers = create_canvas_action_handlers(
-        output_transport=output_transport,
-        context=context,
-        llm=llm,
-        room_id=room_id,
-        api_url=api_url,
-    )
-    for func_name, handler in action_handlers.items():
-        llm.register_function(func_name, handler)
+    # ── Scene-change refresh (S64c) ──
+    # Single refresh entry point for both voice-initiated and
+    # visitor-initiated scene navigation. The frontend's navigateToIndex
+    # emits a `canvas.sceneChanged` Daily message after every successful
+    # nav, regardless of trigger (voice via canvas_control, or visitor
+    # rail-click). The on_app_message handler below routes that single
+    # message to this closure, which:
+    #   1. Rebuilds the system prompt (so CANVAS ELEMENTS + ids and
+    #      knowledge.flow reflect the new scene).
+    #   2. Refreshes the vision frame.
+    # No verb-specific logic and no api_navigate call — the frontend has
+    # already advanced the backend cursor by the time this fires, so
+    # build_system_prompt's internal /scene-snapshot fetch returns the
+    # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
+    # in place so the next canvas_highlight / canvas_action resolves
+    # aliases against the new scene's elements.
+    async def refresh_agent_for_current_scene() -> None:
+        if not room_id:
+            logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
+            return
+
+        new_prompt = await build_system_prompt(
+            room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
+            aliases_out=canvas_ctx.element_alias_map,
+        )
+        try:
+            llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
+            logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
+        except Exception:
+            logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+
+        from api_client import get_scene_image_base64
+        new_image = await get_scene_image_base64(room_id, api_url)
+        if new_image:
+            from scene_context import build_vision_message
+            context.add_message(build_vision_message(new_image))
+            logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+        else:
+            logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+
+    # ── Canvas Protocol generic tool handlers (S64c) ──
+    canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
+    for name, handler in canvas_protocol_handlers.items():
+        llm.register_function(name, handler)
 
     # ── Aggregators with VAD ──
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -683,6 +835,41 @@ async def run_bot_classic(
 
     # ── Event handlers (simple — no participant role detection) ──
 
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        """Route Canvas Protocol messages from the frontend (S64c)."""
+        if not isinstance(message, dict):
+            return
+        msg_type = message.get("type")
+        if msg_type == "canvas.register":
+            logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
+            canvas_manifest.set_manifest(message)
+        elif msg_type == "canvas.stateChange":
+            logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")
+            canvas_manifest.update_state(message.get("semanticState") or {})
+        elif msg_type == "canvas.sceneChanged":
+            # S64c — single refresh trigger for ALL scene navigations,
+            # voice-initiated and visitor-initiated alike. The frontend
+            # emits this from navigateToIndex, which is the canonical
+            # scene-change function (both rail-click and voice-tool paths
+            # bottom out there). Awaited inline so the refresh completes
+            # before subsequent messages (in particular canvas.commandResult
+            # for voice nav) are processed by the loop, keeping the prompt
+            # fresh by the time the LLM speaks its tool result.
+            scene_index = message.get("sceneIndex")
+            logger.info(f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r}")
+            await refresh_agent_for_current_scene()
+        elif msg_type == "canvas.commandResult":
+            cid = message.get("commandId")
+            logger.info(f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}")
+            if cid:
+                canvas_pending.resolve(cid, message.get("result") or {})
+        elif msg_type == "canvas.commandError":
+            cid = message.get("commandId")
+            logger.warning(f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}")
+            if cid:
+                canvas_pending.reject(cid, message.get("error") or {})
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Visitor connected to live room")
@@ -719,6 +906,7 @@ async def run_bot_classic(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Visitor disconnected")
+        canvas_pending.cancel_all("session_end")
         await task.cancel()
 
     # ── Run ──
@@ -750,11 +938,18 @@ async def run_bot_relay(
     """Relay avatar pipeline — forwards LLM text to SoulX for speech + video."""
     logger.info("Starting relay avatar agent (room={}, avatar={})", room_id, avatar_id)
 
+    # S64c — initial element alias map. Populated by build_system_prompt
+    # below and passed into CanvasToolContext when it's constructed
+    # further down. The same dict object is reused across the session;
+    # post_scene_change clears + repopulates it on every scene nav so
+    # the tool handlers always see the current scene's aliases.
+    element_alias_map: dict[str, str] = {}
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
         scene_id=scene_id,
         api_url=api_url,
+        aliases_out=element_alias_map,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
@@ -776,8 +971,30 @@ async def run_bot_relay(
         if scene_snapshot:
             logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
 
+    # ── Canvas Protocol substrate (S64c) ──
+    output_transport = transport.output()
+    canvas_manifest = CanvasManifestRegistry()
+    canvas_pending = PendingCommandRegistry()
+
+    async def send_canvas_message(payload: dict) -> None:
+        """Send a Canvas Protocol Daily app-message to the frontend."""
+        try:
+            await output_transport.send_message(OutputTransportMessageFrame(message=payload))
+        except Exception as exc:
+            logger.warning("Failed to send canvas message: {}", exc)
+
+    canvas_ctx = CanvasToolContext(
+        manifest_registry=canvas_manifest,
+        pending=canvas_pending,
+        send_app_message=send_canvas_message,
+        element_alias_map=element_alias_map,
+        command_timeout_s=6.0,
+    )
+
     # ── AI Services (no TTS — SoulX handles speech) ──
-    canvas_tools = get_canvas_tools()
+    canvas_tools = ToolsSchema(
+        standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
+    )
 
     # STT language driven by the live-room language (S61).
     snapshot_language = (scene_snapshot or {}).get("language")
@@ -797,13 +1014,19 @@ async def run_bot_relay(
         api_key=DEEPGRAM_API_KEY,
         settings=DeepgramSTTService.Settings(language=deepgram_language),
     )
-    llm = OpenAILLMService(
-        api_key=OPENAI_API_KEY,
-        settings=OpenAILLMService.Settings(
-            model=LLM_MODEL,
-            system_instruction=system_prompt,
-        ),
+
+    llm, eager_hook = _build_llm_and_eager_hook(
+        provider=LLM_CANVAS_PROVIDER,
+        system_prompt=system_prompt,
+        canvas_pending=canvas_pending,
+        send_canvas_message=send_canvas_message,
     )
+    logger.info(
+        "Canvas Protocol LLM provider={} eager_hook={}",
+        LLM_CANVAS_PROVIDER, eager_hook.__class__.__name__,
+    )
+    # NOTE: see run_bot_classic — eager_hook is instantiated but not wired
+    # into the streaming loop yet.
 
     # ── Conversation context ──
     initial_messages = []
@@ -816,17 +1039,50 @@ async def run_bot_relay(
         tools=canvas_tools,
     )
 
-    # ── Output transport + canvas action handlers ──
-    output_transport = transport.output()
-    action_handlers = create_canvas_action_handlers(
-        output_transport=output_transport,
-        context=context,
-        llm=llm,
-        room_id=room_id,
-        api_url=api_url,
-    )
-    for func_name, handler in action_handlers.items():
-        llm.register_function(func_name, handler)
+    # ── Scene-change refresh (S64c) ──
+    # Single refresh entry point for both voice-initiated and
+    # visitor-initiated scene navigation. The frontend's navigateToIndex
+    # emits a `canvas.sceneChanged` Daily message after every successful
+    # nav, regardless of trigger (voice via canvas_control, or visitor
+    # rail-click). The on_app_message handler below routes that single
+    # message to this closure, which:
+    #   1. Rebuilds the system prompt (so CANVAS ELEMENTS + ids and
+    #      knowledge.flow reflect the new scene).
+    #   2. Refreshes the vision frame.
+    # No verb-specific logic and no api_navigate call — the frontend has
+    # already advanced the backend cursor by the time this fires, so
+    # build_system_prompt's internal /scene-snapshot fetch returns the
+    # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
+    # in place so the next canvas_highlight / canvas_action resolves
+    # aliases against the new scene's elements.
+    async def refresh_agent_for_current_scene() -> None:
+        if not room_id:
+            logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
+            return
+
+        new_prompt = await build_system_prompt(
+            room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
+            aliases_out=canvas_ctx.element_alias_map,
+        )
+        try:
+            llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
+            logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
+        except Exception:
+            logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+
+        from api_client import get_scene_image_base64
+        new_image = await get_scene_image_base64(room_id, api_url)
+        if new_image:
+            from scene_context import build_vision_message
+            context.add_message(build_vision_message(new_image))
+            logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+        else:
+            logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+
+    # ── Canvas Protocol generic tool handlers (S64c) ──
+    canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
+    for name, handler in canvas_protocol_handlers.items():
+        llm.register_function(name, handler)
 
     # ── Aggregators with VAD ──
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -1029,6 +1285,7 @@ async def run_bot_relay(
         active_human_id = None
         captured_audio_participant_id = None
         greeting_sent = False
+        canvas_pending.cancel_all("session_end")
         await task.cancel()
 
     # ── Event handlers (complex — participant role detection) ──
@@ -1036,6 +1293,41 @@ async def run_bot_relay(
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender):
         nonlocal avatar_participant_id
+
+        # Canvas Protocol routing (S64c) — handled before relay-ready check
+        # so the canvas message types short-circuit cleanly.
+        if isinstance(message, dict):
+            msg_type = message.get("type")
+            if msg_type == "canvas.register":
+                logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
+                canvas_manifest.set_manifest(message)
+                return
+            if msg_type == "canvas.stateChange":
+                logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")
+                canvas_manifest.update_state(message.get("semanticState") or {})
+                return
+            if msg_type == "canvas.sceneChanged":
+                # S64c — see classic pipeline's on_app_message for the
+                # rationale. Single refresh trigger for both voice and
+                # visitor-initiated nav; awaited inline so the refresh
+                # finishes before canvas.commandResult is processed.
+                scene_index = message.get("sceneIndex")
+                logger.info(f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r}")
+                await refresh_agent_for_current_scene()
+                return
+            if msg_type == "canvas.commandResult":
+                cid = message.get("commandId")
+                logger.info(f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}")
+                if cid:
+                    canvas_pending.resolve(cid, message.get("result") or {})
+                return
+            if msg_type == "canvas.commandError":
+                cid = message.get("commandId")
+                logger.warning(f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}")
+                if cid:
+                    canvas_pending.reject(cid, message.get("error") or {})
+                return
+
         if not _is_relay_ready_message(message):
             return
         avatar_participant_id = str(sender or "").strip() or avatar_participant_id

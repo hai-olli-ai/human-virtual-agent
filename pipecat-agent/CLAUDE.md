@@ -1,8 +1,20 @@
 # pipecat-agent — CLAUDE.md
 
-> Voice agent for **Human Virtual** (hv.ai) — drives the avatar's voice + canvas behavior in Live Rooms.
-> **Status:** V2 in progress · Sessions through 63b complete · **S64a (Canvas Protocol Foundation) is next; S64c rebuilds this repo's tool surface**.
-> **Stack:** Pipecat Framework · Pipecat Cloud · Daily.co (prod) · Cartesia + Deepgram + OpenAI/Anthropic/Gemini.
+> Voice agent for **Human Virtual** (hv.ai), built on the **Pipecat Framework**.
+> **Status:** Sessions through 64b complete · **S64c (generic 5-tool surface + multi-provider eager streaming dispatch) is next**.
+> **Repo:** `pipecat-agent/` (lives alongside `human-virtual-backend/` and `human-virtual-frontend/`).
+
+---
+
+## What this service does
+
+The Pipecat agent runs the avatar's **conversation pipeline**: STT → LLM → TTS → audio out, with optional vision and canvas tool calls. It connects to a Live Room over WebRTC and:
+
+1. Listens to the visitor's microphone (Deepgram STT).
+2. Calls an LLM (currently Anthropic Claude Sonnet 4 by default) with a system prompt assembled from the Live Room's persona, knowledge, current scene instruction, and canvas state.
+3. Emits TTS audio (Cartesia) plus avatar lip-sync data (SoulX-Flashtalk for "talking" display mode).
+4. Calls **canvas tools** when the visitor asks the avatar to highlight an element, draw an arrow, navigate scenes, etc.
+5. (S46+) Calls **vision** (OpenAI GPT-4.1) when the visitor asks about screen contents.
 
 ---
 
@@ -10,29 +22,16 @@
 
 | Layer | Choice |
 |---|---|
-| Framework | Pipecat (Daily.co's voice-agent framework) |
-| Transport (local dev) | `SmallWebRTCTransport` |
-| Transport (production) | `DailyTransport` via Daily.co |
-| Hosting (production) | Pipecat Cloud |
-| STT | Deepgram (multilingual, 9 languages) |
-| TTS | Cartesia (with voice clones from S51b) |
-| LLM (canvas tool routing) | OpenAI / Anthropic / Gemini — selectable via `LLM_CANVAS_PROVIDER` (introduced S64c) |
-| LLM (vision) | OpenAI GPT-4.1 (S46 scene understanding) |
-| Avatar display | SoulX-Flashtalk (S48 talking mode) |
-
----
-
-## What this agent does
-
-For each Live Room session, the agent:
-
-1. Fetches the per-session context from the backend's snapshot endpoint.
-2. Constructs a system prompt using the **sandwich pattern** (see below).
-3. Runs the conversation loop: user speaks → STT → LLM → tool call (canvas action) + speech response → TTS → speaks back.
-4. Optionally uses GPT-4.1 vision (S46) to understand the rendered canvas when a question requires visual grounding.
-5. Retrieves Knowledge via RAG (S56) when the question relates to creator-provided documents/URLs/FAQs.
-
-**The agent is stateless across sessions.** Each Live Room session boots a fresh agent with a fresh prompt.
+| Framework | Pipecat (Python) |
+| Transport (prod) | DailyTransport (Daily.co WebRTC) |
+| Transport (local) | SmallWebRTCTransport |
+| Deployment (prod) | Pipecat Cloud |
+| LLM (default) | Anthropic Claude Sonnet 4 |
+| LLM (alt) | OpenAI GPT-4o, Google Gemini 2.0 Flash |
+| Vision | OpenAI GPT-4.1 (hardcoded for canvas snapshot understanding — S46) |
+| STT | Deepgram |
+| TTS | Cartesia |
+| Lip-sync | SoulX-Flashtalk (S48 — for "talking" display mode) |
 
 ---
 
@@ -40,321 +39,329 @@ For each Live Room session, the agent:
 
 ```
 pipecat-agent/
-  agent.py                   # Entry point — bootstraps the pipeline
-  config.py                  # Settings (env vars, transport, model IDs)
+  agent.py                   # Main entrypoint — pipeline assembly, transport setup
+  config.py                  # Settings (env vars)
   context/
-    snapshot_client.py       # Calls backend HV_API_URL endpoints
-    prompt_builder.py        # Sandwich-pattern system prompt assembly
-    knowledge_rag.py         # S56 RAG retrieval
-  tools/                     # Function-calling tools
-    canvas_actions.py        # Currently S47's 5 hardcoded tools — REPLACED in S64c
-    vision.py                # S46 GPT-4.1 vision for canvas understanding
-    knowledge.py             # RAG-backed knowledge lookup
-  transports/
-    local.py                 # SmallWebRTCTransport setup
-    daily.py                 # DailyTransport setup
+    prompt_builder.py        # System prompt assembly (sandwich pattern)
+    knowledge.py             # Knowledge / FAQ rendering
+  tools/
+    canvas_actions.py        # V2.13 hardcoded canvas tools (REMOVED in S64c)
+    canvas_protocol_tools.py # NEW in S64c — 5 generic protocol tools
   services/
-    cartesia_tts.py          # Cartesia TTS wrapper with voice-clone support
-    deepgram_stt.py          # Multilingual STT
-  utils/
-    language.py              # Locale → STT/TTS config mapping (S60–61)
-  Dockerfile                 # For Pipecat Cloud deployment
-  requirements.txt
+    eager_dispatch/          # NEW in S64c — per-provider streaming hooks
+      __init__.py
+      anthropic_adapter.py
+      openai_adapter.py
+      gemini_adapter.py
+  tests/
+    test_eager_dispatch.py   # NEW in S64c
+    test_canvas_protocol_tools.py
+  README.md
 ```
 
 ---
 
-## Local dev vs production
+## Pipecat pipeline (high level)
 
-| Aspect | Local dev | Production |
-|---|---|---|
-| Transport | `SmallWebRTCTransport` | `DailyTransport` |
-| Run command | `python agent.py --transport=local` | Pipecat Cloud manages |
-| WebRTC signaling | Built-in to Pipecat dev server | Daily.co room API |
-| Backend URL | `http://localhost:8000` (`HV_API_URL`) | `https://api.hv.ai` |
-| Voice room | Direct browser ↔ agent | Browser ↔ Daily room ↔ agent |
+```
+DailyTransport.input  ->  Deepgram STT
+                      ->  user_context_aggregator
+                      ->  LLM (Anthropic / OpenAI / Gemini, with tools)
+                      ->  assistant_context_aggregator
+                      ->  Cartesia TTS
+                      ->  SoulX (when display_mode=='talking')
+                      ->  DailyTransport.output
+```
 
-The transport is selected at startup based on the `--transport` CLI flag or `TRANSPORT` env var. **Don't unify** the two paths — Daily-specific session metadata (room URLs, app messages) doesn't have a clean local equivalent.
+The LLM service has **canvas tools registered** as function-calling tools. When the LLM emits a tool call, Pipecat's function-call aggregator invokes the registered handler. The handler emits a Daily app-message to the frontend (the live-room shell handles it and dispatches to the Canvas Service).
 
 ---
 
-## Backend integration — snapshot endpoint
+## System prompt — the sandwich pattern
 
-The agent's source of truth is the backend's per-session snapshot:
+`context/prompt_builder.py` assembles the system prompt in a fixed order. The pattern locks LANGUAGE on both ends ("sandwich") to keep multilingual output consistent:
+
+**Current order (post-S64b):**
 
 ```
-GET /live-rooms/by-slug/{slug}/scene-snapshot
+1. LANGUAGE         (open)
+2. PERSONA
+3. AUDIENCE
+4. KNOWLEDGE
+5. SCENE INSTRUCTION
+6. DISPLAY MODE
+7. CANVAS ELEMENTS
+8. CANVAS ACTIONS   (V2.13 — describes 5 hardcoded tools)
+9. LANGUAGE         (close)
 ```
 
-This endpoint is **public** (no auth) — it's hit by both the Pipecat agent and the live-room frontend visitor view. The response shape:
+**Coming in S64c order:**
+
+```
+1.  LANGUAGE          (open)
+2.  PERSONA
+3.  AUDIENCE
+4.  KNOWLEDGE
+5.  SCENE INSTRUCTION
+5b. CANVAS PAGE       (NEW — describes active Page's manifest verbs)
+6.  DISPLAY MODE
+7.  CANVAS ELEMENTS
+8.  CANVAS ACTIONS    (REPLACED — describes 5 generic protocol tools)
+9.  LANGUAGE          (close)
+```
+
+The `CANVAS PAGE` section is positioned right after `SCENE INSTRUCTION` because Page type can change with scene navigation (S64d/e via `set_page`). Having it adjacent to scene context makes the LLM's verb selection more reliable.
+
+**For Anthropic specifically (S64c):** the prompt prefix LANGUAGE → CANVAS PAGE will be marked with `cache_control: {"type": "ephemeral"}` for Anthropic prompt caching. Sections 6–9 are the dynamic suffix. `build_system_prompt_split()` returns the (stable_prefix, dynamic_suffix) tuple.
+
+OpenAI and Gemini benefit from automatic prefix caching — same structural prefix gives them implicit cache hits even without explicit markers.
+
+---
+
+## Canvas tools — current (V2.13, post-S64b)
+
+The agent currently has **5 hardcoded tools** that ship V2.13-shape Daily app-messages:
+
+| Tool | Daily message shape |
+|---|---|
+| `highlight_element(id)` | `{type: 'canvas_tool', name: 'highlight_element', args: {id}}` |
+| `arrow_between(from, to)` | `{type: 'canvas_tool', name: 'arrow_between', args: {from, to}}` |
+| `add_annotation(text, x, y)` | `{type: 'canvas_tool', name: 'add_annotation', args: {text, x, y}}` |
+| `navigate_scene(direction)` | `{type: 'canvas_tool', name: 'navigate_scene', args: {direction: 'next' \| 'previous'}}` |
+| `clear_overlays()` | `{type: 'canvas_tool', name: 'clear_overlays', args: {}}` |
+
+These live in `tools/canvas_actions.py`. Each handler:
+
+1. Validates args.
+2. Sends the Daily app-message via the transport.
+3. Returns "ok" to the LLM (fire-and-forget — the V2.13 path doesn't wait for canvas confirmation).
+
+**The frontend's translation shim** (S64b — `src/lib/canvas-protocol/translation-shim.ts`) catches these V2.13-shape messages and converts them to Canvas Protocol dispatches. The agent has no idea the protocol exists; it just emits V2.13 messages. The shim makes everything work.
+
+**This is replaced in S64c.** The agent will emit protocol-shape messages directly. The shim will be removed. See "Coming in S64c" below.
+
+---
+
+## LLM provider — current (post-S64b)
+
+Currently Anthropic Claude Sonnet 4 is hardcoded as the LLM service in `agent.py`:
 
 ```python
-{
-  "scenes": [
-    {
-      "id": "...",
-      "name": "...",
-      "display_mode": "normal" | "invisible" | "3dgs" | "talking",
-      "instruction": "...",
-      "elements": [...],            # JSONB array of canvas elements
-      "scripts": [...],
-      "knowledge_text": "...",      # assembled from Scene Knowledge + extracted link content
-      "faqs": [...],
-      "link_url": "..." | null,
-      "link_source": "..." | null,
-      "canvas_page_type": "composition"  # NEW in S64a — Pipecat ignores until S64c
-    },
-    ...
-  ],
-  "live_room": {
-    "language": "en",               # S60–61 multi-language
-    "recipient_prompt": "...",      # S60–61
-    "persona": {
-      "avatar_name": "...",
-      "voice_model_provider": "cartesia",
-      "voice_id": "...",
-      ...
-    }
-  }
-}
+from pipecat.services.anthropic.llm import AnthropicLLMService
+llm = AnthropicLLMService(
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    model="claude-sonnet-4-20250514",
+)
 ```
 
-Snapshot is fetched **once per session** at session start. The agent caches it in memory for the session's duration. If the user navigates between scenes mid-session, the agent reads the new scene from the cached snapshot — no refetch.
+There's no provider abstraction yet. Vision (S46) is a separate service (OpenAI GPT-4.1) that runs alongside.
 
-**Adding a new field to the snapshot is non-breaking** — Pipecat parses what it needs and ignores the rest. There is no strict Pydantic model with `extra="forbid"`. Don't add one.
-
----
-
-## System prompt — sandwich pattern
-
-The system prompt is assembled in `context/prompt_builder.py` in this order:
-
-```
-1. LANGUAGE                     # "Respond in {language}. ..."
-2. PERSONA                      # avatar identity, tone, role
-3. AUDIENCE                     # recipient_prompt from S60–61
-4. KNOWLEDGE                    # RAG-retrieved + scene knowledge text
-5. SCENE INSTRUCTION            # creator-authored instruction
-6. DISPLAY MODE                 # what the avatar looks like (talking, invisible, etc.)
-7. CANVAS ELEMENTS              # serialized JSON of current scene's elements
-8. CANVAS ACTIONS               # tool descriptions — REPLACED in S64c
-9. LANGUAGE                     # repeat the language instruction (sandwich close)
-```
-
-The double-LANGUAGE wrap (1 + 9) is intentional — multilingual reliability requires the language directive to be both at the start (for instruction-following) and at the end (closest to the next-token prediction). Don't remove either anchor.
-
-**The sandwich must remain stable across sessions.** Reordering the sections invalidates LLM prompt caches across all three providers (Anthropic explicit `cache_control`, OpenAI/Gemini structural prefix). When extending the prompt, **append within an existing section** rather than inserting a new section between existing ones.
-
-### Coming in S64c
-
-Section 8 (CANVAS ACTIONS) is being restructured:
-
-- The 5 hardcoded tool descriptions (`highlight_element`, `arrow_between`, `add_annotation`, `navigate_scene`, `clear_overlays`) are removed.
-- A new compact section called `CANVAS PAGE` describes the active Page type and supported verbs:
-  ```
-  Active page: composition.
-  control: next_scene | previous_scene | clear.
-  highlight: element_id targets.
-  analyze: supported (semanticState provider).
-  ```
-- 5 generic tools (`canvas.analyze`, `canvas.highlight`, `canvas.control`, `canvas.action`, `canvas.set_page`) replace the hardcoded surface.
-
-This is the most delicate change in Phase 9g — the agent's tool surface fundamentally shifts. Before/after latency benchmarking is mandatory in S64c.
+S64c introduces `LLM_CANVAS_PROVIDER` env var (anthropic|openai|gemini) and three adapter classes — see "Coming in S64c".
 
 ---
 
-## Voice tech
+## Vision (S46) — separate, hardcoded
 
-### STT — Deepgram (multilingual)
+`POST /live-rooms/by-slug/{slug}/scene-snapshot/image` (backend) returns a Pillow-rendered base64 PNG of the current scene. When the visitor asks "what's on screen?", the agent calls the OpenAI GPT-4.1 vision API with the image and the question.
 
-`services/deepgram_stt.py` configures Deepgram per the live-room language. Locale mapping in `utils/language.py`:
-
-```python
-LOCALE_TO_DEEPGRAM_MODEL = {
-    "en": "nova-3",
-    "es": "nova-2",
-    "fr": "nova-2",
-    # ... 9 total
-}
-```
-
-Deepgram returns interim transcripts; the agent waits for `is_final=True` before sending to LLM. The pipeline uses Pipecat's `STTService` interface — replacing Deepgram is a single-class swap.
-
-### TTS — Cartesia (with voice clones)
-
-`services/cartesia_tts.py` uses Cartesia's WebSocket TTS API. Voice selection logic:
-
-1. If `voice_model_provider == "cartesia"` and a `voice_id` is set on the avatar, use that voice (cloned from S51b).
-2. Else use the default Cartesia voice for the session's language (mapped in `utils/language.py`).
-
-Cartesia's auto-clone (S51b) creates a voice from the 6–10s recording the user makes during avatar creation. The backend manages clone creation; this repo only consumes the resulting `voice_id`.
-
-### Display modes (S39, S48)
-
-- `normal` — static avatar image
-- `invisible` — no avatar shown (audio-only)
-- `3dgs` — 3D Gaussian Splatting (rendered frontend-side)
-- `talking` — SoulX-Flashtalk lip-sync (rendered frontend-side, this repo only relays the TTS audio)
-
-The agent doesn't render the avatar. It emits TTS audio frames; the frontend renders the visual based on `display_mode` from the snapshot.
+**Vision provider does NOT change with `LLM_CANVAS_PROVIDER`.** Vision is hardcoded on OpenAI GPT-4.1 because (a) GPT-4.1 vision is currently best-in-class for canvas understanding and (b) the volume is low enough that the separate OpenAI key is justified. Keep `OPENAI_API_KEY` set even when running with `LLM_CANVAS_PROVIDER=anthropic` or `LLM_CANVAS_PROVIDER=gemini`.
 
 ---
 
-## Vision — S46 GPT-4.1
+## Live Room snapshot consumer
 
-When a user question requires visual grounding ("what color is the box on the left?"), the agent calls `tools/vision.py`:
+The agent fetches `GET /live-rooms/by-slug/{slug}/scene-snapshot` from backend on session start (and on scene navigation). The snapshot includes:
 
-1. Fetches the canvas snapshot image from `GET /live-rooms/by-slug/{slug}/scene-snapshot/image` (Pillow-rendered PNG of the current scene).
-2. Sends to GPT-4.1 with the user's question.
-3. Returns the answer, which the LLM incorporates into its response.
+- `live_room`: language, persona, recipient_prompt
+- `current_scene`: name, instruction, display_mode, background_url, elements, link_url, link_source
+- `flow_state`: scene_index, total_scenes, scene_ids array
+- `knowledge`: text content from extracted sources
+- `faqs`: array of {question, answer}
 
-Vision is **opt-in per turn** — the agent's main LLM decides when to call the vision tool. Don't always-call vision; it adds 1–3s latency.
+The agent passes these into `prompt_builder.build_system_prompt(...)` to assemble the per-turn system prompt.
 
-**Coming in S64c+:** with the Canvas Protocol, vision becomes one of multiple `analyze()` providers. v0.1 ships only the semanticState provider (microsecond-fast, answers most questions). Vision is queued for v0.2.
+**Do not duplicate snapshot logic locally.** If the agent needs additional context, extend the snapshot endpoint in the backend rather than fetching multiple endpoints. The backend's `LiveRoomService.get_scene_snapshot()` is the single source of truth.
 
----
-
-## Knowledge RAG — S56
-
-`context/knowledge_rag.py` retrieves relevant Knowledge chunks for a user question:
-
-1. Knowledge text was assembled into `scene.knowledge_text` at snapshot time (backend-side).
-2. The agent's LLM has the full knowledge text in the prompt's KNOWLEDGE section.
-3. For very large knowledge bodies, the agent calls a RAG tool (`tools/knowledge.py`) to retrieve specific chunks via the backend's `POST /knowledge/search` endpoint.
-
-The simple path (knowledge fits in prompt) handles most cases. RAG retrieval is reserved for >~10k token knowledge bodies. Backend handles vector storage + retrieval; this repo just calls the search endpoint.
+The snapshot's per-scene shape is shared with the **composition Canvas Page** (S64b — frontend). Don't change the snapshot's per-scene shape without coordinating with the composition Page bundle (`public/canvas-pages/composition/main.js` in human-virtual-frontend) and the Pipecat consumer (this agent). The backend has regression tests in `tests/test_scenes_canvas_page_type.py` to catch drift.
 
 ---
 
-## Canvas tools — current state (S47), changing in S64c
+## Daily app-messages — current (post-S64b)
 
-### Current (post-S63b)
+**Outgoing (agent → frontend):**
 
-5 hardcoded tools in `tools/canvas_actions.py`:
+- `{type: 'canvas_tool', name, args}` — V2.13 canvas tool call (intercepted by frontend shim).
+- `{type: 'caption', text, language}` — caption strip update.
+- `{type: 'lip_sync', frames}` — SoulX lip-sync frame data when display_mode == 'talking'.
+- `{type: 'session_event', event, payload}` — session lifecycle events.
 
-- `highlight_element(element_id: str)` — render a highlight box on a canvas element
-- `arrow_between(from_element_id: str, to_element_id: str)` — render an arrow
-- `add_annotation(text: str, x: int, y: int)` — render a text bubble at a coordinate
-- `navigate_scene(direction: "next" | "previous")` — flow navigation
-- `clear_overlays()` — remove all highlights/arrows/annotations
+**Incoming (frontend → agent):**
 
-Tools are emitted as Daily app-messages (in production) or local WebRTC data-channel messages (in dev). The frontend listens and renders.
+- `{type: 'navigate', direction}` — visitor clicks scene rail (frontend tells agent to advance scene context).
+- `{type: 'session_event', event, payload}` — visitor session lifecycle.
 
-### Coming in S64c (Canvas Protocol generic surface)
-
-The 5 hardcoded tools are **removed**. Replaced by 5 generic verbs:
-
-- `canvas.analyze(question, options)` — Q&A about the current Page state
-- `canvas.highlight(target, options)` — target = `{element_id}` or `{box: [x,y,w,h]}`
-- `canvas.control(verb, args)` — Page-specific verbs (composition: `next_scene`, `previous_scene`, `clear`)
-- `canvas.action(verb, args)` — Page-specific action verbs (quiz: `submit_answer`, `request_hint`)
-- `canvas.set_page(pageType, pageInit)` — switch the active Canvas Page (composition / youtube / quiz)
-
-The 5 generic verbs work uniformly across all Page types. The active Page's manifest (received via Daily app-message from the frontend's Canvas Service) tells the agent which `control` and `action` verbs are valid in the current context.
-
-**Multi-provider eager streaming dispatch** also lands in S64c — three per-provider Pipecat adapters (Anthropic, OpenAI, Gemini) implement eager dispatch on tool-call streaming so arg-less verbs (`pause`, `play`, `clear`, `restart`, `next_question`) fire 100–250ms earlier than a wait-for-stop_reason path.
+**S64c will add:** new outgoing message type `{type: 'canvas.command', commandId, tool, verb?, args}` (replaces V2.13 `canvas_tool`). New incoming types: `canvas.register`, `canvas.stateChange`, `canvas.commandResult`, `canvas.commandError` — replied by the frontend Canvas Service.
 
 ---
 
-## Multi-language (S60–61)
-
-Live Rooms support 9 languages: `en`, `es`, `fr`, `de`, `pt`, `it`, `ja`, `ko`, `zh-CN`.
-
-The `language` field on the snapshot drives:
-
-1. **STT model selection** — `LOCALE_TO_DEEPGRAM_MODEL[language]`
-2. **TTS voice selection** — language-specific Cartesia voice (or the cloned voice if it supports the language)
-3. **Prompt LANGUAGE sections (1 + 9)** — instruct the LLM to respond in the target language
-4. **Recipient prompt** — creator-authored audience description, optionally translated
-
-The voice agent does not auto-detect the language. The creator picks the language at Live Room creation time (frontend studio); the agent operates in that language exclusively.
-
-When adding a new language: extend `LOCALE_TO_DEEPGRAM_MODEL`, extend the Cartesia voice mapping, extend `utils/language.py`. The frontend's i18n locale list is independent — UI language ≠ Live Room language.
-
----
-
-## Pipecat Cloud deployment
-
-Production runs on Pipecat Cloud. Deployment via the Pipecat CLI:
+## Local development
 
 ```bash
-pcc deploy
-pcc logs --tail
-```
+# Set up
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-The `Dockerfile` is the deployment artifact. `pipecat-cloud.yaml` (or equivalent) configures the agent name, transport, scaling.
-
-`PIPECAT_AGENT_NAME` is set in the backend so it can dispatch agent boot requests to the right deployment.
-
----
-
-## Environment variables
-
-```
-TRANSPORT=local | daily             # local for dev, daily for prod
-HV_API_URL=http://localhost:8000    # backend snapshot fetch
-DAILY_API_KEY=...                    # production only
-DEEPGRAM_API_KEY=...
-CARTESIA_API_KEY=...
-OPENAI_API_KEY=...                   # main LLM + vision
-ANTHROPIC_API_KEY=...                # alt LLM (S64c canvas tool routing — optional)
-GOOGLE_AI_API_KEY=...                # alt LLM
-LLM_CANVAS_PROVIDER=anthropic | openai | gemini   # NEW in S64c — picks Pipecat LLM service for canvas tools
-```
-
----
-
-## Common commands
-
-```bash
-# Local dev (SmallWebRTC transport)
+# Run agent locally with WebRTC server in browser
 python agent.py --transport=local
 
-# Production deploy
-pcc deploy
+# Run against a live room slug (production-like)
+DAILY_API_KEY=... python agent.py --transport=daily --slug=<live-room-slug>
 
-# Tail production logs
-pcc logs --tail
-
-# Test snapshot fetch locally
-curl http://localhost:8000/live-rooms/by-slug/{slug}/scene-snapshot | jq .
+# Run tests
+pytest -q
 ```
+
+`.env.local` should include:
+
+```
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...                # for vision
+GOOGLE_AI_API_KEY=...             # for Gemini (optional in current state, required for LLM_CANVAS_PROVIDER=gemini in S64c)
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+DAILY_API_KEY=...
+HV_API_BASE=http://localhost:8000  # backend
+HV_LIVE_ROOM_SLUG=...              # for local testing against a specific room
+```
+
+---
+
+## Deployment — Pipecat Cloud
+
+Production runs on Pipecat Cloud. The deployment manifest (in `deploy.toml` or equivalent) bundles `agent.py` and dependencies. Pipecat Cloud handles per-session container provisioning when a Daily room is created.
+
+Backend's live-room start endpoint creates a Daily room and registers the Pipecat Cloud agent for that room. The agent boots, reads room metadata, fetches the snapshot, joins via DailyTransport.
 
 ---
 
 ## Conventions Claude Code should follow
 
-- **Always** treat the snapshot as immutable for the session. Don't mutate the cached snapshot; if state needs to evolve, store it separately.
-- **Always** keep the system prompt's section order stable. Append within existing sections; don't reorder, don't insert new sections between existing ones.
-- **Always** test prompt changes against all 9 supported languages before merging — localized failure modes are easy to miss.
-- **Always** route external API calls (STT/TTS/LLM) through Pipecat's service interfaces. Don't hardcode SDK calls outside `services/`.
-- **Never** add auth requirements to backend snapshot calls. The snapshot endpoint is public on purpose.
-- **Never** introduce a strict Pydantic model with `extra="forbid"` for the snapshot. New fields must be non-breaking.
-- **Never** unify local + Daily transports. They have genuinely different session lifecycles.
-- **Never** add fallback logic that auto-detects language. The creator-set language is authoritative.
-- When adding a new tool: register it in the LLM service's tool list, write the handler in `tools/`, document it in the system prompt's CANVAS ACTIONS section. **(After S64c, this changes — new tools are added by extending the active Page's manifest, not by adding to Pipecat's tool surface.)**
+- **Match the installed pipecat-ai version's import paths.** Pipecat's module layout has shifted between versions. Don't assume `from pipecat.services.openai.llm import OpenAILLMService` works — older versions had `from pipecat.services.openai import OpenAILLMService`. Match what the existing code in `agent.py` uses.
+- **Don't introduce a provider abstraction prematurely.** S64c handles multi-provider via direct branching in `agent.py` (if/elif on `LLM_CANVAS_PROVIDER`). A general LLM service factory can come later if the codebase needs it; v0.1 doesn't.
+- **Don't add async sessions or asyncio primitives in tool handlers without considering Pipecat's pipeline lifecycle.** Pipecat manages its own event loop; tool handlers run inside it. Use `asyncio.Future` for awaitable results (S64c does this for canvas command results).
+- **Don't unify vision + main LLM.** They're separate by design. Vision is hardcoded on OpenAI GPT-4.1 and stays that way regardless of `LLM_CANVAS_PROVIDER`.
+- **Don't add new Daily message types without coordinating with the frontend.** The frontend's `LiveRoomCanvas.tsx` has a Daily app-message handler that routes by `type`. Adding a new type requires a frontend code change to handle it.
+- When extending tool definitions: prefer the `FunctionSchema` shape used by Pipecat's tool registration. The schema's `description` field is what the LLM sees — write it for the LLM, not for human readers.
 
 ---
 
-## Coming in S64a (next session — minimal direct change here)
+## Recent: S64a + S64b complete (no Pipecat changes)
 
-S64a touches **zero** code in this repo. The new `canvas_page_type` field in the snapshot is forward-compat ignored. Verify after S64a lands that:
+S64a and S64b were **frontend + backend only.** Pipecat's tool surface and system prompt are unchanged from V2.13.
 
-- The agent boots normally against a snapshot that includes `canvas_page_type: "composition"` per scene.
-- No errors logged about unexpected snapshot fields.
-- All existing tools (`highlight_element`, etc.) continue to work end-to-end.
+The frontend gained the Canvas Protocol substrate (S64a) and rendered the live-room visitor view through a sandboxed iframe (S64b). The frontend's translation shim catches Pipecat's V2.13-shape Daily messages and converts them to protocol dispatches — the agent has no idea any of this happened.
+
+End-user behavior is pixel-identical to V2.13. The agent's tool call success rate, latency, and error patterns should all match pre-S64b baselines.
 
 ---
 
-## Coming in S64c (the big change for this repo)
+## Coming in S64c (next session — heavy refactor)
 
-S64c is the heaviest session in Phase 9g for this repo:
+S64c is **the big Pipecat session.** The full tool surface flips. New files, new system prompt structure, new per-provider eager-dispatch adapters. Major changes:
 
-1. **Remove S47 tools.** Delete `highlight_element`, `arrow_between`, `add_annotation`, `navigate_scene`, `clear_overlays` from `tools/canvas_actions.py`.
-2. **Add 5 generic tools.** `canvas.analyze`, `canvas.highlight`, `canvas.control`, `canvas.action`, `canvas.set_page`.
-3. **Restructure the system prompt's CANVAS ACTIONS section.** Add the new `CANVAS PAGE` section that describes the active Page's manifest in compact form.
-4. **Implement multi-provider eager streaming dispatch.** Three Pipecat adapters (~100 LOC each) for Anthropic, OpenAI, Gemini.
-5. **Add Daily app-message relay.** Pipecat ↔ frontend's Canvas Service. Agent emits `canvas.command` payloads as Daily app-messages; receives `canvas.commandResult` / `canvas.stateChange` back.
-6. **Add `LLM_CANVAS_PROVIDER` env var** and provider selection in agent boot.
+### Tool surface
 
-After S64c: this file should be updated to remove the "currently using S47 tools" framing and document the production state of the 5 generic tools + multi-provider streaming.
+The 5 V2.13 tools (`highlight_element`, `arrow_between`, `add_annotation`, `navigate_scene`, `clear_overlays`) are **deleted**. Replaced by 5 generic protocol tools:
+
+```
+canvas.analyze(question, options={})
+canvas.highlight(target, options={})
+canvas.control(verb, args={})
+canvas.action(verb, args={})
+canvas.set_page(pageType, pageInit={})
+```
+
+Where `verb` is enum'd per the active Canvas Page's manifest. For composition (the only Page in v0.1):
+
+- control verbs: `next_scene` | `previous_scene` | `goto_scene` | `clear`
+- action verbs: `draw_arrow` | `add_annotation`
+
+Tool handlers in `tools/canvas_protocol_tools.py` build a wire-format `canvas.command` payload, send it as a Daily app-message, and await the matching `canvas.commandResult` reply via an `asyncio.Future` (managed by `PendingCommandRegistry`).
+
+### System prompt restructure
+
+`context/prompt_builder.py` adds a `CANVAS PAGE` section between SCENE INSTRUCTION and DISPLAY MODE. The section renders dynamically from the active Page's manifest (held in `context/canvas_manifest.py` — `CanvasManifestRegistry`).
+
+The `CANVAS ACTIONS` section is replaced — instead of describing 5 hardcoded tools, it describes the 5 generic protocol tools with usage notes.
+
+For Anthropic, `build_system_prompt_split()` returns `(stable_prefix, dynamic_suffix)` so the Anthropic LLM service can apply `cache_control: {"type": "ephemeral"}` on the stable prefix.
+
+### Multi-provider LLM selection
+
+A new env var `LLM_CANVAS_PROVIDER` (anthropic|openai|gemini, default anthropic) selects the main LLM at boot. `agent.py` instantiates the appropriate Pipecat LLM service:
+
+```python
+if provider == "anthropic":
+    llm = AnthropicLLMService(...)
+    eager_hook = AnthropicEagerHook(...)
+elif provider == "openai":
+    llm = OpenAILLMService(...)
+    eager_hook = OpenAIEagerHook(...)
+elif provider == "gemini":
+    llm = GoogleLLMService(...)
+    eager_hook = GeminiEagerHook(...)
+```
+
+### Eager streaming dispatch
+
+Three per-provider adapters (`services/eager_dispatch/{anthropic,openai,gemini}_adapter.py`) peek at the LLM's streaming events. When the LLM finishes streaming the verb token for an arg-less verb, the adapter fires the canvas command immediately — without waiting for `stop_reason: tool_use`. Saves 100–250ms per arg-less call.
+
+Arg-less verb registry (hardcoded constant in `services/eager_dispatch/__init__.py`):
+
+```python
+EAGER_DISPATCH_VERBS = frozenset({
+    "next_scene", "previous_scene", "clear",
+    "next_question", "previous_question", "restart",
+    "play", "pause",
+})
+```
+
+Verbs not in this set wait for full tool-call completion as before. The per-provider adapter implementations:
+
+- **Anthropic:** reads `input_json_delta.partial_json` chunks; runs a regex (`"verb"\s*:\s*"X"\s*(,|})`) against accumulated text to detect verb completion.
+- **OpenAI:** reads `delta.tool_calls[].function.arguments` (string) chunks; same regex detection.
+- **Gemini:** reads `candidates[].content.parts[].function_call`; whole-args path (dict) gets immediate detection, partial-args path falls back to the shared regex. Eager benefit on ~60% of Gemini calls.
+
+Double-dispatch safety: when eager fires, the `PendingCommandRegistry` stores the future with `eager_dispatched=True`. When `stop_reason` arrives and the regular tool handler runs, it checks `pending.is_eager(commandId)` first; if true, it just awaits the existing future without re-sending the Daily message.
+
+### Daily message handlers (new)
+
+`agent.py` adds an `on_app_message` handler routing four new incoming message types:
+
+- `canvas.register` → `CanvasManifestRegistry.set_manifest(message)` — Page declared its capabilities; system prompt's CANVAS PAGE section will reflect this on next turn.
+- `canvas.stateChange` → `CanvasManifestRegistry.update_state(...)` — Page's semantic state changed; cached for next analyze() call.
+- `canvas.commandResult` → `PendingCommandRegistry.resolve(commandId, result)` — completes the awaiting tool handler's Future with success.
+- `canvas.commandError` → `PendingCommandRegistry.reject(commandId, error)` — completes the Future with `CanvasCommandError`.
+
+### Cleanup
+
+After end-to-end verification gates pass:
+
+- `tools/canvas_actions.py` — DELETED.
+- `llm.register_function("highlight_element", ...)` and the other 4 V2.13 registrations — DELETED.
+- The frontend's translation shim and feature flag are also removed (in the frontend repo).
+
+After S64c: the agent speaks the Canvas Protocol natively. Same end-user behavior as V2.13, but with a 100–250ms latency improvement on common arg-less verb calls and a stable abstraction that supports YouTube (S64d) and Quiz (S64e) Pages without further tool-surface changes.
+
+---
+
+## Out of scope for S64c (don't try to do these)
+
+- `canvas.set_page` execution path. The tool is registered and the agent can call it, but the only allowed pageType is `'composition'` in v0.1; the dispatch validates against the allowlist and rejects anything else. S64e wires `set_page` end-to-end with Quiz Page.
+- YouTube Canvas Page (S64d). Quiz Canvas Page (S64e).
+- `analyze()` with a vision provider — semanticState only in v0.1.
+- Natural-language highlight targets (e.g., "the second button on the left"). v0.1 highlight accepts only `element_id` or `box`.
+- Mid-session provider switching. `LLM_CANVAS_PROVIDER` is set at boot and fixed for the session.
+- Persistent iframe shell (still per-scene unmount in v0.1).
+- A/B testing infrastructure for comparing providers in production.
