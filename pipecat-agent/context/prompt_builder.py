@@ -50,6 +50,47 @@ from scene_context import (
 # CANVAS PAGE — NEW (S64c)
 # ----------------------------------------------------------------------------
 
+# Per-verb arg shapes that the LLM must pass when invoking known verbs. The
+# same shapes are also documented in the canvas_control / canvas_action
+# FunctionSchema descriptions (tools/canvas_protocol_tools.py) — the
+# redundancy is intentional because early LLM calls routinely flatten
+# verb-specific fields onto the top level alongside `verb`, and documenting
+# the nesting on BOTH surfaces (prompt + schema) was what closed the class
+# of flatten-bugs (CLAUDE.md "canvas_action verb-specific arg shape" note).
+# Pages that introduce new verbs without entries here render as argless —
+# the frontend returns INVALID_ARGS if the verb actually needs args, and
+# the LLM self-corrects from the error result handed back as a tool reply.
+VERB_ARG_SHAPES: dict[str, str] = {
+    # control verbs
+    "seek":       '{"seconds": <non-negative number>}',
+    "set_speed":  '{"rate": <number; 1.0 normal, 0.5 half, 2.0 double>}',
+    "goto_scene": '{"index": <zero-based integer scene index>}',
+    # action verbs
+    "draw_arrow":     '{"from": "<element_id>", "to": "<element_id>"}',
+    "add_annotation": '{"text": "<string>", "x": <number>, "y": <number>}',
+}
+
+
+def _render_verb_list(label: str, verbs: list[str]) -> list[str]:
+    """Render a verb listing with per-verb arg shapes inlined when known.
+
+    Concise single-line when every verb in the list is argless; multi-line
+    bulleted when at least one verb declares an arg shape, so the LLM has
+    an unambiguous template to copy for each verb."""
+    if not verbs:
+        return []
+    has_args = [v for v in verbs if v in VERB_ARG_SHAPES]
+    if not has_args:
+        return [f"- {label} verbs: {' | '.join(verbs)}."]
+    argless = [v for v in verbs if v not in VERB_ARG_SHAPES]
+    lines = [f"- {label} verbs:"]
+    if argless:
+        lines.append(f"  - {', '.join(argless)} — args: {{}}")
+    for v in has_args:
+        lines.append(f"  - {v} — args: {VERB_ARG_SHAPES[v]}")
+    return lines
+
+
 def render_canvas_page_section(manifest: Optional[dict]) -> str:
     """Render the CANVAS PAGE section from the active Page's manifest.
 
@@ -80,18 +121,12 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
         targets = ", ".join(h.get("targets", []) or []) or "(unspecified)"
         lines.append(f"- highlight: targets={targets}.")
 
-    c = cap.get("control") or {}
-    cv = c.get("verbs") or []
-    if cv:
-        lines.append(f"- control verbs: {' | '.join(cv)}.")
-
-    a = cap.get("action") or {}
-    av = a.get("verbs") or []
-    if av:
-        lines.append(f"- action verbs: {' | '.join(av)}.")
+    lines.extend(_render_verb_list("control", (cap.get("control") or {}).get("verbs") or []))
+    lines.extend(_render_verb_list("action", (cap.get("action") or {}).get("verbs") or []))
 
     lines.append("")
-    lines.append("Use these verbs through canvas_control(verb=...) and canvas_action(verb=...).")
+    lines.append("Use these verbs through canvas_control(verb=..., args={...}) and canvas_action(verb=..., args={...}).")
+    lines.append("Verb-specific fields MUST be nested inside `args` — never at the top level alongside `verb`.")
     lines.append("If you call an unsupported verb, the dispatch returns UNSUPPORTED_VERB and you should pick a supported alternative.")
 
     return "\n".join(lines)

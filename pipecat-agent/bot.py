@@ -19,6 +19,7 @@ Production: Deployed to Pipecat Cloud with DailyTransport
 """
 
 import asyncio
+import json
 import os
 import uuid
 
@@ -91,6 +92,7 @@ from tools.canvas_protocol_tools import (
     make_tool_schemas as make_canvas_protocol_schemas,
 )
 from context.canvas_manifest import CanvasManifestRegistry
+from context.prompt_builder import render_canvas_page_section
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -695,6 +697,20 @@ async def run_bot_classic(
         command_timeout_s=6.0,
     )
 
+    # S64d — persona.build_system_prompt doesn't include the CANVAS PAGE
+    # section (the migration to prompt_builder.build_system_prompt_split was
+    # planned but never landed). Append it here so the LLM knows what verbs
+    # the active Page supports. At session start the manifest is empty —
+    # the section renders the "no page registered yet" guidance. The
+    # on_app_message canvas.register branch below rebuilds the prompt with
+    # the real manifest once the iframe registers.
+    base_system_prompt = system_prompt
+    system_prompt = (
+        base_system_prompt
+        + "\n\n"
+        + render_canvas_page_section(canvas_manifest.current())
+    )
+
     # ── AI Services ──
     canvas_tools = ToolsSchema(
         standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
@@ -772,10 +788,17 @@ async def run_bot_classic(
             logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
             return
 
-        new_prompt = await build_system_prompt(
+        nonlocal base_system_prompt
+        new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
         )
+        # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
+        # the section is dropped on every navigation and the LLM loses its
+        # verb list. Also update base_system_prompt so subsequent
+        # canvas.register rebuilds use the post-navigation base.
+        base_system_prompt = new_base
+        new_prompt = new_base + "\n\n" + render_canvas_page_section(canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
@@ -838,12 +861,36 @@ async def run_bot_classic(
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender):
         """Route Canvas Protocol messages from the frontend (S64c)."""
+        # S64d defensive: some Daily SDK / Pipecat Cloud versions deliver
+        # app-messages as JSON strings rather than parsed dicts. Parse
+        # before the isinstance(dict) guard rejects everything (otherwise
+        # canvas.register hits the silent-return path below and the bot's
+        # manifest registry never updates).
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                pass
         if not isinstance(message, dict):
             return
         msg_type = message.get("type")
         if msg_type == "canvas.register":
             logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
             canvas_manifest.set_manifest(message)
+            # S64d — rebuild the system prompt so the LLM sees the new
+            # Page's verb list in the CANVAS PAGE section. Without this
+            # the LLM keeps seeing "No page registered yet" guidance and
+            # tries canvas_set_page (which v0.1 doesn't end-to-end-wire).
+            try:
+                new_prompt = (
+                    base_system_prompt
+                    + "\n\n"
+                    + render_canvas_page_section(canvas_manifest.current())
+                )
+                llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
+                logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
+            except Exception as exc:
+                logger.warning("[CANVAS REGISTER] prompt rebuild failed: {!r}", exc)
         elif msg_type == "canvas.stateChange":
             logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")
             canvas_manifest.update_state(message.get("semanticState") or {})
@@ -991,6 +1038,16 @@ async def run_bot_relay(
         command_timeout_s=6.0,
     )
 
+    # S64d — see run_bot_classic for rationale. Append CANVAS PAGE section
+    # to system_prompt so the LLM knows the active Page's verbs; on
+    # canvas.register, rebuild via base_system_prompt + new section.
+    base_system_prompt = system_prompt
+    system_prompt = (
+        base_system_prompt
+        + "\n\n"
+        + render_canvas_page_section(canvas_manifest.current())
+    )
+
     # ── AI Services (no TTS — SoulX handles speech) ──
     canvas_tools = ToolsSchema(
         standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
@@ -1060,10 +1117,17 @@ async def run_bot_relay(
             logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
             return
 
-        new_prompt = await build_system_prompt(
+        nonlocal base_system_prompt
+        new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
         )
+        # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
+        # the section is dropped on every navigation and the LLM loses its
+        # verb list. Also update base_system_prompt so subsequent
+        # canvas.register rebuilds use the post-navigation base.
+        base_system_prompt = new_base
+        new_prompt = new_base + "\n\n" + render_canvas_page_section(canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
@@ -1294,6 +1358,15 @@ async def run_bot_relay(
     async def on_app_message(transport, message, sender):
         nonlocal avatar_participant_id
 
+        # S64d defensive: parse JSON-string payloads so canvas.register
+        # reaches the manifest registry even if Daily delivers as string.
+        # See classic handler above for full rationale.
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
         # Canvas Protocol routing (S64c) — handled before relay-ready check
         # so the canvas message types short-circuit cleanly.
         if isinstance(message, dict):
@@ -1301,6 +1374,18 @@ async def run_bot_relay(
             if msg_type == "canvas.register":
                 logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
                 canvas_manifest.set_manifest(message)
+                # S64d — rebuild the system prompt so the LLM learns the new
+                # Page's verbs (see classic pipeline for full rationale).
+                try:
+                    new_prompt = (
+                        base_system_prompt
+                        + "\n\n"
+                        + render_canvas_page_section(canvas_manifest.current())
+                    )
+                    llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
+                    logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
+                except Exception as exc:
+                    logger.warning("[CANVAS REGISTER] prompt rebuild failed: {!r}", exc)
                 return
             if msg_type == "canvas.stateChange":
                 logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")

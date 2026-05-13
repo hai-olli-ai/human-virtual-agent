@@ -164,11 +164,23 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
             name="canvas_control",
             description=(
                 f"Invoke a control verb on the active Canvas Page. Supported verbs: {verbs_str('control')}. "
-                "Control verbs are state transitions (navigation, clearing) that don't take complex args."
+                "Control verbs are state transitions (navigation, media playback, clearing). "
+                "Verb-specific fields MUST be nested inside `args`, not placed at the top level alongside `verb`."
             ),
             properties={
                 "verb": {"type": "string", "description": "The control verb to invoke."},
-                "args": {"type": "object", "description": "Verb-specific args. Most control verbs take {}."},
+                "args": {
+                    "type": "object",
+                    "description": (
+                        "Verb-specific args object. "
+                        "Argless verbs (next_scene, previous_scene, clear, play, pause, restart, "
+                        "next_question, previous_question) take {}. "
+                        "For seek: {\"seconds\": <non-negative number>} — absolute timestamp in seconds "
+                        "(e.g. 120 for two minutes). "
+                        "For set_speed: {\"rate\": <number>} — playback rate, 1.0 normal, 0.5 half, 2.0 double. "
+                        "For goto_scene: {\"index\": <integer>} — zero-based scene index."
+                    ),
+                },
             },
             required=["verb"],
         ),
