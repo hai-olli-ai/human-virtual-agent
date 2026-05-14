@@ -92,7 +92,17 @@ from tools.canvas_protocol_tools import (
     make_tool_schemas as make_canvas_protocol_schemas,
 )
 from context.canvas_manifest import CanvasManifestRegistry
-from context.prompt_builder import render_canvas_page_section
+from context.prompt_builder import (
+    render_agent_playbook_section,
+    render_canvas_page_section,
+)
+# S64e — generate_quiz_from_knowledge tool + session-scoped slug/scene state.
+import api_client
+from tools.quiz_generation import (
+    GENERATE_QUIZ_SCHEMA,
+    SessionContext,
+    make_handle_generate_quiz,
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -554,6 +564,22 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
 # because that's the only LLM extra in pyproject.toml. Override via
 # LLM_CANVAS_PROVIDER env var after installing the corresponding extra.
 
+def _assemble_full_prompt(base: str, manifest: dict | None) -> str:
+    """Concatenate the base persona prompt, CANVAS PAGE, and AGENT PLAYBOOK.
+
+    Single helper for the three sites that rebuild the prompt (session
+    start, canvas.register, canvas.sceneChanged). The CANVAS PAGE section
+    is driven by the active Page's manifest; AGENT PLAYBOOK is a stable
+    string that documents cross-tool sequences the agent should follow
+    (currently the quiz flow — S64e).
+    """
+    return "\n\n".join([
+        base,
+        render_canvas_page_section(manifest),
+        render_agent_playbook_section(),
+    ])
+
+
 def _build_llm_and_eager_hook(
     *,
     provider: str,
@@ -627,6 +653,7 @@ async def run_bot_classic(
     scene_id: str = "",
     flow_id: str | None = None,
     api_url: str | None = None,
+    slug: str = "",
 ):
     """Classic voice agent pipeline with Cartesia TTS."""
     logger.info("Starting classic voice agent (room={}, avatar={})", room_id, avatar_id)
@@ -697,6 +724,29 @@ async def run_bot_classic(
         command_timeout_s=6.0,
     )
 
+    # S64e — session-scoped state for non-canvas tools that need slug +
+    # current scene id (currently generate_quiz_from_knowledge). slug
+    # comes from the runner-args body (the backend's live-room start
+    # endpoint passes it alongside room_id); current_scene_id starts at
+    # the body's scene_id and is refreshed on every canvas.sceneChanged
+    # from the post-nav snapshot. If slug isn't present in the body, the
+    # quiz tool returns "no active live-room session" and the LLM
+    # apologises gracefully — see make_handle_generate_quiz.
+    session_context = SessionContext()
+    session_context.set_slug(slug or None)
+    # Seed scene id from the body so the very first quiz request lands
+    # on the room's initial scene even before any sceneChanged event.
+    # Prefer the live snapshot's scene_id over the body field, because
+    # for flow-based rooms the body carries scene_id=None while the
+    # snapshot resolves the flow's current scene.
+    initial_scene_id = (scene_snapshot or {}).get("scene_id") or scene_id or None
+    session_context.set_scene(str(initial_scene_id) if initial_scene_id else None)
+    logger.info(
+        "[SESSION_CONTEXT] slug={!r} initial_scene_id={!r}",
+        session_context.get_slug(),
+        session_context.get_current_scene_id(),
+    )
+
     # S64d — persona.build_system_prompt doesn't include the CANVAS PAGE
     # section (the migration to prompt_builder.build_system_prompt_split was
     # planned but never landed). Append it here so the LLM knows what verbs
@@ -704,16 +754,21 @@ async def run_bot_classic(
     # the section renders the "no page registered yet" guidance. The
     # on_app_message canvas.register branch below rebuilds the prompt with
     # the real manifest once the iframe registers.
+    # S64e — also append AGENT PLAYBOOK (quiz flow guidance). The helper
+    # is the single source of truth for the prompt's append-suffix shape.
     base_system_prompt = system_prompt
-    system_prompt = (
-        base_system_prompt
-        + "\n\n"
-        + render_canvas_page_section(canvas_manifest.current())
-    )
+    system_prompt = _assemble_full_prompt(base_system_prompt, canvas_manifest.current())
 
     # ── AI Services ──
     canvas_tools = ToolsSchema(
-        standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
+        standard_tools=[
+            *make_canvas_protocol_schemas(canvas_manifest.current()),
+            # S64e — generate_quiz_from_knowledge sits alongside the 5
+            # canvas protocol tools. It's not a canvas verb (it talks to
+            # the backend directly, not through the iframe), but it
+            # shares the same registration surface.
+            GENERATE_QUIZ_SCHEMA,
+        ],
     )
 
     # STT language driven by the live-room language (S61).
@@ -798,14 +853,31 @@ async def run_bot_classic(
         # verb list. Also update base_system_prompt so subsequent
         # canvas.register rebuilds use the post-navigation base.
         base_system_prompt = new_base
-        new_prompt = new_base + "\n\n" + render_canvas_page_section(canvas_manifest.current())
+        new_prompt = _assemble_full_prompt(new_base, canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
         except Exception:
             logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
 
-        from api_client import get_scene_image_base64
+        # S64e — refresh session_context.current_scene_id from the
+        # post-nav snapshot so generate_quiz_from_knowledge targets the
+        # scene the visitor is actually looking at. The snapshot was
+        # fetched inside build_system_prompt; we re-fetch here (cheap,
+        # cached on the backend) rather than threading the snapshot
+        # through every prompt-builder caller.
+        from api_client import get_scene_snapshot, get_scene_image_base64
+        fresh_snapshot = await get_scene_snapshot(room_id, api_url)
+        if fresh_snapshot and fresh_snapshot.get("scene_id"):
+            new_scene_id = str(fresh_snapshot["scene_id"])
+            if new_scene_id != session_context.get_current_scene_id():
+                logger.info(
+                    "[CANVAS SCENECHANGED] session_context scene_id {} -> {}",
+                    session_context.get_current_scene_id(),
+                    new_scene_id,
+                )
+            session_context.set_scene(new_scene_id)
+
         new_image = await get_scene_image_base64(room_id, api_url)
         if new_image:
             from scene_context import build_vision_message
@@ -818,6 +890,17 @@ async def run_bot_classic(
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
     for name, handler in canvas_protocol_handlers.items():
         llm.register_function(name, handler)
+
+    # ── Quiz generation tool (S64e) ──
+    # generate_quiz_from_knowledge talks to the backend directly (it
+    # doesn't go through the Daily canvas protocol), so it lives outside
+    # the canvas tool surface. The handler is factory-bound to the
+    # api_client module and the session_context so it can resolve the
+    # slug + current scene id at call time.
+    llm.register_function(
+        "generate_quiz_from_knowledge",
+        make_handle_generate_quiz(api_client, session_context),
+    )
 
     # ── Aggregators with VAD ──
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -882,10 +965,8 @@ async def run_bot_classic(
             # the LLM keeps seeing "No page registered yet" guidance and
             # tries canvas_set_page (which v0.1 doesn't end-to-end-wire).
             try:
-                new_prompt = (
-                    base_system_prompt
-                    + "\n\n"
-                    + render_canvas_page_section(canvas_manifest.current())
+                new_prompt = _assemble_full_prompt(
+                    base_system_prompt, canvas_manifest.current()
                 )
                 llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
                 logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
@@ -981,6 +1062,7 @@ async def run_bot_relay(
     scene_id: str = "",
     flow_id: str | None = None,
     api_url: str | None = None,
+    slug: str = "",
 ):
     """Relay avatar pipeline — forwards LLM text to SoulX for speech + video."""
     logger.info("Starting relay avatar agent (room={}, avatar={})", room_id, avatar_id)
@@ -1038,19 +1120,44 @@ async def run_bot_relay(
         command_timeout_s=6.0,
     )
 
+    # S64e — session-scoped state for non-canvas tools that need slug +
+    # current scene id (currently generate_quiz_from_knowledge). slug
+    # comes from the runner-args body (the backend's live-room start
+    # endpoint passes it alongside room_id); current_scene_id starts at
+    # the body's scene_id and is refreshed on every canvas.sceneChanged
+    # from the post-nav snapshot. If slug isn't present in the body, the
+    # quiz tool returns "no active live-room session" and the LLM
+    # apologises gracefully — see make_handle_generate_quiz.
+    session_context = SessionContext()
+    session_context.set_slug(slug or None)
+    # Seed scene id from the body so the very first quiz request lands
+    # on the room's initial scene even before any sceneChanged event.
+    # Prefer the live snapshot's scene_id over the body field, because
+    # for flow-based rooms the body carries scene_id=None while the
+    # snapshot resolves the flow's current scene.
+    initial_scene_id = (scene_snapshot or {}).get("scene_id") or scene_id or None
+    session_context.set_scene(str(initial_scene_id) if initial_scene_id else None)
+    logger.info(
+        "[SESSION_CONTEXT] slug={!r} initial_scene_id={!r}",
+        session_context.get_slug(),
+        session_context.get_current_scene_id(),
+    )
+
     # S64d — see run_bot_classic for rationale. Append CANVAS PAGE section
     # to system_prompt so the LLM knows the active Page's verbs; on
     # canvas.register, rebuild via base_system_prompt + new section.
+    # S64e — _assemble_full_prompt also tacks on the AGENT PLAYBOOK
+    # section (cross-tool sequences, currently the quiz flow).
     base_system_prompt = system_prompt
-    system_prompt = (
-        base_system_prompt
-        + "\n\n"
-        + render_canvas_page_section(canvas_manifest.current())
-    )
+    system_prompt = _assemble_full_prompt(base_system_prompt, canvas_manifest.current())
 
     # ── AI Services (no TTS — SoulX handles speech) ──
     canvas_tools = ToolsSchema(
-        standard_tools=make_canvas_protocol_schemas(canvas_manifest.current()),
+        standard_tools=[
+            *make_canvas_protocol_schemas(canvas_manifest.current()),
+            # S64e — generate_quiz_from_knowledge alongside canvas tools.
+            GENERATE_QUIZ_SCHEMA,
+        ],
     )
 
     # STT language driven by the live-room language (S61).
@@ -1127,14 +1234,31 @@ async def run_bot_relay(
         # verb list. Also update base_system_prompt so subsequent
         # canvas.register rebuilds use the post-navigation base.
         base_system_prompt = new_base
-        new_prompt = new_base + "\n\n" + render_canvas_page_section(canvas_manifest.current())
+        new_prompt = _assemble_full_prompt(new_base, canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
         except Exception:
             logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
 
-        from api_client import get_scene_image_base64
+        # S64e — refresh session_context.current_scene_id from the
+        # post-nav snapshot so generate_quiz_from_knowledge targets the
+        # scene the visitor is actually looking at. The snapshot was
+        # fetched inside build_system_prompt; we re-fetch here (cheap,
+        # cached on the backend) rather than threading the snapshot
+        # through every prompt-builder caller.
+        from api_client import get_scene_snapshot, get_scene_image_base64
+        fresh_snapshot = await get_scene_snapshot(room_id, api_url)
+        if fresh_snapshot and fresh_snapshot.get("scene_id"):
+            new_scene_id = str(fresh_snapshot["scene_id"])
+            if new_scene_id != session_context.get_current_scene_id():
+                logger.info(
+                    "[CANVAS SCENECHANGED] session_context scene_id {} -> {}",
+                    session_context.get_current_scene_id(),
+                    new_scene_id,
+                )
+            session_context.set_scene(new_scene_id)
+
         new_image = await get_scene_image_base64(room_id, api_url)
         if new_image:
             from scene_context import build_vision_message
@@ -1147,6 +1271,17 @@ async def run_bot_relay(
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
     for name, handler in canvas_protocol_handlers.items():
         llm.register_function(name, handler)
+
+    # ── Quiz generation tool (S64e) ──
+    # generate_quiz_from_knowledge talks to the backend directly (it
+    # doesn't go through the Daily canvas protocol), so it lives outside
+    # the canvas tool surface. The handler is factory-bound to the
+    # api_client module and the session_context so it can resolve the
+    # slug + current scene id at call time.
+    llm.register_function(
+        "generate_quiz_from_knowledge",
+        make_handle_generate_quiz(api_client, session_context),
+    )
 
     # ── Aggregators with VAD ──
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -1377,10 +1512,8 @@ async def run_bot_relay(
                 # S64d — rebuild the system prompt so the LLM learns the new
                 # Page's verbs (see classic pipeline for full rationale).
                 try:
-                    new_prompt = (
-                        base_system_prompt
-                        + "\n\n"
-                        + render_canvas_page_section(canvas_manifest.current())
+                    new_prompt = _assemble_full_prompt(
+                        base_system_prompt, canvas_manifest.current()
                     )
                     llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
                     logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
@@ -1520,6 +1653,13 @@ async def bot(runner_args: RunnerArguments):
     scene_id = body.get("scene_id") or DEFAULT_SCENE_ID
     flow_id = body.get("flow_id")
     api_url = body.get("hv_api_url")
+    # S64e — slug threads through to SessionContext for the
+    # generate_quiz_from_knowledge tool, whose backend endpoint is
+    # scoped by-slug (POST /live-rooms/by-slug/{slug}/scenes/{scene_id}/
+    # generate-quiz). Backend live-room start endpoint must pass `slug`
+    # in the body for the quiz tool to function; until it does, the
+    # quiz handler returns "no active live-room session" gracefully.
+    slug = body.get("slug") or ""
 
     output_mode = await _resolve_output_mode(room_id, api_url)
 
@@ -1552,6 +1692,7 @@ async def bot(runner_args: RunnerArguments):
             scene_id=scene_id,
             flow_id=flow_id,
             api_url=api_url,
+            slug=slug,
         )
     else:
         await run_bot_classic(
@@ -1562,6 +1703,7 @@ async def bot(runner_args: RunnerArguments):
             scene_id=scene_id,
             flow_id=flow_id,
             api_url=api_url,
+            slug=slug,
         )
 
 

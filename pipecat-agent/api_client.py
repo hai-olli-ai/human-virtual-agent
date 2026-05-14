@@ -5,6 +5,18 @@ from loguru import logger
 from config import HV_API_URL, HV_API_TOKEN
 
 
+class BackendError(Exception):
+    """Raised when a backend HTTP call returns a non-2xx status.
+
+    Used by callers that must distinguish success from failure (e.g. tool
+    handlers that surface the error to the LLM). The existing
+    fetch-or-None helpers above intentionally swallow errors because they
+    feed into prompt assembly where a missing snapshot just means "no
+    enrichment"; this exception is for endpoints where the caller has to
+    react to the failure.
+    """
+
+
 # ── Authenticated endpoints (existing — for direct avatar/scene fetch) ──
 
 async def get_avatar(avatar_id: str) -> dict | None:
@@ -127,6 +139,41 @@ async def get_scene_image_base64(room_id: str, api_url: str | None = None) -> st
     except Exception as e:
         logger.warning(f"Failed to fetch scene image for room {room_id}: {e}")
         return None
+
+
+async def generate_quiz(
+    slug: str,
+    scene_id: str,
+    count: int = 3,
+    language: str = "en",
+    api_url: str | None = None,
+) -> dict:
+    """POST /live-rooms/by-slug/{slug}/scenes/{scene_id}/generate-quiz (S64e).
+
+    Calls the backend's quiz-generation endpoint, which assembles the
+    scene's knowledge_text and prompts Anthropic for a structured
+    multiple-choice quiz blob. Returns the quiz blob dict on 200.
+
+    Raises BackendError on non-2xx so the tool handler can hand the
+    error back to the LLM. Timeout is 30s — the upstream LLM call
+    typically takes 1-2s but allow headroom for cold starts and longer
+    scenes.
+
+    Public endpoint: the slug acts as the access token (matches the
+    pattern the visitor frontend already uses for survey submission).
+    """
+    base_url = api_url or HV_API_URL
+    url = f"{base_url}/live-rooms/by-slug/{slug}/scenes/{scene_id}/generate-quiz"
+    payload = {"count": count, "language": language}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            detail = response.text[:300]
+            raise BackendError(
+                f"generate_quiz failed: HTTP {response.status_code} {detail}"
+            )
+        return response.json()
 
 
 async def navigate_scene(

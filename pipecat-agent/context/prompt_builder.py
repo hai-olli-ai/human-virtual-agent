@@ -7,7 +7,7 @@ description. Exposes `build_system_prompt_split` returning the prompt as
 (stable_prefix, dynamic_suffix) so the Anthropic LLM service can mark the
 prefix with cache_control: ephemeral.
 
-S64c sandwich order:
+S64c sandwich order (+ S64e AGENT PLAYBOOK):
   1.  LANGUAGE (open)
   2.  PERSONA
   3.  AUDIENCE
@@ -19,7 +19,8 @@ S64c sandwich order:
   6.  DISPLAY MODE
   7.  CANVAS ELEMENTS
   8.  CANVAS ACTIONS       ← REPLACED (5 generic tools)
-  8b. SCRIPTS              (carried forward from S49)
+  8b. AGENT PLAYBOOK       ← NEW (S64e — cross-tool sequences)
+  8c. SCRIPTS              (carried forward from S49)
   9.  LANGUAGE (close)
 
 The split point is between CANVAS PAGE (5b) and DISPLAY MODE (6). Within a
@@ -118,8 +119,40 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
 
     h = cap.get("highlight") or {}
     if h.get("supported"):
-        targets = ", ".join(h.get("targets", []) or []) or "(unspecified)"
-        lines.append(f"- highlight: targets={targets}.")
+        targets = h.get("targets") or []
+        if "box" in targets and "element_id" in targets:
+            lines.append(
+                "- highlight: target may be `{element_id: \"<id>\"}` (from CANVAS "
+                "ELEMENTS) OR `{box: [x, y, w, h]}` in 1280x720 design space."
+            )
+        elif "box" in targets:
+            lines.append(
+                "- highlight: target MUST be `{box: [x, y, w, h]}` in 1280x720 design "
+                "space. `{element_id: ...}` targets are NOT supported on this page."
+            )
+            # Fallback guidance: without an element list (which box-only pages
+            # don't surface as highlight targets), the LLM has been observed
+            # to emit canvas_highlight with target=null when it can't infer
+            # coordinates. Steer it to canvas_analyze or a verbal response
+            # instead of a degenerate tool call.
+            lines.append(
+                "  If you don't know specific box coordinates for what you want to "
+                "highlight, call `canvas_analyze` first to learn the layout, or "
+                "describe verbally — do NOT call `canvas_highlight` without a real "
+                "`{box: [x, y, w, h]}` value (a null or empty target is rejected)."
+            )
+        elif "element_id" in targets:
+            lines.append(
+                "- highlight: target MUST be `{element_id: \"<id>\"}` using an id from "
+                "CANVAS ELEMENTS. `{box: ...}` targets are NOT supported on this page."
+            )
+            lines.append(
+                "  Pick a specific alias from CANVAS ELEMENTS — do NOT call "
+                "`canvas_highlight` with a null or empty target."
+            )
+        else:
+            target_str = ", ".join(targets) or "(unspecified)"
+            lines.append(f"- highlight: targets={target_str}.")
 
     lines.extend(_render_verb_list("control", (cap.get("control") or {}).get("verbs") or []))
     lines.extend(_render_verb_list("action", (cap.get("action") or {}).get("verbs") or []))
@@ -130,6 +163,68 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
     lines.append("If you call an unsupported verb, the dispatch returns UNSUPPORTED_VERB and you should pick a supported alternative.")
 
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# AGENT PLAYBOOK — NEW (S64e)
+# ----------------------------------------------------------------------------
+
+# Cross-tool playbooks. These document multi-step sequences the agent must
+# follow that span tools (generate_quiz_from_knowledge → canvas_set_page →
+# canvas_action → canvas_control) and that the per-tool descriptions can't
+# express on their own. Sits BETWEEN the canvas tool guidance and the
+# closing LANGUAGE reminder, so it benefits from recency weighting without
+# displacing the canvas/manifest sections that the LLM consults for every
+# tool call.
+#
+# Tool names use the underscored form (canvas_set_page, canvas_action,
+# canvas_control, generate_quiz_from_knowledge) to match what's actually
+# registered with the LLM provider. The CLAUDE.md note "Tool names must
+# satisfy ^[a-zA-Z0-9_-]+$" applies here too — dotted forms would steer
+# the model toward calls that 400 at the provider boundary.
+
+def render_agent_playbook_section() -> str:
+    """AGENT PLAYBOOK — situational sequences the agent should follow.
+
+    Currently documents the quiz flow (S64e). New entries can be added as
+    additional Page types ship their own multi-step interactions. Returns
+    a stable string regardless of active Page; the per-page verb listing
+    lives in the CANVAS PAGE section, not here.
+    """
+    return (
+        "## AGENT PLAYBOOK\n"
+        "\n"
+        "**Quiz flow** — if the user asks for a quiz, asks to be quizzed, or asks "
+        "to test their knowledge:\n"
+        "\n"
+        "1. First call `generate_quiz_from_knowledge` with `count=3` (or whatever "
+        "the user requested) and the conversation's language.\n"
+        "2. WHILE that tool is running (it takes 1-2 seconds), narrate naturally — "
+        "for example: \"Alright, let me put together a few questions for you...\".\n"
+        "3. When `generate_quiz_from_knowledge` returns, immediately call "
+        "`canvas_set_page` with `pageType='quiz'` and `pageInit` set to the "
+        "returned blob.\n"
+        "4. After `canvas_set_page` resolves, the quiz Page is displayed. Read the "
+        "first question out loud to the user; the user will see it on screen too.\n"
+        "5. When the user answers verbally (e.g. \"I'll go with B\" or \"the answer "
+        "is Paris\"), look at the `choices` array in the active Page's "
+        "`semanticState` to map their words to a choice id (A/B/C/D). Call "
+        "`canvas_action` with `verb='submit_answer'` and `args={\"choice\": "
+        "\"<letter>\"}`.\n"
+        "6. The Page replies with `correct: true/false`. Narrate the result "
+        "naturally; use `canvas_action` with `verb='show_explanation'` if you want "
+        "the on-screen explanation revealed.\n"
+        "7. To move on, call `canvas_control` with `verb='next_question'`. When "
+        "all questions are done, narrate a summary.\n"
+        "\n"
+        "Do NOT call `canvas_set_page` with `pageType='quiz'` WITHOUT first having "
+        "a quiz blob from `generate_quiz_from_knowledge` — `pageInit` must contain "
+        "the questions array, and an empty quiz Page has nothing to display.\n"
+        "\n"
+        "To exit the quiz back to the regular scene view, call `canvas_set_page` "
+        "with `pageType='composition'` (`pageInit` can be empty; the visitor's "
+        "shell will rebuild it from the snapshot)."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -306,6 +401,11 @@ def build_system_prompt_split(
         dynamic_parts.append(elements_block)
 
     dynamic_parts.append(render_canvas_actions_section())
+
+    # S64e — AGENT PLAYBOOK sits between CANVAS ACTIONS and the closing
+    # LANGUAGE reminder. Stable string, but kept in the dynamic suffix
+    # because it references tools registered for this session.
+    dynamic_parts.append(render_agent_playbook_section())
 
     scripts_section = build_scripts_section(snapshot)
     if scripts_section:
