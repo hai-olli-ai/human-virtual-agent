@@ -892,14 +892,16 @@ async def run_bot_classic(
         llm.register_function(name, handler)
 
     # ── Quiz generation tool (S64e) ──
-    # generate_quiz_from_knowledge talks to the backend directly (it
-    # doesn't go through the Daily canvas protocol), so it lives outside
-    # the canvas tool surface. The handler is factory-bound to the
-    # api_client module and the session_context so it can resolve the
-    # slug + current scene id at call time.
+    # generate_quiz_from_knowledge talks to the backend for the quiz blob,
+    # then dispatches a canvas set_page through canvas_ctx so the iframe
+    # activates the quiz Page with the new blob in the same tool call
+    # (S64e Option D — LLMs unreliably copy large structured args between
+    # tool calls). The handler is factory-bound to the api_client module,
+    # the session_context (slug + current scene id), and canvas_ctx (the
+    # same context the 5 canvas tool handlers use).
     llm.register_function(
         "generate_quiz_from_knowledge",
-        make_handle_generate_quiz(api_client, session_context),
+        make_handle_generate_quiz(api_client, session_context, canvas_ctx),
     )
 
     # ── Aggregators with VAD ──
@@ -1273,14 +1275,16 @@ async def run_bot_relay(
         llm.register_function(name, handler)
 
     # ── Quiz generation tool (S64e) ──
-    # generate_quiz_from_knowledge talks to the backend directly (it
-    # doesn't go through the Daily canvas protocol), so it lives outside
-    # the canvas tool surface. The handler is factory-bound to the
-    # api_client module and the session_context so it can resolve the
-    # slug + current scene id at call time.
+    # generate_quiz_from_knowledge talks to the backend for the quiz blob,
+    # then dispatches a canvas set_page through canvas_ctx so the iframe
+    # activates the quiz Page with the new blob in the same tool call
+    # (S64e Option D — LLMs unreliably copy large structured args between
+    # tool calls). The handler is factory-bound to the api_client module,
+    # the session_context (slug + current scene id), and canvas_ctx (the
+    # same context the 5 canvas tool handlers use).
     llm.register_function(
         "generate_quiz_from_knowledge",
-        make_handle_generate_quiz(api_client, session_context),
+        make_handle_generate_quiz(api_client, session_context, canvas_ctx),
     )
 
     # ── Aggregators with VAD ──

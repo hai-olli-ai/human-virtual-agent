@@ -1,7 +1,7 @@
 # pipecat-agent — CLAUDE.md
 
 > Voice agent for **Human Virtual** (hv.ai), built on the **Pipecat Framework**.
-> **Status:** S64c complete + several post-cutover hardenings (alias layer, sceneChanged unification, all-scene knowledge aggregation, manifest-driven CANVAS PAGE section now wired into the live prompt). **S64d (YouTube Canvas Page) frontend has shipped; Pipecat code changes for it remain at zero per the original design — only the manifest content differs at runtime.**
+> **Status:** S64c + S64d + S64e shipped, plus a round of post-S64e hardenings driven by real-session bug reports — `generate_quiz_from_knowledge` bundles the canvas Page swap (Option D); the Quiz Page owns its post-answer reveal/auto-advance timing instead of the agent racing it; a `skip_question` action verb handles "I don't know"; `canvas.set_page` override is all-or-nothing (empty `pageInit` means "restore snapshot — both pageType and init"); scene-nav verbs (`next_scene` / `previous_scene` / `goto_scene`) are exempt from the per-Page manifest validator because they're shell-level.
 > **Repo:** `pipecat-agent/` (lives alongside `human-virtual-backend/` and `human-virtual-frontend/`).
 
 ---
@@ -50,7 +50,8 @@ pipecat-agent/
     prompt_builder.py               # Alternative split-prompt builder (build_system_prompt_split) + render_canvas_page_section (the bit that IS wired into the live prompt)
     canvas_manifest.py              # CanvasManifestRegistry — in-memory holder for the active Page's manifest
   tools/
-    canvas_protocol_tools.py        # 5 generic protocol tools (S64c), alias translation, dispatch with futures
+    canvas_protocol_tools.py        # 5 generic protocol tools (S64c) + dispatch_canvas_command (module-level since S64e); alias translation; SCENE_NAV_VERBS exemption from manifest validation
+    quiz_generation.py              # S64e — generate_quiz_from_knowledge tool. Bundled set_page dispatch (Option D); SessionContext (slug + current_scene_id) for backend lookup
   services/
     eager_dispatch/                 # Per-provider streaming hooks (S64c) — instantiated but NOT wired into the LLM streaming loop yet
       __init__.py                   # EAGER_DISPATCH_VERBS, PendingCommandRegistry, verb-detection regex
@@ -58,10 +59,13 @@ pipecat-agent/
       openai_adapter.py
       gemini_adapter.py
   tests/
+    test_canvas_highlight_validation.py
     test_eager_dispatch.py
     test_link_narration_directive.py
+    test_quiz_generation.py
     test_scene_context_knowledge.py
     test_scene_context_s61.py
+    test_submit_answer_bundling.py  # S64e — guards "submit_answer is pass-through; advancement is the Page's job"
     bench_canvas_latency.py         # Manual structural benchmark (not pytest-collected)
   docs/
     benchmarks/
@@ -150,16 +154,18 @@ These travel between Pipecat ↔ frontend (Daily app-messages), never to the LLM
 
 ---
 
-## Canvas tools — the 5 generic protocol tools
+## Canvas tools — the 5 generic protocol tools (plus `generate_quiz_from_knowledge`)
 
-`tools/canvas_protocol_tools.py` registers exactly 5 tools. Each handler:
+`tools/canvas_protocol_tools.py` registers exactly 5 generic canvas tools (`canvas_analyze`, `canvas_highlight`, `canvas_control`, `canvas_action`, `canvas_set_page`). `tools/quiz_generation.py` adds a sixth, non-canvas tool — `generate_quiz_from_knowledge` — which is bundled with `set_page` internally; see the "Quiz Canvas Page (S64e)" section below for why.
+
+Each canvas handler:
 
 1. Logs entry with a `[CANVAS_<VERB>] called: …` line so cloud logs are greppable.
 2. Translates element_id aliases (see "Element alias layer" below) to real UUIDs before dispatch.
-3. Validates verb against the active Page's manifest when present.
+3. Validates verb against the active Page's manifest when present — **with one exemption**: scene-nav verbs (`next_scene` / `previous_scene` / `goto_scene`) bypass this check. See "Scene-nav verbs are shell-level" below.
 4. Builds the wire-format payload with a fresh `commandId` (uuid).
 5. Registers the pending command with `PendingCommandRegistry`, getting an `asyncio.Future`.
-6. Sends the Daily app-message and logs `[CANVAS DISPATCH] tool=… commandId=… payload=…`.
+6. Sends the Daily app-message via `dispatch_canvas_command(ctx, tool, args, command_id=None)` (module-level helper, since S64e — same dispatch path is reused by `tools/quiz_generation.py` for the bundled set_page). Logs `[CANVAS DISPATCH] tool=… commandId=… payload=…`.
 7. Awaits the Future (6s default timeout).
 8. Logs `[CANVAS RESULT] tool=… commandId=… result=…`, returns to LLM.
 9. On `CanvasCommandError`: logs `[CANVAS_<VERB>] error code=… message=…`, returns the error to the LLM as a tool result (`{error, message, details}`) — NOT a raise — so a single failed call doesn't break the conversation turn. Mirrors V2.13's always-result_callback resilience.
@@ -168,10 +174,22 @@ These travel between Pipecat ↔ frontend (Daily app-messages), never to the LLM
 
 - `draw_arrow`: `args = {"from": "<element_id>", "to": "<element_id>"}` — both must be element ids from the "Available canvas elements" listing.
 - `add_annotation`: `args = {"text": "<string>", "x": <number>, "y": <number>}` — x/y in 1280×720 design space.
+- `submit_answer` (quiz): `args = {"choice": "A"|"B"|"C"|"D"}` — handler dispatches and returns the frontend reply unchanged. **Advancement is NOT bundled**; the Quiz Page schedules its own reveal-then-advance timer. See the Quiz section below.
+- `skip_question` (quiz): `args = {}`. The "I don't know" path — Page reveals the correct answer without recording a user pick, then auto-advances on the same timer. Returns `{skipped: true, correct: false, completed: bool}`.
 
 The redundancy (prompt + schema) is intentional — early LLM tool calls had a flatten bug where it'd pass `from`/`to` at the top level alongside `verb`. Documenting the nesting in both surfaces fixed it.
 
-**`canvas_set_page` allowlist:** handler validates `pageType` against `{"composition", "youtube", "quiz"}`. The `youtube` and `quiz` entries were pre-allowed in S64c so the allowlist doesn't need to change as new Page types ship; end-to-end `set_page` execution still requires the corresponding Page bundle on the frontend.
+**`canvas_set_page` allowlist:** handler validates `pageType` against `{"composition", "youtube", "quiz"}`. The `youtube` and `quiz` entries were pre-allowed in S64c so the allowlist doesn't need to change as new Page types ship; end-to-end `set_page` execution requires the corresponding Page bundle on the frontend.
+
+**`canvas_set_page` is all-or-nothing on the frontend.** The override layer in `app/(live)/live/[slug]/page.tsx` derives both `effectivePageType` and `effectivePageInit` from a single `useOverride` flag: true only when the LLM supplies BOTH a non-null pageType AND a non-empty pageInit. When pageInit is empty (or missing), BOTH fields fall back to the snapshot. This is what makes "exit overlay back to the scene" work on every scene type (composition or YouTube): the LLM calls `canvas_set_page(pageType='composition', pageInit={})`, the override is treated as "restore snapshot", and the iframe lands on whatever Page the scene's `canvas_page_type` declares. The PLAYBOOK can therefore continue to say "exit to composition" even though the actual destination is "exit to scene".
+
+The agent's PLAYBOOK forbids the LLM from calling `canvas_set_page(pageType='quiz', …)` directly — the blob-copy failure mode is too reliable. Quiz activation goes through `generate_quiz_from_knowledge` instead, which builds the blob AND dispatches set_page in one tool call.
+
+**Scene-nav verbs are shell-level.** `next_scene`, `previous_scene`, and `goto_scene` are routed by the frontend's `DailyRelay` to the live-room shell's `navigateToIndex` BEFORE reaching the iframe (see `lib/canvas-protocol/daily-relay.ts SCENE_NAV_VERBS`). Consequently:
+
+- These verbs are NOT (and should not be) listed in any iframe-side manifest. Listing them implies the iframe handles them; the iframe doesn't. The composition Page used to declare them and worked by accident — the relay short-circuited before the iframe got a chance to reject. YouTube and Quiz correctly omit them, which tripped the agent's manifest validator on `next_scene` from a YouTube scene.
+- The agent's `handle_control` skips the manifest verb check when `verb in SCENE_NAV_VERBS` (`tools/canvas_protocol_tools.py`). The dispatch goes out, the relay intercepts it, the shell navigates, the agent learns about the change via inbound `canvas.sceneChanged`.
+- The CANVAS PAGE prompt section always appends a closing paragraph telling the LLM that scene-nav verbs are available regardless of the per-Page verb listing above. Without this, the LLM would conclude "next_scene isn't in YouTube's verb list, so I can't use it".
 
 ---
 

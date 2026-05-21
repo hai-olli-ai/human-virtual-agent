@@ -461,11 +461,16 @@ def build_canvas_tools_section(
     total = snapshot.get("total_scenes", 1)
     control_verbs = "next_scene, previous_scene, goto_scene, clear" if total > 1 else "clear"
 
-    # Element listing: when aliases are provided, render alias + short
-    # description so the LLM has a complete authoritative reference. Strategy
-    # 1 in persona.build_system_prompt skips build_scene_description, so this
-    # section is the only reliable place to surface element ids on the live
-    # path.
+    # Page-type-aware bullets. The OLD pre-S64d wording asserted composition
+    # rules unconditionally ("element_id MUST, box NOT supported") which
+    # contradicted the YouTube manifest (box-only) and caused the LLM to send
+    # element_id highlight targets on YouTube scenes (rejected by the shell
+    # validator with INVALID_ARGS). Strategy now: use the snapshot's
+    # canvas_page_type to pick text that matches the active Page, with a
+    # neutral fallback that defers to the CANVAS PAGE manifest section for
+    # unknown page types.
+    page_type = (snapshot.get("canvas_page_type") or "composition").lower()
+
     elements = snapshot.get("elements") or []
     if aliases:
         # Stable iteration order: follow the elements list (which matches the
@@ -482,15 +487,22 @@ def build_canvas_tools_section(
             if not alias:
                 continue
             listed.append(f"  - `{alias}` — {_summarize_element(el)}")
-        if listed:
+
+        if page_type == "youtube":
+            ids_line = (
+                "- Canvas elements on this scene (informational only — the YouTube page "
+                "does NOT accept element_id highlight targets and has no canvas_action "
+                "verbs in v0.1):\n" + "\n".join(listed)
+            ) if listed else (
+                "- No standalone canvas elements declared on this scene."
+            )
+        else:
             ids_line = (
                 "- Available canvas elements (pass these aliases as "
                 "`element_id` for canvas_highlight, and as `from` / `to` "
                 "for canvas_action with verb=draw_arrow):\n"
                 + "\n".join(listed)
-            )
-        else:
-            ids_line = (
+            ) if listed else (
                 "- No canvas elements are available on this scene — "
                 "`canvas_highlight` and `canvas_action(verb='draw_arrow')` cannot be called."
             )
@@ -503,6 +515,34 @@ def build_canvas_tools_section(
         else:
             ids_line = "- No element ids are available on this scene — `canvas_highlight` cannot be called."
 
+    if page_type == "youtube":
+        highlight_bullet = (
+            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
+            "On the active YouTube page, `target` MUST be `{box: [x, y, w, h]}` in 1280x720 "
+            "design-space coordinates. Element-id targets (`{element_id: \"<id>\"}`) are "
+            "NOT supported on this page — do not use them. "
+            "If you don't know specific coordinates for what you want to highlight, call "
+            "`canvas_analyze` first to learn the layout, or describe verbally; do NOT call "
+            "`canvas_highlight` with a null or empty target (it will be rejected)."
+        )
+    elif page_type == "composition":
+        highlight_bullet = (
+            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
+            "`target` MUST be `{element_id: \"<id>\"}` using one of the aliases listed in "
+            "Notes below. Box-coordinate targets (`{box: [x, y, w, h]}`) are NOT supported "
+            "on the composition page — do not use them. "
+            "Pick a specific alias from the Available canvas elements list; do NOT call "
+            "`canvas_highlight` with a null or empty target."
+        )
+    else:
+        highlight_bullet = (
+            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
+            "Check the CANVAS PAGE section below for the exact target shape this Page "
+            "supports — either `{element_id: \"<id>\"}` or `{box: [x, y, w, h]}` "
+            "(1280x720 design space). Sending the wrong shape returns INVALID_ARGS, "
+            "and a null/empty target is rejected outright."
+        )
+
     return "\n".join([
         "## Canvas Actions",
         "",
@@ -512,10 +552,7 @@ def build_canvas_tools_section(
         "visible on the canvas using the active page's semantic state. Use when the "
         "visitor asks something you cannot determine from your existing context.",
         "",
-        "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
-        "`target` MUST be `{element_id: \"<id>\"}` using one of the ids listed in Notes "
-        "below. Box-coordinate targets (`{box: [x, y, w, h]}`) are NOT supported on the "
-        "v0.1 Composition page — do not use them.",
+        highlight_bullet,
         "",
         f"3. `canvas_control(verb, args={{}})` — state-transition verbs. Supported: "
         f"{control_verbs}. Most take `args={{}}`.",
