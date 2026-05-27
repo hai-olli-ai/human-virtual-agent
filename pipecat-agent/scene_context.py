@@ -324,19 +324,26 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
     if not snapshot:
         return "No scene is currently loaded."
 
+    # S65 (Option B) — per-scene fields nested under current_scene; cursor
+    # under flow_state. Defensive .get with {} fallback so a degraded
+    # snapshot still renders SOMETHING rather than KeyError-crashing
+    # mid-prompt-build.
+    current_scene = snapshot.get("current_scene") or {}
+    flow_state = snapshot.get("flow_state") or {}
+
     parts = []
 
-    title = snapshot.get("title", "Untitled Scene")
+    title = current_scene.get("title", "Untitled Scene")
     parts.append(f"## Current Scene: {title}")
 
     # Background
-    bg_url = snapshot.get("background_url")
-    bg_type = snapshot.get("background_type")
+    bg_url = current_scene.get("background_url")
+    bg_type = current_scene.get("background_type")
     if bg_url:
         parts.append(f"Background: {bg_type or 'image'}")
 
     # Avatar display mode
-    display_mode = snapshot.get("avatar_display_mode", "normal")
+    display_mode = current_scene.get("avatar_display_mode", "normal")
     parts.append(f"Avatar display mode: {display_mode}")
 
     if display_mode == "invisible":
@@ -347,7 +354,7 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
         parts.append("Note: You are rendered as a 3D model. The visitor sees a 3D representation of you.")
 
     # Canvas elements
-    elements = snapshot.get("elements", [])
+    elements = current_scene.get("elements", [])
     if elements:
         parts.append("\nElements on the canvas:")
         # Note (S59): Element type "button" is a visitor-clickable CTA on
@@ -395,9 +402,9 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
             parts.append(desc)
 
     # Flow position
-    total = snapshot.get("total_scenes", 1)
+    total = flow_state.get("total_scenes", 1)
     if total > 1:
-        index = snapshot.get("scene_index", 0)
+        index = flow_state.get("scene_index", 0)
         parts.append(f"\nThis is scene {index + 1} of {total} in a multi-scene flow.")
         parts.append("You can navigate between scenes when appropriate by using the navigate_scene tool.")
 
@@ -405,8 +412,12 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
 
 
 def build_instruction_section(snapshot: dict) -> str:
-    """Build the scene instruction section from a snapshot."""
-    instruction = snapshot.get("instruction")
+    """Build the scene instruction section from a snapshot.
+
+    S65 (Option B) — instruction nested under current_scene.
+    """
+    current_scene = snapshot.get("current_scene") or {}
+    instruction = current_scene.get("instruction")
     if not instruction:
         return ""
 
@@ -420,8 +431,23 @@ def build_scripts_section(snapshot: dict) -> str:
 
     Gives the LLM awareness of script content so it can reference it
     during conversation without repeating it verbatim.
+
+    S65 G5 directive update: the original S49 wording told the LLM "you
+    will present these to the visitor via TTS", which contradicts the
+    actual runtime behaviour — ``bot.py`` (classic) or SoulX (relay)
+    narrates each segment automatically through ``SceneNarrator``, and
+    the LLM is expected to stay quiet until the visitor speaks. The
+    rewritten preamble makes the contract explicit: the script is
+    system-narrated, the LLM must NOT read or paraphrase it, the
+    invitation has already been spoken, and the LLM stays silent until
+    the visitor's first turn. Without this directive some models would
+    open their first response by repeating script line 1 verbatim,
+    overlapping the visitor's audio with the agent's first utterance.
+
+    S65 (Option B) — scripts nested under current_scene.
     """
-    scripts = snapshot.get("scripts", [])
+    current_scene = snapshot.get("current_scene") or {}
+    scripts = current_scene.get("scripts", [])
     if not scripts:
         return ""
 
@@ -435,7 +461,15 @@ def build_scripts_section(snapshot: dict) -> str:
     if not lines:
         return ""
 
-    return "Scene Scripts (you will present these to the visitor via TTS before conversation begins):\n" + "\n".join(lines)
+    preamble = (
+        "Scene Scripts (the current scene's script is narrated automatically "
+        "by the system in the host's voice — DO NOT read or paraphrase it "
+        "yourself). After narration the visitor will already have been "
+        "invited to ask questions; stay silent until the visitor speaks, "
+        "then respond conversationally. The script content is provided "
+        "below so you can reference it without repeating it:"
+    )
+    return preamble + "\n" + "\n".join(lines)
 
 
 def build_canvas_tools_section(
@@ -458,7 +492,11 @@ def build_canvas_tools_section(
     UUIDs before sending the canvas.command. See
     ``compute_element_aliases`` for the rationale.
     """
-    total = snapshot.get("total_scenes", 1)
+    # S65 (Option B) — total under flow_state; canvas_page_type + elements under current_scene.
+    flow_state = snapshot.get("flow_state") or {}
+    current_scene = snapshot.get("current_scene") or {}
+
+    total = flow_state.get("total_scenes", 1)
     control_verbs = "next_scene, previous_scene, goto_scene, clear" if total > 1 else "clear"
 
     # Page-type-aware bullets. The OLD pre-S64d wording asserted composition
@@ -469,9 +507,9 @@ def build_canvas_tools_section(
     # canvas_page_type to pick text that matches the active Page, with a
     # neutral fallback that defers to the CANVAS PAGE manifest section for
     # unknown page types.
-    page_type = (snapshot.get("canvas_page_type") or "composition").lower()
+    page_type = (current_scene.get("canvas_page_type") or "composition").lower()
 
-    elements = snapshot.get("elements") or []
+    elements = current_scene.get("elements") or []
     if aliases:
         # Stable iteration order: follow the elements list (which matches the
         # creator's stacking) rather than the dict's insertion order — they
@@ -595,50 +633,53 @@ def build_system_prompt(snapshot: dict | None) -> str:
 
     Section order (S61 sandwich pattern + S63 Block 7):
       1. LANGUAGE directive            (top — strong steering)
-      2. PERSONA                       (when snapshot.persona is non-empty)
-      3. AUDIENCE                      (when snapshot.recipient_prompt is non-empty)
+      2. PERSONA                       (when snapshot persona is non-empty)
+      3. AUDIENCE                      (when live_room.recipient_prompt is non-empty)
       4. KNOWLEDGE                     (S56)
-      5. LINK NARRATION                (S63 — when snapshot.link is set)
-      6. SCENE INSTRUCTION             (instruction or scene_instruction)
+      5. LINK NARRATION                (S63 — when current_scene.link is set)
+      6. SCENE INSTRUCTION             (current_scene.instruction)
       7. SCENE / DISPLAY / ELEMENTS    (build_scene_description)
       8. CANVAS ACTION TOOL GUIDANCE
       9. SCRIPTS                       (when present)
       10. LANGUAGE reminder            (bottom — sandwich)
+
+    S65 (Option B) — snapshot is nested under {live_room, flow_state,
+    current_scene, knowledge, survey}. ``persona`` is not currently in
+    the backend snapshot; it's a test-only field kept at the snapshot
+    top level for sync test fixtures.
     """
     snapshot = snapshot or {}
-    language = snapshot.get("language") or "en"
+    live_room = snapshot.get("live_room") or {}
+    current_scene = snapshot.get("current_scene") or {}
+
+    language = live_room.get("language") or "en"
     sections: list[str] = []
 
     # 1. LANGUAGE directive (top)
     sections.append(f"# LANGUAGE\n{build_language_directive(language)}")
 
-    # 2. PERSONA
+    # 2. PERSONA (test-only top-level field; not in production snapshot)
     persona = (snapshot.get("persona") or "").strip()
     if persona:
         sections.append(f"# PERSONA\n{persona}")
 
-    # 3. AUDIENCE (only when recipient_prompt is non-empty)
-    audience = build_recipient_context(snapshot.get("recipient_prompt"))
+    # 3. AUDIENCE (only when live_room.recipient_prompt is non-empty)
+    audience = build_recipient_context(live_room.get("recipient_prompt"))
     if audience:
         sections.append(audience.lstrip("\n"))
 
-    # 4. KNOWLEDGE (S56)
+    # 4. KNOWLEDGE (S56) — knowledge stays at the snapshot top level.
     knowledge_section = build_knowledge_context(snapshot.get("knowledge"))
     if knowledge_section:
         sections.append(knowledge_section.lstrip("\n"))
 
     # 5. LINK NARRATION (S63 Block 7) — between KNOWLEDGE and SCENE INSTRUCTION
-    link_narration = build_link_narration_directive(snapshot.get("link"))
+    link_narration = build_link_narration_directive(current_scene.get("link"))
     if link_narration:
         sections.append(link_narration)
 
-    # 6. SCENE INSTRUCTION — accept either "instruction" (current backend)
-    #    or "scene_instruction" (forward-compat with snapshot rename).
-    instruction_text = (
-        snapshot.get("scene_instruction")
-        or snapshot.get("instruction")
-        or ""
-    ).strip()
+    # 6. SCENE INSTRUCTION — current_scene.instruction.
+    instruction_text = (current_scene.get("instruction") or "").strip()
     if instruction_text:
         sections.append(f"# SCENE INSTRUCTION\n{instruction_text}")
 

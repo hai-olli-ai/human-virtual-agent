@@ -419,7 +419,12 @@ def build_system_prompt_split(
       (stable_prefix, dynamic_suffix) — both strings, joined with "\\n\\n".
     """
     snapshot = snapshot or {}
-    language = snapshot.get("language") or "en"
+    # S65 (Option B) — snapshot nested under {live_room, flow_state,
+    # current_scene, knowledge, survey}. Pull blocks once.
+    live_room_block = snapshot.get("live_room") or {}
+    current_scene_block = snapshot.get("current_scene") or {}
+
+    language = live_room_block.get("language") or "en"
 
     # ── Stable prefix (sections 1 → 5b) ──
     stable_parts: list[str] = []
@@ -430,7 +435,7 @@ def build_system_prompt_split(
     if persona:
         stable_parts.append(f"# PERSONA\n{persona}")
 
-    audience = build_recipient_context(snapshot.get("recipient_prompt"))
+    audience = build_recipient_context(live_room_block.get("recipient_prompt"))
     if audience:
         stable_parts.append(audience.lstrip("\n"))
 
@@ -438,15 +443,11 @@ def build_system_prompt_split(
     if knowledge_section:
         stable_parts.append(knowledge_section.lstrip("\n"))
 
-    link_narration = build_link_narration_directive(snapshot.get("link"))
+    link_narration = build_link_narration_directive(current_scene_block.get("link"))
     if link_narration:
         stable_parts.append(link_narration)
 
-    instruction_text = (
-        snapshot.get("scene_instruction")
-        or snapshot.get("instruction")
-        or ""
-    ).strip()
+    instruction_text = (current_scene_block.get("instruction") or "").strip()
     if instruction_text:
         stable_parts.append(f"# SCENE INSTRUCTION\n{instruction_text}")
 
@@ -458,12 +459,12 @@ def build_system_prompt_split(
     dynamic_parts: list[str] = []
 
     display_block = _render_display_mode(
-        snapshot.get("avatar_display_mode") or snapshot.get("display_mode")
+        current_scene_block.get("avatar_display_mode")
     )
     if display_block:
         dynamic_parts.append(display_block)
 
-    elements_block = _render_canvas_elements(snapshot.get("elements"))
+    elements_block = _render_canvas_elements(current_scene_block.get("elements"))
     if elements_block:
         dynamic_parts.append(elements_block)
 

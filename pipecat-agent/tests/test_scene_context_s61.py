@@ -99,14 +99,18 @@ def test_language_reminder_unknown_falls_back():
 # -----------------------
 
 def test_system_prompt_includes_language_at_top_and_bottom():
+    # S65 (Option B) — snapshot is nested under live_room / current_scene.
+    # persona is a test-only top-level field (not in production snapshot).
     snap = {
-        "language": "es",
-        "persona": "A friendly assistant.",
-        "recipient_prompt": None,
+        "live_room": {"language": "es", "recipient_prompt": None},
+        "flow_state": {"scene_index": 0, "total_scenes": 1},
+        "current_scene": {
+            "instruction": "Help the visitor.",
+            "avatar_display_mode": "normal",
+            "elements": [],
+        },
         "knowledge": None,
-        "scene_instruction": "Help the visitor.",
-        "display_mode": "normal",
-        "elements": [],
+        "persona": "A friendly assistant.",
     }
     prompt = build_system_prompt(snap)
 
@@ -121,59 +125,49 @@ def test_system_prompt_includes_language_at_top_and_bottom():
     assert "Remember" in last_section or "remember" in last_section.lower()
 
 
-def test_system_prompt_audience_appears_when_recipient_prompt_set():
-    snap = {
-        "language": "en",
-        "persona": "Assistant.",
-        "recipient_prompt": "Speak to first-time parents — be reassuring.",
-        "knowledge": None,
-        "scene_instruction": "Help.",
-        "display_mode": "normal",
-        "elements": [],
+def _nested_snap(*, language="en", recipient_prompt=None, persona="Assistant.",
+                  knowledge=None, instruction="Help.", display_mode="normal",
+                  elements=None) -> dict:
+    """Helper for the S65 (Option B) nested snapshot fixture."""
+    return {
+        "live_room": {"language": language, "recipient_prompt": recipient_prompt},
+        "flow_state": {"scene_index": 0, "total_scenes": 1},
+        "current_scene": {
+            "instruction": instruction,
+            "avatar_display_mode": display_mode,
+            "elements": elements if elements is not None else [],
+        },
+        "knowledge": knowledge,
+        "persona": persona,
     }
+
+
+def test_system_prompt_audience_appears_when_recipient_prompt_set():
+    snap = _nested_snap(
+        recipient_prompt="Speak to first-time parents — be reassuring.",
+    )
     prompt = build_system_prompt(snap)
     assert "# AUDIENCE" in prompt
     assert "first-time parents" in prompt
 
 
 def test_system_prompt_audience_absent_when_recipient_prompt_empty():
-    snap = {
-        "language": "en",
-        "persona": "Assistant.",
-        "recipient_prompt": "",
-        "knowledge": None,
-        "scene_instruction": "Help.",
-        "display_mode": "normal",
-        "elements": [],
-    }
+    snap = _nested_snap(recipient_prompt="")
     prompt = build_system_prompt(snap)
     assert "# AUDIENCE" not in prompt
 
 
 def test_system_prompt_audience_absent_when_recipient_prompt_whitespace():
-    snap = {
-        "language": "en",
-        "persona": "Assistant.",
-        "recipient_prompt": "   \n   ",
-        "knowledge": None,
-        "scene_instruction": "Help.",
-        "display_mode": "normal",
-        "elements": [],
-    }
+    snap = _nested_snap(recipient_prompt="   \n   ")
     prompt = build_system_prompt(snap)
     assert "# AUDIENCE" not in prompt
 
 
 def test_system_prompt_audience_appears_after_persona_before_knowledge():
-    snap = {
-        "language": "en",
-        "persona": "Assistant.",
-        "recipient_prompt": "Audience text",
-        "knowledge": {"sources": [{"text": "Knowledge fact ABC"}]},
-        "scene_instruction": "Help.",
-        "display_mode": "normal",
-        "elements": [],
-    }
+    snap = _nested_snap(
+        recipient_prompt="Audience text",
+        knowledge={"sources": [{"text": "Knowledge fact ABC"}]},
+    )
     prompt = build_system_prompt(snap)
     persona_idx = prompt.find("# PERSONA")
     audience_idx = prompt.find("# AUDIENCE")
@@ -184,29 +178,16 @@ def test_system_prompt_audience_appears_after_persona_before_knowledge():
 
 
 def test_system_prompt_defaults_to_english_when_language_missing():
-    snap = {
-        "persona": "Assistant.",
-        "recipient_prompt": None,
-        "knowledge": None,
-        "scene_instruction": "Help.",
-        "display_mode": "normal",
-        "elements": [],
-    }
+    # live_room block present but no language key.
+    snap = _nested_snap()
+    snap["live_room"].pop("language")
     prompt = build_system_prompt(snap)
     assert "English" in prompt
 
 
 def test_system_prompt_handles_all_nine_languages():
     for lang in ["en", "es", "fr", "de", "pt", "ja", "ko", "vi", "zh"]:
-        snap = {
-            "language": lang,
-            "persona": "Assistant.",
-            "recipient_prompt": None,
-            "knowledge": None,
-            "scene_instruction": "Help.",
-            "display_mode": "normal",
-            "elements": [],
-        }
+        snap = _nested_snap(language=lang)
         prompt = build_system_prompt(snap)
         # Language name should appear at least twice (top + bottom)
         name = LANGUAGE_NAMES[lang]

@@ -10,6 +10,8 @@ COPY config.py .
 COPY persona.py .
 COPY api_client.py .
 COPY scene_context.py .
+# S65 G3 — per-scene narration helper with per-segment voice switching.
+COPY narration.py .
 
 # S64c — Canvas Protocol modules
 COPY tools tools

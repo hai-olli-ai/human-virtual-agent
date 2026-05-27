@@ -97,19 +97,25 @@ async def build_system_prompt(
     directive, the AUDIENCE section, and per-strategy enrichment.
     """
     # ── Snapshot fetched once; powers LANGUAGE + AUDIENCE + body ──
+    # S65 (Option B) — snapshot nested under {live_room, flow_state,
+    # current_scene, knowledge, survey}. Pull live_room + current_scene
+    # blocks once so the rest of the function reads from local handles.
     snapshot: dict | None = None
     if room_id:
         snapshot = await get_scene_snapshot(room_id, api_url)
 
-    language = (snapshot or {}).get("language") or "en"
-    audience_section = build_recipient_context((snapshot or {}).get("recipient_prompt"))
+    live_room_block = (snapshot or {}).get("live_room") or {}
+    current_scene_block = (snapshot or {}).get("current_scene") or {}
+
+    language = live_room_block.get("language") or "en"
+    audience_section = build_recipient_context(live_room_block.get("recipient_prompt"))
 
     # S64c — element aliases for the canvas tools section. Computed from
     # the same snapshot used for everything else, so the prompt's listing
     # and the agent's translation map are guaranteed in sync.
     element_aliases: dict[str, str] = {}
     if snapshot:
-        element_aliases = compute_element_aliases(snapshot.get("elements") or [])
+        element_aliases = compute_element_aliases(current_scene_block.get("elements") or [])
     if aliases_out is not None:
         aliases_out.clear()
         aliases_out.update(element_aliases)
@@ -133,14 +139,17 @@ async def build_system_prompt(
                 if knowledge_block:
                     body_parts.append(knowledge_block)
 
-                # LINK NARRATION (S63 Block 7) — after KNOWLEDGE
-                link_narration = build_link_narration_directive(snapshot.get("link"))
+                # LINK NARRATION (S63 Block 7) — after KNOWLEDGE.
+                # S65 (Option B) — link nested under current_scene.
+                link_narration = build_link_narration_directive(current_scene_block.get("link"))
                 if link_narration:
                     body_parts.append(link_narration)
 
                 # Add canvas tools section (for Session 47).
                 # S64c — aliases are computed once above and threaded here so
                 # the LLM-facing listing surfaces alias names instead of UUIDs.
+                # build_canvas_tools_section + build_scripts_section read
+                # the nested snapshot shape directly.
                 tools = build_canvas_tools_section(snapshot, aliases=element_aliases)
                 if tools:
                     body_parts.append(tools)
@@ -180,8 +189,9 @@ async def build_system_prompt(
         if knowledge_block:
             body_parts.append(knowledge_block)
 
-        # LINK NARRATION (S63 Block 7) — after KNOWLEDGE, before scene details
-        link_narration = build_link_narration_directive(snapshot.get("link"))
+        # LINK NARRATION (S63 Block 7) — after KNOWLEDGE, before scene details.
+        # S65 (Option B) — link nested under current_scene.
+        link_narration = build_link_narration_directive(current_scene_block.get("link"))
         if link_narration:
             body_parts.append(link_narration)
 

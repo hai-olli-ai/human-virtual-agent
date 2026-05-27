@@ -113,7 +113,15 @@ async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict |
             )
             response.raise_for_status()
             data = response.json()
-            data.setdefault("scripts", [])
+            # S65 (Option B) — snapshot nested under {live_room,
+            # flow_state, current_scene, knowledge, survey}. Defensive
+            # setdefaults so a pre-S65 backend (or a degraded response)
+            # still yields a dict every consumer's `(snapshot.get("X")
+            # or {}).get("Y")` chain can read without KeyError.
+            data.setdefault("live_room", {})
+            data.setdefault("flow_state", {})
+            data.setdefault("current_scene", {})
+            data["current_scene"].setdefault("scripts", [])
             return data
     except Exception as e:
         logger.warning(f"Failed to fetch scene snapshot for room {room_id}: {e}")

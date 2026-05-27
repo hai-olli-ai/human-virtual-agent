@@ -40,6 +40,7 @@ from pipecat.frames.frames import (
     OutputTransportMessageFrame,
     StartFrame,
     TTSSpeakFrame,
+    TTSUpdateSettingsFrame,
     TranscriptionFrame,
     TextFrame,
     UserAudioRawFrame,
@@ -102,6 +103,17 @@ from tools.quiz_generation import (
     GENERATE_QUIZ_SCHEMA,
     SessionContext,
     make_handle_generate_quiz,
+)
+# S65 G3+G4 — per-scene narration helper with per-segment voice switching,
+# post-narration invitation/cue branch, and the script_complete payload.
+# run_scene_narration is the orchestrator wired into both
+# on_client_connected (session start) AND refresh_agent_for_current_scene
+# (scene change — S65 Bug #2 fix) so both moments narrate identically.
+from narration import (
+    NarrationCompletionGate,
+    SceneNarrator,
+    build_script_complete_payload,
+    run_scene_narration,
 )
 
 # ──────────────────────────────────────────────────────────────────────
@@ -535,7 +547,10 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
 
         snapshot = await get_scene_snapshot(room_id, api_url)
         if snapshot:
-            display_mode = snapshot.get("avatar_display_mode", "normal")
+            # S65 (Option B) — avatar_display_mode nested under current_scene.
+            display_mode = (snapshot.get("current_scene") or {}).get(
+                "avatar_display_mode", "normal"
+            )
             if display_mode == "talking":
                 logger.info(
                     "Avatar display_mode={} -> output_mode=relay_avatar",
@@ -694,12 +709,18 @@ async def run_bot_classic(
             logger.info("No scene image available; vision disabled for this session")
 
     # ── Fetch scene snapshot for scripts ──
+    # S65 (Option B) — snapshot is nested under {live_room, flow_state,
+    # current_scene, knowledge, survey}. Pull the per-scene block once
+    # so subsequent reads stay terse.
     scene_snapshot = None
     if room_id:
         from api_client import get_scene_snapshot
         scene_snapshot = await get_scene_snapshot(room_id, api_url)
         if scene_snapshot:
-            logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
+            scripts_len = len(
+                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
+            )
+            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
 
     # ── Canvas Protocol substrate (S64c) ──
     # Manifest + pending command registries are per-session; an instance pair
@@ -739,7 +760,12 @@ async def run_bot_classic(
     # Prefer the live snapshot's scene_id over the body field, because
     # for flow-based rooms the body carries scene_id=None while the
     # snapshot resolves the flow's current scene.
-    initial_scene_id = (scene_snapshot or {}).get("scene_id") or scene_id or None
+    # S65 (Option B) — scene_id nested under current_scene.
+    initial_scene_id = (
+        ((scene_snapshot or {}).get("current_scene") or {}).get("scene_id")
+        or scene_id
+        or None
+    )
     session_context.set_scene(str(initial_scene_id) if initial_scene_id else None)
     logger.info(
         "[SESSION_CONTEXT] slug={!r} initial_scene_id={!r}",
@@ -772,7 +798,8 @@ async def run_bot_classic(
     )
 
     # STT language driven by the live-room language (S61).
-    snapshot_language = (scene_snapshot or {}).get("language")
+    # S65 (Option B) — language nested under live_room.
+    snapshot_language = ((scene_snapshot or {}).get("live_room") or {}).get("language")
     deepgram_language = resolve_deepgram_language(snapshot_language)
     logger.info(
         "Deepgram language configured: snapshot_language={} deepgram_language={}",
@@ -866,10 +893,12 @@ async def run_bot_classic(
         # fetched inside build_system_prompt; we re-fetch here (cheap,
         # cached on the backend) rather than threading the snapshot
         # through every prompt-builder caller.
+        # S65 (Option B) — scene_id nested under current_scene.
         from api_client import get_scene_snapshot, get_scene_image_base64
         fresh_snapshot = await get_scene_snapshot(room_id, api_url)
-        if fresh_snapshot and fresh_snapshot.get("scene_id"):
-            new_scene_id = str(fresh_snapshot["scene_id"])
+        fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
+        if fresh_snapshot and fresh_cs.get("scene_id"):
+            new_scene_id = str(fresh_cs["scene_id"])
             if new_scene_id != session_context.get_current_scene_id():
                 logger.info(
                     "[CANVAS SCENECHANGED] session_context scene_id {} -> {}",
@@ -885,6 +914,42 @@ async def run_bot_classic(
             logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
         else:
             logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+
+        # ── S65 Bug #2 — narrate the new scene + emit script_complete ──
+        # The shell's auto-advance keys off script_complete; if the agent
+        # doesn't narrate + emit on canvas.sceneChanged, auto-advance
+        # stalls at the first scene change. Cancel any in-flight
+        # narration_gate futures first (leftover from a prior scene's
+        # narration that may not have fully resolved), then orchestrate
+        # narrate → followup speak → script_complete in spec'd order.
+        # narrator + _classic_speak resolve from the enclosing
+        # run_bot_classic scope (defined below; Python closures look up
+        # names at call time, so this works even though they appear
+        # textually later in the file).
+        if fresh_snapshot:
+            narration_gate.cancel_all("scene_change")
+            try:
+                spoke_script = await run_scene_narration(
+                    fresh_snapshot,
+                    narrator=narrator,
+                    speak_followup=_classic_speak,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[CANVAS SCENECHANGED] narration failed: {!r}", exc
+                )
+                spoke_script = False
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        fresh_snapshot, spoke_script=spoke_script
+                    )
+                )
+            )
+            logger.info(
+                "[CANVAS SCENECHANGED] narration complete spoke_script={}",
+                spoke_script,
+            )
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
@@ -918,6 +983,14 @@ async def run_bot_classic(
     speaking_notifier = SpeakingStateNotifier(output_transport)
     thinking_notifier = ThinkingNotifier(output_transport)
 
+    # ── Narration completion gate (S65 G3) ──
+    # Sits between TTS and output_transport so it observes every
+    # TTSStoppedFrame; SceneNarrator awaits these to know when a script
+    # segment has finished rendering before applying the next voice
+    # update. See narration.NarrationCompletionGate for the FIFO + race
+    # caveat.
+    narration_gate = NarrationCompletionGate()
+
     # ── Pipeline ──
     pipeline = Pipeline([
         transport.input(),       # Visitor's microphone audio (WebRTC)
@@ -929,6 +1002,7 @@ async def run_bot_classic(
         avatar_transcript_fwd,   # Forward avatar LLM text to frontend
         speaking_notifier,       # Notify frontend of speaking state
         tts,                     # Cartesia: response -> speech audio
+        narration_gate,          # S65 G3: observe TTSStoppedFrame for narration
         output_transport,        # Send audio back to visitor (WebRTC)
         assistant_aggregator,    # Add bot response to conversation history
     ])
@@ -939,6 +1013,49 @@ async def run_bot_classic(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+    )
+
+    # ── Scene narrator (S65 G3 — classic pipeline, per-segment voice) ──
+    # primary_voice is the Cartesia voice the TTS service was constructed
+    # with at session start (avatar config first, CARTESIA_VOICE_ID
+    # fallback). After per-segment voice switching, SceneNarrator resets
+    # back to primary BEFORE returning so the closing "feel free to ask"
+    # line + all subsequent conversation use the agent's own voice. See
+    # narration.SceneNarrator for the loop + idempotency contract.
+    primary_voice_id_classic = voice_id
+
+    async def _classic_set_voice(target_voice_id: str) -> None:
+        # Queue a TTSUpdateSettingsFrame; the TTS service applies the
+        # delta inline before the next TTSSpeakFrame is processed
+        # (pipecat 0.0.108 TTSService.process_frame). No await needed
+        # for completion — the delta is synchronous within the TTS
+        # processor's frame loop.
+        delta = CartesiaTTSService.Settings(voice=target_voice_id)
+        await task.queue_frames([TTSUpdateSettingsFrame(delta=delta)])
+
+    async def _classic_speak(text: str) -> None:
+        # Register the completion future BEFORE queuing the speak — a
+        # short utterance can fire TTSStoppedFrame before we register
+        # otherwise (race), leaving us waiting forever. 30 s upper
+        # bound is generous for any single narration segment; on
+        # timeout we log and proceed so the rest of the narration plan
+        # still runs.
+        fut = narration_gate.expect_next_stop()
+        await task.queue_frames([TTSSpeakFrame(text=text)])
+        try:
+            await asyncio.wait_for(fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[NARRATION] segment TTSStoppedFrame timeout — continuing"
+            )
+        except asyncio.CancelledError:
+            logger.warning("[NARRATION] segment future cancelled")
+            raise
+
+    narrator = SceneNarrator(
+        primary_voice_id=primary_voice_id_classic,
+        set_voice=_classic_set_voice,
+        speak=_classic_speak,
     )
 
     # ── Event handlers (simple — no participant role detection) ──
@@ -1004,21 +1121,28 @@ async def run_bot_classic(
     async def on_client_connected(transport, client):
         logger.info("Visitor connected to live room")
 
-        if scene_snapshot and scene_snapshot.get("scripts"):
-            scripts = sorted(scene_snapshot["scripts"], key=lambda s: s.get("order", 0))
-            for script in scripts:
-                text = script.get("text", "").strip()
-                if text:
-                    await task.queue_frames([TTSSpeakFrame(text=text)])
-
-            await task.queue_frames([
-                TTSSpeakFrame(text="Please feel free to ask me if you have any questions.")
-            ])
-
-            await output_transport.send_message(
-                OutputTransportMessageFrame(message={"type": "script_complete"})
+        # S65 G3+G4 — narrate scene scripts via SceneNarrator (per-segment
+        # voice switching, idempotent per scene_id), then speak the
+        # localized invitation OR transition_cue, then emit
+        # script_complete LAST. run_scene_narration composes the
+        # narrate + followup steps; we emit script_complete separately
+        # because in the relay pipeline the RELAY_TURN must close
+        # between followup and script_complete — keeping the emit at
+        # the call site lets each pipeline own its turn lifecycle.
+        spoke_script = await run_scene_narration(
+            scene_snapshot,
+            narrator=narrator,
+            speak_followup=_classic_speak,
+        )
+        await output_transport.send_message(
+            OutputTransportMessageFrame(
+                message=build_script_complete_payload(
+                    scene_snapshot, spoke_script=spoke_script
+                )
             )
+        )
 
+        if spoke_script:
             context.add_message({
                 "role": "developer",
                 "content": (
@@ -1037,6 +1161,10 @@ async def run_bot_classic(
     async def on_client_disconnected(transport, client):
         logger.info("Visitor disconnected")
         canvas_pending.cancel_all("session_end")
+        # S65 G3 — surface any narration segments still awaiting their
+        # TTSStoppedFrame so the disconnect doesn't leave coroutines
+        # hung on futures that will never resolve.
+        narration_gate.cancel_all("session_end")
         await task.cancel()
 
     # ── Run ──
@@ -1095,12 +1223,16 @@ async def run_bot_relay(
             logger.info("No scene image available; vision disabled for this session")
 
     # ── Fetch scene snapshot for scripts ──
+    # S65 (Option B) — scripts nested under current_scene.
     scene_snapshot = None
     if room_id:
         from api_client import get_scene_snapshot
         scene_snapshot = await get_scene_snapshot(room_id, api_url)
         if scene_snapshot:
-            logger.info("Scene snapshot loaded (scripts={})", len(scene_snapshot.get("scripts", [])))
+            scripts_len = len(
+                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
+            )
+            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
 
     # ── Canvas Protocol substrate (S64c) ──
     output_transport = transport.output()
@@ -1137,7 +1269,12 @@ async def run_bot_relay(
     # Prefer the live snapshot's scene_id over the body field, because
     # for flow-based rooms the body carries scene_id=None while the
     # snapshot resolves the flow's current scene.
-    initial_scene_id = (scene_snapshot or {}).get("scene_id") or scene_id or None
+    # S65 (Option B) — scene_id nested under current_scene.
+    initial_scene_id = (
+        ((scene_snapshot or {}).get("current_scene") or {}).get("scene_id")
+        or scene_id
+        or None
+    )
     session_context.set_scene(str(initial_scene_id) if initial_scene_id else None)
     logger.info(
         "[SESSION_CONTEXT] slug={!r} initial_scene_id={!r}",
@@ -1163,7 +1300,8 @@ async def run_bot_relay(
     )
 
     # STT language driven by the live-room language (S61).
-    snapshot_language = (scene_snapshot or {}).get("language")
+    # S65 (Option B) — language nested under live_room.
+    snapshot_language = ((scene_snapshot or {}).get("live_room") or {}).get("language")
     deepgram_language = resolve_deepgram_language(snapshot_language)
     logger.info(
         "Deepgram language configured: snapshot_language={} deepgram_language={}",
@@ -1249,10 +1387,12 @@ async def run_bot_relay(
         # fetched inside build_system_prompt; we re-fetch here (cheap,
         # cached on the backend) rather than threading the snapshot
         # through every prompt-builder caller.
+        # S65 (Option B) — scene_id nested under current_scene.
         from api_client import get_scene_snapshot, get_scene_image_base64
         fresh_snapshot = await get_scene_snapshot(room_id, api_url)
-        if fresh_snapshot and fresh_snapshot.get("scene_id"):
-            new_scene_id = str(fresh_snapshot["scene_id"])
+        fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
+        if fresh_snapshot and fresh_cs.get("scene_id"):
+            new_scene_id = str(fresh_cs["scene_id"])
             if new_scene_id != session_context.get_current_scene_id():
                 logger.info(
                     "[CANVAS SCENECHANGED] session_context scene_id {} -> {}",
@@ -1268,6 +1408,42 @@ async def run_bot_relay(
             logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
         else:
             logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+
+        # ── S65 Bug #2 — narrate the new scene + emit script_complete ──
+        # The shell's auto-advance keys off script_complete; if the agent
+        # doesn't narrate + emit on canvas.sceneChanged, auto-advance
+        # stalls at the first scene change. Mirrors the classic
+        # pipeline's refresh-time narration. Closes the RELAY_TURN
+        # BEFORE emitting script_complete so SoulX sees TURN_END before
+        # the shell potentially auto-advances. narrator + _relay_speak +
+        # _relay_close_turn resolve from the enclosing run_bot_relay
+        # scope (defined below; Python closures look up names at call
+        # time, so this works even though they appear textually later).
+        if fresh_snapshot:
+            spoke_script = False
+            try:
+                spoke_script = await run_scene_narration(
+                    fresh_snapshot,
+                    narrator=narrator,
+                    speak_followup=_relay_speak,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[CANVAS SCENECHANGED] narration failed: {!r}", exc
+                )
+            finally:
+                await _relay_close_turn()
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        fresh_snapshot, spoke_script=spoke_script
+                    )
+                )
+            )
+            logger.info(
+                "[CANVAS SCENECHANGED] narration complete spoke_script={}",
+                spoke_script,
+            )
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
@@ -1425,6 +1601,50 @@ async def run_bot_relay(
         except Exception:
             logger.exception("Failed to send relay message type={}", msg_type)
 
+    # ── Scene narrator (S65 G3 — relay pipeline, primary SoulX voice only) ──
+    # The relay pipeline doesn't drive a local TTS, so per-segment voice
+    # switching is not exposed — SoulX renders narration in its single
+    # configured voice (the script-avatar voice clone is a v0.2 punt per
+    # CLAUDE.md S65). The narrator still owns scene-script iteration +
+    # idempotency so the relay and classic paths share the same loop.
+    #
+    # `relay_turn_state` is the single mutable holder for the
+    # currently-open RELAY_TURN. _relay_speak lazily opens the turn on
+    # the first segment so a narrate() call that yields no segments
+    # leaves no orphan TURN_START on the wire; _relay_close_turn
+    # finalises the turn after the closing line is sent. Keeping the
+    # turn lifecycle here (and not inside SceneNarrator) lets the
+    # narrator stay relay-agnostic.
+    relay_turn_state: dict[str, object] = {"turn_id": None, "seq": 0}
+
+    async def _relay_speak(text: str) -> None:
+        if relay_turn_state["turn_id"] is None:
+            new_turn_id = str(uuid.uuid4())
+            relay_turn_state["turn_id"] = new_turn_id
+            relay_turn_state["seq"] = 0
+            await _send_relay(RELAY_TURN_START, turn_id=new_turn_id)
+        await _send_relay(
+            RELAY_TEXT,
+            turn_id=relay_turn_state["turn_id"],
+            seq=relay_turn_state["seq"],
+            text=text,
+        )
+        relay_turn_state["seq"] = int(relay_turn_state["seq"]) + 1
+
+    async def _relay_close_turn() -> None:
+        turn_id = relay_turn_state["turn_id"]
+        if turn_id is None:
+            return
+        await _send_relay(RELAY_TURN_END, turn_id=turn_id)
+        relay_turn_state["turn_id"] = None
+        relay_turn_state["seq"] = 0
+
+    narrator = SceneNarrator(
+        primary_voice_id=None,
+        set_voice=None,
+        speak=_relay_speak,
+    )
+
     # ── Greeting (waits for avatar readiness) ──
 
     async def _queue_greeting():
@@ -1439,31 +1659,37 @@ async def run_bot_relay(
 
         greeting_sent = True
 
-        if scene_snapshot and scene_snapshot.get("scripts"):
-            # Send scripts directly to SoulX via relay protocol
-            turn_id = str(uuid.uuid4())
-            seq = 0
+        spoke_script = False
+        if scene_snapshot:
+            # S65 G3+G4 — narrate + followup via the shared orchestrator,
+            # wrapped in try/finally so an in-flight RELAY_TURN is
+            # always closed BEFORE script_complete is emitted: otherwise
+            # SoulX waits forever for TURN_END AND the shell might have
+            # already auto-advanced. The orchestrator returns
+            # spoke_script for the script_complete payload + the
+            # developer-context message branch below.
+            try:
+                spoke_script = await run_scene_narration(
+                    scene_snapshot,
+                    narrator=narrator,
+                    speak_followup=_relay_speak,
+                )
+            finally:
+                await _relay_close_turn()
 
-            await _send_relay(RELAY_TURN_START, turn_id=turn_id)
-
-            scripts = sorted(scene_snapshot["scripts"], key=lambda s: s.get("order", 0))
-            for script in scripts:
-                text = script.get("text", "").strip()
-                if text:
-                    await _send_relay(RELAY_TEXT, turn_id=turn_id, seq=seq, text=text)
-                    seq += 1
-
-            await _send_relay(
-                RELAY_TEXT, turn_id=turn_id, seq=seq,
-                text="Please feel free to ask me if you have any questions.",
+        # S65 G4 — script_complete fires for BOTH branches; payload
+        # carries {sceneIndex, hadScript} so the shell knows whether
+        # to wait for narration (hadScript=True) or short-circuit
+        # auto-advance immediately (hadScript=False).
+        await output_transport.send_message(
+            OutputTransportMessageFrame(
+                message=build_script_complete_payload(
+                    scene_snapshot, spoke_script=spoke_script
+                )
             )
+        )
 
-            await _send_relay(RELAY_TURN_END, turn_id=turn_id)
-
-            await output_transport.send_message(
-                OutputTransportMessageFrame(message={"type": "script_complete"})
-            )
-
+        if spoke_script:
             context.add_message({
                 "role": "developer",
                 "content": (
