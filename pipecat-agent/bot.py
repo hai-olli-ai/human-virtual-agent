@@ -23,6 +23,8 @@ import json
 import os
 import uuid
 
+import httpx
+
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -80,6 +82,9 @@ from config import (
     ANTHROPIC_MODEL,
     GOOGLE_AI_API_KEY,
     GEMINI_MODEL,
+    NARRATION_TTS_MODEL_ID,
+    NARRATION_AUDIO_SAMPLE_RATE,
+    NARRATION_AUDIO_NUM_CHANNELS,
     resolve_deepgram_language,
 )
 from persona import build_system_prompt
@@ -115,6 +120,11 @@ from narration import (
     build_script_complete_payload,
     run_scene_narration,
 )
+# Block 12 — cache-first Cartesia TTS service (replay of pre-rendered
+# narration PCM via single-shot prime). The narrator's prefetch+prime
+# closures (~run_bot_classic) populate and consume the cache; on a miss
+# the service falls through to live Cartesia synthesis.
+from services.cached_first_tts import CachedFirstTTSService, CachedSegment
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -817,9 +827,18 @@ async def run_bot_classic(
         settings=DeepgramSTTService.Settings(language=deepgram_language),
     )
     voice_id = (avatar_config or {}).get("voiceModelId") or CARTESIA_VOICE_ID
-    tts = CartesiaTTSService(
+    # Block 13 — Cartesia constructor pinned to the narration cache's
+    # sample_rate + model so a primed segment can be replayed byte-for-
+    # byte alongside live miss-path audio. The voice is the live-room
+    # primary; per-segment voice switches still go through
+    # _classic_set_voice as a TTSUpdateSettingsFrame delta.
+    tts = CachedFirstTTSService(
         api_key=CARTESIA_API_KEY,
-        settings=CartesiaTTSService.Settings(voice=voice_id),
+        sample_rate=NARRATION_AUDIO_SAMPLE_RATE,
+        settings=CartesiaTTSService.Settings(
+            voice=voice_id,
+            model=NARRATION_TTS_MODEL_ID,
+        ),
     )
 
     llm, eager_hook = _build_llm_and_eager_hook(
@@ -1052,10 +1071,64 @@ async def run_bot_classic(
             logger.warning("[NARRATION] segment future cancelled")
             raise
 
+    # Block 13 — narration cache closures. Shared dict between prefetch
+    # (fills it once at the top of each per-scene narration) and prime
+    # (per-segment consume; primes the TTS service for the very next
+    # run_tts call). On any HTTP / decode failure we fall back to live —
+    # the prime returns False, the narrator runs the normal voice-switch
+    # + live synthesis path for that segment.
+    _narration_cache: dict[str, CachedSegment] = {}
+
+    async def _narration_prefetch(plan):
+        _narration_cache.clear()
+        targets = [
+            seg for seg in plan
+            if seg.id and seg.audio and seg.audio.get("url")
+        ]
+        if not targets:
+            return
+        # 10 s per-segment timeout — narration is on the critical path
+        # of scene entry; a slow CDN should fail fast to live rather
+        # than stall the visitor.
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for seg in targets:
+                url = seg.audio["url"]
+                try:
+                    r = await client.get(url)
+                    if r.status_code != 200:
+                        logger.warning(
+                            "[NARRATION] prefetch {} -> HTTP {}, live fallback",
+                            seg.id, r.status_code,
+                        )
+                        continue
+                    sr = int(seg.audio.get("sample_rate") or NARRATION_AUDIO_SAMPLE_RATE)
+                    if sr != NARRATION_AUDIO_SAMPLE_RATE:
+                        logger.warning(
+                            "[NARRATION] prefetch {} sr={} != configured {}, skip",
+                            seg.id, sr, NARRATION_AUDIO_SAMPLE_RATE,
+                        )
+                        continue
+                    _narration_cache[seg.id] = CachedSegment(
+                        pcm=r.content,
+                        sample_rate=sr,
+                        num_channels=NARRATION_AUDIO_NUM_CHANNELS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[NARRATION] prefetch {} failed: {!r}", seg.id, exc
+                    )
+
+    def _narration_prime(seg) -> bool:
+        cached = _narration_cache.get(seg.id) if seg.id else None
+        tts.prime_cached(cached)
+        return cached is not None
+
     narrator = SceneNarrator(
         primary_voice_id=primary_voice_id_classic,
         set_voice=_classic_set_voice,
         speak=_classic_speak,
+        prefetch=_narration_prefetch,
+        prime=_narration_prime,
     )
 
     # ── Event handlers (simple — no participant role detection) ──

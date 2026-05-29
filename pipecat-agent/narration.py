@@ -44,6 +44,16 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 SpeakFn = Callable[[str], Awaitable[None]]
 SetVoiceFn = Callable[[str], Awaitable[None]]
+# Block 13 — narration cache callables, both optional.
+#  * PrefetchFn runs ONCE at the top of the per-scene narration loop
+#    with the full plan; implementation stashes any cacheable PCM bytes
+#    in a side-channel keyed on segment id.
+#  * PrimeFn runs per-segment immediately before ``speak`` (sync —
+#    no awaits between prime and the TTSSpeakFrame queue); returns
+#    True iff the segment will be played from cache, in which case the
+#    narrator skips the per-segment voice switch.
+PrefetchFn = Callable[[list["NarrationSegment"]], Awaitable[None]]
+PrimeFn = Callable[["NarrationSegment"], bool]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -58,10 +68,18 @@ class NarrationSegment:
     ``voice_id`` is the resolved Cartesia voice for the segment in the
     classic pipeline, or ``None`` in the relay pipeline (where SoulX
     handles its own voice and we never switch).
+
+    ``id`` and ``audio`` come from the Block 8 snapshot contract — when
+    present, they let :class:`services.cached_first_tts.CachedFirstTTSService`
+    replay pre-rendered PCM instead of synthesizing. Both are ``None``
+    for pre-Block-8 snapshots and for the relay pipeline (SoulX renders
+    speech itself, so the bytes wouldn't be useful).
     """
 
     text: str
     voice_id: str | None
+    id: str | None = None
+    audio: dict | None = None
 
 
 def plan_post_narration_followup(
@@ -187,13 +205,22 @@ def plan_narration_segments(
         text = (seg.get("text") or "").strip()
         if not text:
             continue
+        # Block 13 — propagate id + audio for the cache layer. Both stay
+        # None on pre-Block-8 snapshots and on relay (where SoulX renders
+        # speech itself, so cached PCM is moot).
+        seg_id = seg.get("id")
+        audio = seg.get("audio") if isinstance(seg.get("audio"), dict) else None
         if is_relay:
             # Relay pipeline narrates in the primary SoulX voice; the
             # per-segment voice clone is a v0.2 punt (CLAUDE.md S65).
-            plan.append(NarrationSegment(text=text, voice_id=None))
+            plan.append(
+                NarrationSegment(text=text, voice_id=None, id=seg_id, audio=None)
+            )
         else:
             voice = seg.get("voice_id") or primary_voice_id
-            plan.append(NarrationSegment(text=text, voice_id=voice))
+            plan.append(
+                NarrationSegment(text=text, voice_id=voice, id=seg_id, audio=audio)
+            )
     return plan
 
 
@@ -227,10 +254,17 @@ class SceneNarrator:
         primary_voice_id: str | None,
         set_voice: SetVoiceFn | None,
         speak: SpeakFn,
+        prefetch: PrefetchFn | None = None,
+        prime: PrimeFn | None = None,
     ):
         self._primary_voice_id = primary_voice_id
         self._set_voice = set_voice
         self._speak = speak
+        # Block 13 — narration cache. Both None ⇒ behaves exactly like
+        # the pre-cache narrator; the relay pipeline always passes None
+        # because SoulX renders speech itself.
+        self._prefetch = prefetch
+        self._prime = prime
         # Track what voice the TTS service is currently configured with so
         # we can short-circuit no-op switches (segment.voice_id ==
         # primary, which is the common "fallback" case from the backend's
@@ -300,9 +334,26 @@ class SceneNarrator:
             is_relay,
         )
 
+        # Block 13 — single batched prefetch BEFORE the loop. Failures
+        # downgrade to live: a logged warning + every segment misses
+        # cleanly. Placed after the empty-plan + already-narrated guards
+        # so we never fetch bytes for a scene we won't narrate.
+        if self._prefetch is not None:
+            try:
+                await self._prefetch(plan)
+            except Exception as exc:
+                logger.warning(
+                    "[NARRATION] prefetch failed; live fallback: {!r}", exc
+                )
+
         for idx, seg in enumerate(plan):
+            # Prime is sync — keeps zero awaits between the prime call
+            # and the TTSSpeakFrame queue so no other run_tts can sneak
+            # in and consume the primed segment.
+            is_hit = bool(self._prime(seg)) if self._prime is not None else False
             if (
-                self._set_voice is not None
+                not is_hit
+                and self._set_voice is not None
                 and seg.voice_id
                 and seg.voice_id != self._current_voice
             ):
@@ -315,10 +366,11 @@ class SceneNarrator:
                 await self._set_voice(seg.voice_id)
                 self._current_voice = seg.voice_id
             logger.info(
-                "[NARRATION] segment={} speak (voice={!r}, chars={})",
+                "[NARRATION] segment={} speak (voice={!r}, chars={}, hit={})",
                 idx,
                 self._current_voice,
                 len(seg.text),
+                is_hit,
             )
             await self._speak(seg.text)
 

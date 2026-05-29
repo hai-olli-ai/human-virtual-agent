@@ -27,6 +27,21 @@ DEFAULT_ROOM_ID = os.getenv("DEFAULT_ROOM_ID", "")
 CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121")
 # Default: "British Reading Lady" — will be customizable per avatar later
 
+# ──────────────────────────────────────────────────────────────────────
+# Narration audio cache (Block 1 — must equal the backend's renderer)
+# ──────────────────────────────────────────────────────────────────────
+# Cartesia returns 16-bit signed little-endian PCM regardless. These
+# three values gate cache compatibility: a pre-rendered segment is only
+# safe to replay if it was synthesized with the same model at the same
+# sample_rate and channel count the live service is configured for.
+# A mismatch would either (a) miss cleanly (safe — falls back to live)
+# or (b) play mangled audio if the cache claims a match but the PCM was
+# rendered against different settings. Keep these in lockstep with the
+# backend's narration renderer.
+NARRATION_TTS_MODEL_ID = os.getenv("NARRATION_TTS_MODEL_ID", "sonic-3")
+NARRATION_AUDIO_SAMPLE_RATE = int(os.getenv("NARRATION_AUDIO_SAMPLE_RATE", "24000"))
+NARRATION_AUDIO_NUM_CHANNELS = int(os.getenv("NARRATION_AUDIO_NUM_CHANNELS", "1"))
+
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
