@@ -108,6 +108,8 @@ from tools.quiz_generation import (
     GENERATE_QUIZ_SCHEMA,
     SessionContext,
     make_handle_generate_quiz,
+    request_quiz_ready,
+    run_quiz_generation,
 )
 # S65 G3+G4 — per-scene narration helper with per-segment voice switching,
 # post-narration invitation/cue branch, and the script_complete payload.
@@ -1149,6 +1151,134 @@ async def run_bot_classic(
         if not isinstance(message, dict):
             return
         msg_type = message.get("type")
+
+        # ── S65c Block 5 — manual visitor-action triggers ──
+        # Sit BEFORE the canvas.* dispatch as early-return branches: an
+        # inbound payload's `type` is the sole discriminator and we want
+        # zero risk of canvas.* fallthrough accidentally also matching a
+        # manual trigger (impossible with exact string match today, but
+        # the ordering documents intent for future maintainers).
+        if msg_type == "request_narrate":
+            # E2 — re-narrate the visitor's current scene on demand.
+            # Fetches a fresh snapshot so a click after navigation always
+            # targets the scene the visitor is actually looking at (the
+            # session-start ``scene_snapshot`` isn't refreshed across
+            # scene changes; the equivalent fetch lives in
+            # ``refresh_agent_for_current_scene`` and we mirror it here).
+            # ``force=True`` bypasses the once-per-entry guard from
+            # Block 4b. ``trigger="manual"`` propagates to the shell so
+            # ``script_complete`` doesn't queue an auto-advance on a
+            # visitor-initiated replay.
+            if not room_id:
+                logger.info("[REQUEST_NARRATE] skipped: no room_id")
+                return
+            from api_client import get_scene_snapshot
+            manual_snapshot = await get_scene_snapshot(room_id, api_url)
+            if not manual_snapshot:
+                logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
+                return
+            narration_gate.cancel_all("manual_replay")
+            spoke_script = False
+            try:
+                spoke_script = await run_scene_narration(
+                    manual_snapshot,
+                    narrator=narrator,
+                    speak_followup=_classic_speak,
+                    force=True,
+                )
+            except Exception as exc:
+                logger.warning("[REQUEST_NARRATE] narration failed: {!r}", exc)
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        manual_snapshot,
+                        spoke_script=spoke_script,
+                        trigger="manual",
+                    )
+                )
+            )
+            logger.info(
+                "[REQUEST_NARRATE] manual replay complete spoke_script={}",
+                spoke_script,
+            )
+            return
+
+        if msg_type == "request_quiz":
+            # E3 — if the agent hasn't fully initialized (no slug or no
+            # current scene_id yet), silently ignore the click. The
+            # frontend button is gated on agentJoined (Block 9) so this
+            # should be rare; the silent path keeps test fixtures simple
+            # by not emitting an error event for a not-ready agent.
+            # The gate is extracted to ``request_quiz_ready(...)`` so a
+            # unit test machine-verifies the predicate.
+            if not request_quiz_ready(session_context):
+                logger.info("[REQUEST_QUIZ] skipped: session_context not ready")
+                return
+            quiz_count = message.get("count", 3)
+            quiz_language = message.get("language") or "en"
+
+            async def _emit_quiz_state(state: str, err: str | None) -> None:
+                payload = {"type": "quiz_generation_state", "state": state}
+                if err:
+                    payload["error"] = err
+                await send_canvas_message(payload)
+
+            logger.info(
+                "[REQUEST_QUIZ] generating: count={} language={!r}",
+                quiz_count, quiz_language,
+            )
+            try:
+                result = await run_quiz_generation(
+                    backend_client=api_client,
+                    session_context=session_context,
+                    canvas_ctx=canvas_ctx,
+                    count=quiz_count,
+                    language=quiz_language,
+                    on_state=_emit_quiz_state,
+                )
+                logger.info(
+                    "[REQUEST_QUIZ] complete ok={} error={!r}",
+                    result.ok, result.error,
+                )
+                if result.ok:
+                    # Wake the LLM with the blob in context. The voice path
+                    # naturally gets this via Pipecat's function-call
+                    # aggregator (tool result ⇒ context); the button path
+                    # bypasses the LLM turn entirely, so without this the
+                    # quiz Page shows on screen but the agent has no idea
+                    # a quiz was activated — it can't narrate the first
+                    # question and can't answer "what's on the quiz?".
+                    # Mirrors the no-script greeting wake pattern below
+                    # (developer message + LLMRunFrame). On failure we
+                    # skip both — the visitor sees the error state and
+                    # the LLM stays in its prior context.
+                    context.add_message({
+                        "role": "developer",
+                        "content": (
+                            "A quiz has just been activated on the canvas by the visitor "
+                            "clicking the Quiz action button (not by your tool call). The "
+                            "quiz Page is already showing on screen. Here is the quiz blob "
+                            "you need to drive the session:\n\n"
+                            f"{json.dumps(result.blob)}\n\n"
+                            "Now read the first question aloud and wait for the visitor's "
+                            "answer, exactly as you would after calling "
+                            "generate_quiz_from_knowledge yourself. Use canvas_action "
+                            "verbs (submit_answer / skip_question) to record their answers "
+                            "and let the Quiz Page own the pacing."
+                        ),
+                    })
+                    await task.queue_frames([LLMRunFrame()])
+            except Exception as exc:
+                # run_quiz_generation already catches its own failures
+                # and emits ("error", msg); any escape past it means
+                # something on our orchestration side broke. Surface a
+                # generic state so the button can flip out of spinner.
+                logger.exception("[REQUEST_QUIZ] unexpected failure")
+                await _emit_quiz_state(
+                    "error", f"unexpected: {type(exc).__name__}: {str(exc)[:200]}"
+                )
+            return
+
         if msg_type == "canvas.register":
             logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
             canvas_manifest.set_manifest(message)
@@ -1809,6 +1939,114 @@ async def run_bot_relay(
         # so the canvas message types short-circuit cleanly.
         if isinstance(message, dict):
             msg_type = message.get("type")
+
+            # ── S65c Block 5 — manual visitor-action triggers ──
+            # See classic pipeline for full rationale. Relay-pipeline
+            # specifics: ``request_narrate`` uses ``_relay_speak`` and
+            # MUST close the open RELAY_TURN before emitting
+            # ``script_complete``, otherwise SoulX waits forever for
+            # TURN_END (S65 Bug #2 lesson, applied to manual replay).
+            # ``request_quiz`` is identical to classic — quiz generation
+            # doesn't touch the SoulX turn lifecycle.
+            if msg_type == "request_narrate":
+                if not room_id:
+                    logger.info("[REQUEST_NARRATE] skipped: no room_id")
+                    return
+                from api_client import get_scene_snapshot
+                manual_snapshot = await get_scene_snapshot(room_id, api_url)
+                if not manual_snapshot:
+                    logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
+                    return
+                spoke_script = False
+                try:
+                    spoke_script = await run_scene_narration(
+                        manual_snapshot,
+                        narrator=narrator,
+                        speak_followup=_relay_speak,
+                        force=True,
+                    )
+                except Exception as exc:
+                    logger.warning("[REQUEST_NARRATE] narration failed: {!r}", exc)
+                finally:
+                    await _relay_close_turn()
+                await output_transport.send_message(
+                    OutputTransportMessageFrame(
+                        message=build_script_complete_payload(
+                            manual_snapshot,
+                            spoke_script=spoke_script,
+                            trigger="manual",
+                        )
+                    )
+                )
+                logger.info(
+                    "[REQUEST_NARRATE] manual replay complete spoke_script={}",
+                    spoke_script,
+                )
+                return
+
+            if msg_type == "request_quiz":
+                # See classic pipeline for the E3 silent-ignore rationale.
+                if not request_quiz_ready(session_context):
+                    logger.info("[REQUEST_QUIZ] skipped: session_context not ready")
+                    return
+                quiz_count = message.get("count", 3)
+                quiz_language = message.get("language") or "en"
+
+                async def _emit_quiz_state(state: str, err: str | None) -> None:
+                    payload = {"type": "quiz_generation_state", "state": state}
+                    if err:
+                        payload["error"] = err
+                    await send_canvas_message(payload)
+
+                logger.info(
+                    "[REQUEST_QUIZ] generating: count={} language={!r}",
+                    quiz_count, quiz_language,
+                )
+                try:
+                    result = await run_quiz_generation(
+                        backend_client=api_client,
+                        session_context=session_context,
+                        canvas_ctx=canvas_ctx,
+                        count=quiz_count,
+                        language=quiz_language,
+                        on_state=_emit_quiz_state,
+                    )
+                    logger.info(
+                        "[REQUEST_QUIZ] complete ok={} error={!r}",
+                        result.ok, result.error,
+                    )
+                    if result.ok:
+                        # See classic pipeline for the LLM-wake rationale.
+                        # In the relay pipeline the LLM still drives the
+                        # text turn (SoulX renders the speech), so the same
+                        # context.add_message + LLMRunFrame pattern works
+                        # unchanged — no RELAY_TURN bookkeeping needed here
+                        # (the LLM's output text flows through the relay
+                        # forwarder downstream of the assistant aggregator).
+                        context.add_message({
+                            "role": "developer",
+                            "content": (
+                                "A quiz has just been activated on the canvas by the visitor "
+                                "clicking the Quiz action button (not by your tool call). The "
+                                "quiz Page is already showing on screen. Here is the quiz blob "
+                                "you need to drive the session:\n\n"
+                                f"{json.dumps(result.blob)}\n\n"
+                                "Now read the first question aloud and wait for the visitor's "
+                                "answer, exactly as you would after calling "
+                                "generate_quiz_from_knowledge yourself. Use canvas_action "
+                                "verbs (submit_answer / skip_question) to record their answers "
+                                "and let the Quiz Page own the pacing."
+                            ),
+                        })
+                        await task.queue_frames([LLMRunFrame()])
+                except Exception as exc:
+                    logger.exception("[REQUEST_QUIZ] unexpected failure")
+                    await _emit_quiz_state(
+                        "error",
+                        f"unexpected: {type(exc).__name__}: {str(exc)[:200]}",
+                    )
+                return
+
             if msg_type == "canvas.register":
                 logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
                 canvas_manifest.set_manifest(message)

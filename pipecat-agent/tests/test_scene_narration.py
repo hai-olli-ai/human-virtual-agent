@@ -430,26 +430,26 @@ def test_script_complete_payload_with_spoken_script():
     """sceneIndex sourced from flow_state.scene_index; hadScript reflects arg."""
     snapshot = _snap(scene_index=2, total_scenes=5)
     payload = build_script_complete_payload(snapshot, spoke_script=True)
-    assert payload == {"type": "script_complete", "sceneIndex": 2, "hadScript": True}
+    assert payload == {"type": "script_complete", "sceneIndex": 2, "hadScript": True, "trigger": "auto"}
 
 
 def test_script_complete_payload_with_no_script():
     snapshot = _snap(scene_index=0, total_scenes=1)
     payload = build_script_complete_payload(snapshot, spoke_script=False)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False}
+    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}
 
 
 def test_script_complete_payload_defaults_to_index_zero_for_no_snapshot():
     """Defensive: degraded session with no snapshot still produces a valid msg."""
     payload = build_script_complete_payload(None, spoke_script=False)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False}
+    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}
 
 
 def test_script_complete_payload_defaults_when_flow_state_missing():
     """Snapshot present but no flow_state block ⇒ sceneIndex defaults to 0."""
     snapshot = {"live_room": {}, "current_scene": {"scene_id": "s1"}}
     payload = build_script_complete_payload(snapshot, spoke_script=True)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": True}
+    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -552,7 +552,7 @@ def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
         ("speak", "hello world"),
         ("set_voice", "primary"),
         ("speak", "Let's keep going."),
-        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": True}),
+        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"}),
     ]
     # Explicit: the invitation_line MUST NOT appear in the speak history.
     spoken_texts = [evt[1] for evt in events if evt[0] == "speak"]
@@ -581,7 +581,7 @@ def test_scenario_script_complete_emitted_once_after_invitation_with_payload():
     assert events[-1] == send_events[0]
     assert events[-1] == (
         "send",
-        {"type": "script_complete", "sceneIndex": 1, "hadScript": True},
+        {"type": "script_complete", "sceneIndex": 1, "hadScript": True, "trigger": "auto"},
     )
 
     # The invitation was spoken BEFORE script_complete (find both, compare indices).
@@ -618,7 +618,7 @@ def test_scenario_no_script_scene_skips_narration_and_invitation_emits_payload()
     # scenes). Exactly one send for script_complete with
     # hadScript=False.
     assert events == [
-        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": False}),
+        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}),
     ]
 
 
@@ -672,8 +672,8 @@ def test_scenario_scene_change_rerruns_narration_with_new_scene_id():
     assert "moving on" in speaks
     assert "moving on again" in speaks
     assert sends == [
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": True},
-        {"type": "script_complete", "sceneIndex": 1, "hadScript": True},
+        {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"},
+        {"type": "script_complete", "sceneIndex": 1, "hadScript": True, "trigger": "auto"},
     ]
 
 
@@ -703,8 +703,8 @@ def test_scenario_scene_change_idempotency_skips_repeat_for_same_scene():
     sends = [evt[1] for evt in events if evt[0] == "send"]
     assert speaks.count("intro") == 1
     assert sends == [
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": True},
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": False},
+        {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"},
+        {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"},
     ]
 
 

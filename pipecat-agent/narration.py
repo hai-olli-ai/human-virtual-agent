@@ -147,6 +147,7 @@ def build_script_complete_payload(
     snapshot: dict | None,
     *,
     spoke_script: bool,
+    trigger: str = "auto",
 ) -> dict:
     """Build the ``script_complete`` Daily app-message payload (S65 G4).
 
@@ -156,6 +157,15 @@ def build_script_complete_payload(
     narrated something for the current scene. ``sceneIndex`` is the
     snapshot's ``flow_state.scene_index`` (0-based), defaulting to
     ``0`` for the degenerate no-snapshot case.
+
+    S65c Block 4 — ``trigger`` is ALWAYS present on the wire (default
+    ``"auto"``). The shell's auto-advance handler short-circuits when it
+    sees ``trigger=="manual"``, so a Script-button click on an
+    auto-advance room never queues a scene jump. Auto-path emits keep
+    the explicit ``trigger:"auto"`` for self-describing wire semantics —
+    the field rides along on every ``script_complete`` so future
+    additions (e.g. ``"keyboard_shortcut"``) don't require a wire
+    versioning bump.
     """
     snap = snapshot or {}
     flow_state = snap.get("flow_state") or {}
@@ -163,6 +173,7 @@ def build_script_complete_payload(
         "type": "script_complete",
         "sceneIndex": int(flow_state.get("scene_index", 0) or 0),
         "hadScript": bool(spoke_script),
+        "trigger": trigger,
     }
 
 
@@ -280,7 +291,7 @@ class SceneNarrator:
     def current_voice(self) -> str | None:
         return self._current_voice
 
-    async def narrate(self, snapshot: dict) -> bool:
+    async def narrate(self, snapshot: dict, *, force: bool = False) -> bool:
         """Narrate the snapshot's scripts.
 
         Returns ``True`` if at least one non-empty segment was spoken,
@@ -291,6 +302,13 @@ class SceneNarrator:
         so successive canvas.register messages within the same scene
         return ``False`` and the caller can no-op.
 
+        S65c Block 4 — ``force=True`` bypasses the once-per-entry guard.
+        The S65c Script button (manual replay via ``request_narrate``)
+        passes ``force=True`` so a visitor can re-narrate the same scene
+        on demand. The guard still SETS ``_narrated_scene_id`` after a
+        forced narrate so a subsequent unforced auto-trigger
+        (e.g. ``canvas.register``) still no-ops as designed.
+
         Snapshot shape: S65 (Option B) nests scene_id under
         ``current_scene.scene_id``.
         """
@@ -298,7 +316,11 @@ class SceneNarrator:
         scene_id = current_scene.get("scene_id")
         scene_id_str = str(scene_id) if scene_id else None
 
-        if scene_id_str is not None and scene_id_str == self._narrated_scene_id:
+        if (
+            not force
+            and scene_id_str is not None
+            and scene_id_str == self._narrated_scene_id
+        ):
             logger.info(
                 "[NARRATION] skip: scene_id={!r} already narrated this session",
                 scene_id_str,
@@ -403,6 +425,7 @@ async def run_scene_narration(
     *,
     narrator: SceneNarrator,
     speak_followup: SpeakFn,
+    force: bool = False,
 ) -> bool:
     """Compose narrate + post-narration follow-up into one call.
 
@@ -424,6 +447,13 @@ async def run_scene_narration(
     caller emit keeps that ordering owned by the caller, which is the
     one who knows about turn lifecycle.
 
+    S65c Block 4 — ``force`` is threaded through to
+    :meth:`SceneNarrator.narrate` so the S65c Script button can re-narrate
+    a scene the visitor already heard. ``trigger`` is NOT a parameter
+    here because the orchestrator doesn't emit; the manual handler in
+    ``bot.py`` constructs the ``script_complete`` payload with
+    ``build_script_complete_payload(..., trigger="manual")`` directly.
+
     Used by ``bot.py`` in four places: classic + relay
     ``on_client_connected`` (session-start narration), and classic +
     relay ``refresh_agent_for_current_scene`` (scene-change narration,
@@ -432,7 +462,7 @@ async def run_scene_narration(
     """
     spoke_script = False
     if snapshot:
-        spoke_script = await narrator.narrate(snapshot)
+        spoke_script = await narrator.narrate(snapshot, force=force)
     followup = plan_post_narration_followup(snapshot or {}, spoke_script=spoke_script)
     if followup:
         await speak_followup(followup)

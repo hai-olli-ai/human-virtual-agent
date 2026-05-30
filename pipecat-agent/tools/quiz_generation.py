@@ -37,6 +37,7 @@ The handler is factory-bound to:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -46,6 +47,40 @@ from tools.canvas_protocol_tools import (
     CanvasCommandError,
     dispatch_canvas_command,
 )
+
+
+# S65c Block 3 — ``on_state`` callable contract for ``run_quiz_generation``.
+# Two arguments so call sites pass an explicit ``None`` for error on the
+# non-error transitions ("generating", "ready") — slightly more verbose at
+# the call site, but the alternative (kwargs / variadic) would make Block 6's
+# Daily emitter harder to type-check.
+QuizStateFn = Callable[[str, Optional[str]], Awaitable[None]]
+
+
+def request_quiz_ready(session_context) -> bool:
+    """S65c Block 5+8 — production gate for the ``request_quiz`` handler.
+
+    Returns ``True`` iff the agent's ``SessionContext`` is sufficiently
+    populated to invoke :func:`run_quiz_generation` — slug AND
+    current_scene_id must both be non-empty. ``bot.py``'s
+    ``request_quiz`` branch uses this as an early-return guard per E3
+    (silently ignore manual quiz requests that arrive before the agent
+    has fully initialized — the wire sees zero events, the frontend
+    button stays in whatever pre-click state it was in, the visitor
+    can retry).
+
+    Extracted as a standalone helper so the gate's predicate is
+    machine-verified by ``test_request_quiz_ready_truth_table`` —
+    without this, the silent-ignore behavior would rely on code review
+    only. ``run_quiz_generation`` itself has a defense-in-depth check
+    against the same condition (it returns
+    ``QuizGenerationResult(ok=False, error="no active live-room
+    session")``), but the handler's pre-gate is what keeps the wire
+    silent in the silent-ignore case.
+    """
+    return bool(
+        session_context.get_slug() and session_context.get_current_scene_id()
+    )
 
 
 @dataclass
@@ -103,98 +138,178 @@ GENERATE_QUIZ_SCHEMA = FunctionSchema(
 )
 
 
+@dataclass
+class QuizGenerationResult:
+    """Outcome of one :func:`run_quiz_generation` invocation.
+
+    Used by two callers with different LLM/UX consequences:
+      * The LLM tool wrapper (``make_handle_generate_quiz``) returns
+        ``blob`` to the LLM on success and the ``{"ok": false, "error":
+        ...}`` sentinel on failure.
+      * The S65c manual ``request_quiz`` button (Block 5) ignores the
+        return shape and relies on ``on_state`` callbacks for UX state.
+
+    ``blob`` may be populated even when ``ok=False`` — specifically when
+    the backend produced a blob but the bundled set_page dispatch failed.
+    The LLM tool wrapper still surfaces the failure (otherwise the LLM
+    would narrate questions to a stale iframe), but the blob is retained
+    on the result so future callers (e.g. retry logic) can read it.
+    """
+
+    ok: bool
+    blob: Optional[dict] = None
+    error: Optional[str] = None
+
+
+async def run_quiz_generation(
+    *,
+    backend_client,
+    session_context,
+    canvas_ctx,
+    count: int = 3,
+    language: str = "en",
+    on_state: Optional[QuizStateFn] = None,
+) -> QuizGenerationResult:
+    """Generate the quiz blob and bundle the canvas.set_page dispatch.
+
+    Pure async core. Two callers wrap this:
+      1. :func:`make_handle_generate_quiz` — the LLM tool handler.
+      2. The S65c ``request_quiz`` inbound-message branch in ``bot.py``
+         (manual visitor click; emits ``quiz_generation_state`` via the
+         injected ``on_state`` hook).
+
+    Contract preserved from the pre-Block-3 ``make_handle_generate_quiz``:
+      * Backend ``generate_quiz`` invoked with POSITIONAL args
+        ``(slug, scene_id, count, language)`` — keeps the existing mocks
+        and any compatibility-leaning call-shape assertions intact.
+      * Defaults ``count=3``, ``language="en"`` — same as today.
+      * Missing slug or scene_id ⇒ ``ok=False`` with the literal
+        ``"no active live-room session"`` error string (LLM tool path
+        surfaces this verbatim).
+      * Backend exception ⇒ error string
+        ``"quiz generation failed: {ExcClass}: {str(exc)[:200]}"`` and
+        ``canvas.set_page`` is NOT dispatched (no blob to dispatch with).
+      * ``CanvasCommandError`` on set_page ⇒
+        ``"quiz page swap failed: {exc.code}: {exc.message[:200]}"``;
+        any other set_page exception ⇒
+        ``"quiz page swap failed: {ExcClass}: {str(exc)[:200]}"``.
+        Both paths keep ``blob`` on the result (creator-recoverable).
+      * ``canvas_ctx.send_app_message is None`` (tests / unwired) ⇒
+        skip dispatch silently and return ``ok=True`` with the blob.
+        The LLM still reads questions; only the iframe-swap is missing.
+
+    ``on_state`` (when supplied) fires:
+      * ``("generating", None)`` immediately after the session check
+        passes — so the button-driven UX can spinner before the backend
+        roundtrip starts.
+      * ``("ready", None)`` after the bundled set_page resolves (or after
+        the skip-dispatch fallback). Lines up with frontend's
+        "show the quiz Page is active" transition.
+      * ``("error", message)`` on each failure branch. The shell uses
+        this to flip the button back from spinner ⇒ error chip.
+
+    The LLM tool path passes ``on_state=None`` so no Daily app-messages
+    are emitted for tool-driven quizzes — they'd just race with the
+    LLM's own narration and add noise.
+    """
+    slug = session_context.get_slug()
+    scene_id = session_context.get_current_scene_id()
+    logger.info(
+        f"[GENERATE_QUIZ] called: count={count} language={language!r} "
+        f"slug={slug!r} scene_id={scene_id!r}"
+    )
+    if not slug or not scene_id:
+        msg = "no active live-room session"
+        if on_state is not None:
+            await on_state("error", msg)
+        return QuizGenerationResult(ok=False, error=msg)
+
+    if on_state is not None:
+        await on_state("generating", None)
+
+    # Step 1 — generate the blob from the backend.
+    try:
+        blob = await backend_client.generate_quiz(slug, scene_id, count, language)
+        logger.info(
+            "[GENERATE_QUIZ] generated quiz: questions={}",
+            len((blob or {}).get("questions", [])),
+        )
+    except Exception as exc:
+        logger.exception("generate_quiz tool call failed during generation")
+        msg = f"quiz generation failed: {type(exc).__name__}: {str(exc)[:200]}"
+        if on_state is not None:
+            await on_state("error", msg)
+        return QuizGenerationResult(ok=False, error=msg)
+
+    # Step 2 — bundled set_page so the quiz Page activates with the
+    # fresh blob in the same tool call. Without this, the LLM was
+    # asked to follow up with canvas_set_page(pageType='quiz',
+    # pageInit=<blob>) and routinely omitted pageInit — leading to
+    # the iframe staying on the previous quiz while the agent
+    # narrated the new questions. See S64e Option D.
+    if canvas_ctx is not None and getattr(canvas_ctx, "send_app_message", None):
+        try:
+            swap_result = await dispatch_canvas_command(
+                canvas_ctx,
+                "set_page",
+                {"pageType": "quiz", "pageInit": blob},
+            )
+            logger.info("[GENERATE_QUIZ] page swap complete: {!r}", swap_result)
+        except CanvasCommandError as exc:
+            logger.warning(
+                "[GENERATE_QUIZ] page swap failed code={!r} message={!r}",
+                exc.code, exc.message,
+            )
+            msg = f"quiz page swap failed: {exc.code}: {exc.message[:200]}"
+            if on_state is not None:
+                await on_state("error", msg)
+            return QuizGenerationResult(ok=False, blob=blob, error=msg)
+        except Exception as exc:
+            logger.exception("generate_quiz page swap failed unexpectedly")
+            msg = f"quiz page swap failed: {type(exc).__name__}: {str(exc)[:200]}"
+            if on_state is not None:
+                await on_state("error", msg)
+            return QuizGenerationResult(ok=False, blob=blob, error=msg)
+    else:
+        logger.info("[GENERATE_QUIZ] canvas dispatch not wired; skipping bundled set_page")
+
+    if on_state is not None:
+        await on_state("ready", None)
+    return QuizGenerationResult(ok=True, blob=blob)
+
+
 def make_handle_generate_quiz(backend_client, session_context, canvas_ctx):
-    """Factory that binds the handler to the active session's slug + scene id
-    and the canvas dispatch substrate.
+    """Factory that binds the LLM tool handler to the session's session.
 
-    ``backend_client`` must expose ``generate_quiz(slug, scene_id, count,
-    language)`` returning the QuizBlob dict (or raising). The production
-    binding passes the ``api_client`` module; tests pass a mock with the
-    same shape.
+    Thin wrapper around :func:`run_quiz_generation` (S65c Block 3). The
+    pre-refactor return-shape contract is preserved verbatim:
 
-    ``session_context`` must expose ``get_slug()`` and
-    ``get_current_scene_id()``. See ``SessionContext`` above.
+      * Success ⇒ ``params.result_callback(blob)`` — raw blob, not
+        wrapped.
+      * Failure ⇒ ``params.result_callback({"ok": False, "error": ...})``
+        — the LLM uses the string to apologise to the visitor.
 
-    ``canvas_ctx`` is the ``CanvasToolContext`` from bot.py — the same
-    one threaded into the 5 canvas tool handlers. Used to dispatch the
-    bundled set_page swap after the blob is generated. When
-    ``canvas_ctx.send_app_message`` is None (tests, or the rare case
-    where the canvas channel isn't wired), the dispatch step is skipped
-    and the blob is returned unchanged.
-
-    Returned errors are handed back as a tool result (``{"ok": false,
-    "error": "..."}``) rather than raised — same resilience pattern as
-    the canvas tools, so a single failed quiz call doesn't break the
-    conversation turn.
+    Tests live in ``tests/test_quiz_generation.py``; they snapshot the
+    pre-refactor behavior and act as the regression guard for this
+    refactor. ``on_state`` is held at ``None`` here so the LLM tool path
+    never emits Daily app-messages — those are S65c's manual-button
+    path concern (Block 5 + Block 6).
     """
     async def handle_generate_quiz(params: FunctionCallParams):
         args = params.arguments or {}
         count = args.get("count", 3)
         language = args.get("language", "en")
-        slug = session_context.get_slug()
-        scene_id = session_context.get_current_scene_id()
-        logger.info(
-            f"[GENERATE_QUIZ] called: count={count} language={language!r} "
-            f"slug={slug!r} scene_id={scene_id!r}"
+        result = await run_quiz_generation(
+            backend_client=backend_client,
+            session_context=session_context,
+            canvas_ctx=canvas_ctx,
+            count=count,
+            language=language,
+            on_state=None,
         )
-        if not slug or not scene_id:
-            await params.result_callback({
-                "ok": False,
-                "error": "no active live-room session",
-            })
+        if not result.ok:
+            await params.result_callback({"ok": False, "error": result.error})
             return
-
-        # Step 1 — generate the blob from the backend.
-        try:
-            blob = await backend_client.generate_quiz(slug, scene_id, count, language)
-            logger.info(
-                "[GENERATE_QUIZ] generated quiz: questions={}",
-                len((blob or {}).get("questions", [])),
-            )
-        except Exception as exc:
-            logger.exception("generate_quiz tool call failed during generation")
-            await params.result_callback({
-                "ok": False,
-                "error": f"quiz generation failed: {type(exc).__name__}: {str(exc)[:200]}",
-            })
-            return
-
-        # Step 2 — bundled set_page so the quiz Page activates with the
-        # fresh blob in the same tool call. Without this, the LLM was
-        # asked to follow up with canvas_set_page(pageType='quiz',
-        # pageInit=<blob>) and routinely omitted pageInit — leading to
-        # the iframe staying on the previous quiz while the agent
-        # narrated the new questions. See S64e Option D.
-        if canvas_ctx is not None and getattr(canvas_ctx, "send_app_message", None):
-            try:
-                swap_result = await dispatch_canvas_command(
-                    canvas_ctx,
-                    "set_page",
-                    {"pageType": "quiz", "pageInit": blob},
-                )
-                logger.info("[GENERATE_QUIZ] page swap complete: {!r}", swap_result)
-            except CanvasCommandError as exc:
-                logger.warning(
-                    "[GENERATE_QUIZ] page swap failed code={!r} message={!r}",
-                    exc.code, exc.message,
-                )
-                await params.result_callback({
-                    "ok": False,
-                    "error": f"quiz page swap failed: {exc.code}: {exc.message[:200]}",
-                })
-                return
-            except Exception as exc:
-                logger.exception("generate_quiz page swap failed unexpectedly")
-                await params.result_callback({
-                    "ok": False,
-                    "error": f"quiz page swap failed: {type(exc).__name__}: {str(exc)[:200]}",
-                })
-                return
-        else:
-            logger.info("[GENERATE_QUIZ] canvas dispatch not wired; skipping bundled set_page")
-
-        # Step 3 — return the blob. The LLM uses it to read the first
-        # question aloud; the iframe is already showing the same blob.
-        await params.result_callback(blob)
+        await params.result_callback(result.blob)
 
     return handle_generate_quiz
