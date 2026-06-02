@@ -26,7 +26,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -338,6 +338,13 @@ class CanvasToolContext:
     # aliases_out parameter.
     element_alias_map: dict[str, str] = field(default_factory=dict)
     command_timeout_s: float = 6.0
+    # S66 Block 5a — lazy vision frame. When wired, handle_analyze calls
+    # this before dispatching `analyze` so the LLM has a fresh scene
+    # image in context for the active scene. None ⇒ no-op (legacy eager
+    # behavior, where bot.py refreshes the vision frame on every scene
+    # change). bot.py constructs the closure that bridges this to
+    # vision_refresh.ensure_vision_frame_for_scene.
+    ensure_vision: Optional[Callable[[], Awaitable[None]]] = None
 
 
 def _validate_highlight_target(target: Any) -> Optional["CanvasCommandError"]:
@@ -473,6 +480,15 @@ def make_handlers(ctx: CanvasToolContext):
         args = params.arguments or {}
         question = args.get("question", "")
         logger.info(f"[CANVAS_ANALYZE] called: question={question!r}")
+        # S66 Block 5a — lazy vision frame. Fetch and add the current
+        # scene's image to context if it isn't already loaded. Failures
+        # are logged but don't fail the analyze call — the iframe's
+        # semantic state alone still answers most questions.
+        if ctx.ensure_vision is not None:
+            try:
+                await ctx.ensure_vision()
+            except Exception as exc:
+                logger.warning(f"[CANVAS_ANALYZE] ensure_vision failed: {exc!r}")
         try:
             result = await _dispatch("analyze", {"question": question, "options": args.get("options", {})})
             await params.result_callback(result)

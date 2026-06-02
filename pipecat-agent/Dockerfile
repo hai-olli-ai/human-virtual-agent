@@ -12,6 +12,11 @@ COPY api_client.py .
 COPY scene_context.py .
 # S65 G3 — per-scene narration helper with per-segment voice switching.
 COPY narration.py .
+# S66 Block 5a — lazy vision-frame tracker; Block 5b — per-session
+# FLOW-scope knowledge cache. Both are top-level modules imported by
+# bot.py + persona.py.
+COPY vision_refresh.py .
+COPY flow_knowledge_cache.py .
 
 # S64c — Canvas Protocol modules
 COPY tools tools

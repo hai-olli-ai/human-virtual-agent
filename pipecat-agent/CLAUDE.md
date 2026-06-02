@@ -1,7 +1,7 @@
 # pipecat-agent — CLAUDE.md
 
 > Voice agent for **Human Virtual** (hv.ai), built on the **Pipecat Framework**.
-> **Status:** S64c + S64d + S64e + **S65 + S65b** shipped. The classic TTS service is now a `CachedFirstTTSService` that composes `CartesiaTTSService` — on a cache hit it yields raw PCM in the *identical* `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires on playback-done; on a miss it delegates to live Cartesia. The S65 narrator prefetches cached segment bytes at scene entry and primes per-segment before each speak call. **S65c (Live Room Action Buttons) is next.**
+> **Status:** S64c + S64d + S64e + S65 + S65b + **S65c** shipped. The classic TTS service is a `CachedFirstTTSService` that composes `CartesiaTTSService` (cache hit → raw PCM in the identical `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires; miss → live Cartesia). **S65c** factored `generate_quiz_from_knowledge` into a plain `run_quiz_generation` coroutine reused by the LLM tool AND a new manual `request_quiz` trigger; added inbound `request_narrate` / `request_quiz` branches in `on_app_message` (alongside, not inside, the canvas dispatch); the narrator gained a `trigger='auto'|'manual'` arg + `force=True` (bypasses the once-per-entry guard) so the Script button can replay without auto-advancing. **S66 (Flow Scene-Switching Performance) is next.**
 > **Repo:** `pipecat-agent/` (alongside `human-virtual-backend/` and `human-virtual-frontend/`).
 
 ---
@@ -180,14 +180,16 @@ The agent generates short deterministic aliases per snapshot (`text_1`, `avatar_
 
 The agent's PLAYBOOK forbids the LLM from calling `canvas_set_page(pageType='quiz', …)` directly — quiz activation only via `generate_quiz_from_knowledge`. `skip_question` ("I don't know") is a separate action verb; `submit_answer` reply is `{ choice, correct, completed }`, `skip_question` reply is `{ skipped, correct: false, completed }`.
 
+**S65c factoring:** the quiz-generation *core* was extracted into a plain coroutine `run_quiz_generation(api_client, session_context, canvas_ctx, count, language, on_state)` in `tools/quiz_generation.py`. Two callers share it: the LLM tool handler (`make_handle_generate_quiz` wraps it and returns the blob as a tool result — **return shape unchanged from S64e**, guarded by `test_quiz_factor.py`) and the manual `request_quiz` button trigger (passes an `on_state` hook that emits `quiz_generation_state` Daily messages). The bundled `canvas.set_page(quiz, blob)` dispatch (Option D) lives inside the core, so both entry points behave identically.
+
 ---
 
 ## Live Room Narration (S65)
 
 S65 turns a scripted flow into a self-driving guided walk-through. `narration.py` owns the playback path:
 
-- **`narrate_scene_script(...)`** runs on scene entry (session start + after every `canvas.sceneChanged` refresh). Idempotent per scene entry — guarded against re-narrating on `canvas.register`-only prompt rebuilds.
-- **Classic pipeline:** for each segment in `current_scene.scripts[*]`, set the Cartesia voice to the segment's resolved `voice_id` (fallback to primary on `is_fallback`), speak via the TTS service, await TTS-stopped; reset to primary after the last segment; speak the localized `invitation_line` in the primary voice (suppressed on non-final auto-advance scenes per D8); emit `{type:'script_complete', sceneIndex, hadScript}`.
+- **`narrate_scene_script(...)`** runs on scene entry (session start + after every `canvas.sceneChanged` refresh). Idempotent per scene entry — guarded against re-narrating on `canvas.register`-only prompt rebuilds. **(S65c)** the entrypoint takes `force: bool = False` and `trigger: str = "auto"`; `force=True` bypasses the once-per-entry guard (used by the manual Script button so a replay always re-narrates), and `trigger` is passed through to the `script_complete` payload.
+- **Classic pipeline:** for each segment in `current_scene.scripts[*]`, set the Cartesia voice to the segment's resolved `voice_id` (fallback to primary on `is_fallback`), speak via the TTS service, await TTS-stopped; reset to primary after the last segment; speak the localized `invitation_line` in the primary voice (suppressed on non-final auto-advance scenes per D8); emit `{type:'script_complete', sceneIndex, hadScript, trigger}`.
 - **Relay pipeline:** forward script text via the `avatar-relay.v1` path (primary SoulX voice; per-script-avatar voice is a v0.2 punt per D4); emit the same `script_complete`.
 
 The SCRIPT prompt directive (above) keeps the LLM silent during narration.
@@ -196,7 +198,7 @@ The SCRIPT prompt directive (above) keeps the LLM silent during narration.
 
 ### Auto-advance signalling (D8)
 
-If `live_room.auto_advance && scene_index < total - 1`: optionally speak `transition_cue`, **skip** the invitation, emit `script_complete`. Else: speak `invitation_line`, emit `script_complete`. No-script scenes: neither branch (the existing conversational greeting stands; the shell knows `hadScript=false` and won't schedule an advance).
+If `live_room.auto_advance && scene_index < total - 1`: optionally speak `transition_cue`, **skip** the invitation, emit `script_complete`. Else: speak `invitation_line`, emit `script_complete`. No-script scenes: neither branch (the existing conversational greeting stands; the shell knows `hadScript=false` and won't schedule an advance). **(S65c)** entry narration emits `trigger:'auto'`; a manual Script-button replay emits `trigger:'manual'` and the shell ignores `'manual'` for auto-advance — so a replay never moves the flow.
 
 ### Tests
 
@@ -334,7 +336,8 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'canvas.command', commandId, tool, verb?, args}` — canvas tool dispatch.
 - `{type: 'transcript', speaker, text}` — STT or avatar text.
 - `{type: 'speaking_state', isSpeaking}`, `{type: 'llm_thinking', thinking}` — UI cues.
-- **`{type: 'script_complete', sceneIndex, hadScript}`** *(S65)* — emitted after the scene's scripts finish; the shell's auto-advance handler keys off this. *(S65c will add `trigger: 'auto' | 'manual'` to this payload.)*
+- **`{type: 'script_complete', sceneIndex, hadScript, trigger}`** *(S65; `trigger` added S65c)* — emitted after the scene's scripts finish; the shell's auto-advance handler advances only when `trigger === 'auto'`.
+- **`{type: 'quiz_generation_state', state, error?}`** *(S65c)* — `state ∈ {generating, ready, error}`. Emitted by the manual `request_quiz` path (via `run_quiz_generation`'s `on_state` hook) so the shell's Quiz button can show a spinner / error. The LLM-tool quiz path does **not** emit these (no button to update).
 - `{type: 'avatar_relay.*', …}` (relay pipeline only) — text/turn protocol for SoulX.
 
 **Incoming (frontend → agent):**
@@ -343,6 +346,10 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'canvas.stateChange', semanticState}` → cached in `CanvasManifestRegistry` for the next `analyze()`.
 - `{type: 'canvas.sceneChanged', sceneIndex}` → `refresh_agent_for_current_scene()`.
 - `{type: 'canvas.commandResult', commandId, result}` / `{type: 'canvas.commandError', commandId, error}` → complete the awaiting Future.
+- **`{type: 'request_narrate'}`** *(S65c)* → `narrate_scene_script(force=True, trigger='manual')` — re-narrates the current scene's script without auto-advancing.
+- **`{type: 'request_quiz', count?, language?}`** *(S65c)* → `run_quiz_generation(...)` with the `quiz_generation_state` emitter. Silently ignored if the agent isn't ready yet (no `session_context`).
+
+**S65c routing rule (important):** the two `request_*` branches are **early-return branches in `on_app_message`, alongside but BEFORE the `canvas.*` dispatch** — never inside the canvas/relay path. They're session-level requests, not canvas commands (mirrors the frontend keeping them out of `DailyRelay`). They piggyback on the existing defensive `json.loads` (below).
 
 Defensive JSON parsing in `on_app_message`: if Daily delivers the payload as a string (varies by SDK version), parse before the `isinstance(dict)` check. *(S64d hardening — still in place.)*
 
@@ -434,7 +441,33 @@ Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend'
 
 ---
 
-## Recent: S65b complete (`CachedFirstTTSService` + narrator prefetch/prime)
+## Recent: S65c complete (Live Room Action Buttons — manual triggers)
+
+S65c gave visitors three explicit controls (Script · Survey · Quiz) in the full-bleed shell. Agent-side, it factored the quiz core for reuse and added two inbound session-level triggers — without touching the canvas protocol or the relay.
+
+### What landed
+
+- **`run_quiz_generation(...)` core** (`tools/quiz_generation.py`) — the quiz-generation logic (backend `generate_quiz` call + bundled `canvas.set_page(quiz, blob)` dispatch) extracted into a plain coroutine with an optional `on_state(state, error)` hook. Two callers: the LLM tool handler (wraps it; **return shape unchanged** — `test_quiz_factor.py` snapshots before/after) and the manual `request_quiz` trigger (passes the `on_state` emitter).
+- **Inbound `{type:'request_narrate'}`** → `narrate_scene_script(force=True, trigger='manual')`. `force=True` bypasses the once-per-entry guard; `trigger='manual'` rides through to `script_complete` so the shell does **not** auto-advance on a replay.
+- **Inbound `{type:'request_quiz', count?, language?}`** → `run_quiz_generation(...)` with an `on_state` hook emitting `{type:'quiz_generation_state', state}`. Silently ignored when the agent isn't ready (`session_context` absent) — the S64d lazy-spawn lesson.
+- **Both `request_*` branches are early-return branches in `on_app_message`, alongside but BEFORE the canvas dispatch** — never inside the canvas/relay path (mirrors the frontend keeping these off `DailyRelay`).
+- **`script_complete` payload gained `trigger: 'auto' | 'manual'`** (default `'auto'` — back-compat with the S65 emit; one line in `narration.py`).
+- **Outbound `{type:'quiz_generation_state', state, error?}`** — only emitted by the manual path (the LLM-tool quiz has no button to update).
+
+### Tests
+
++6 across `test_request_narrate.py` (manual trigger → `force=True`, `trigger='manual'`, agent does NOT navigate), `test_request_quiz.py` (runs the core, emits `generating→ready`, emits `error` on backend failure, ignored when not ready), `test_quiz_factor.py` (**`test_llm_tool_return_shape_unchanged`** — the regression guard for the refactor; button + LLM paths produce the same blob shape), and `test_script_complete_trigger.py` (default `'auto'`, manual passes through, `force` bypasses the guard). Existing S64e quiz tests and S65 narration tests pass unchanged.
+
+### Lessons (READ BEFORE TOUCHING)
+
+1. **The factor must not change the LLM tool's return shape.** S64e's voice-initiated quiz ships today; a careless extraction breaks it silently. `test_llm_tool_return_shape_unchanged` is the guard — keep it.
+2. **`request_*` are session-level, not canvas commands.** They live alongside (before) the canvas dispatch in `on_app_message`, never inside it / never in the relay. Same single-responsibility discipline as the frontend's `DailyRelay`.
+3. **Manual narration never auto-advances.** The whole point of the `trigger` tag. The agent does no navigation either way (the shell owns advance) — `trigger` just tells the shell which `script_complete`s are advance-eligible.
+4. **`request_quiz` is silently ignored before readiness.** A button click that arrives before `session_context` is populated is dropped, not errored — the agent can't have joined-but-uninitialized produce a half-quiz.
+
+---
+
+## Historical: S65b complete (`CachedFirstTTSService` + narrator prefetch/prime)
 
 S65b shipped the agent-side cache consumer for the backend's pre-rendered narration audio. The full detail is in **"Cached narration audio (S65b)"** above. Summary:
 
@@ -481,17 +514,15 @@ Frontend shipped the YouTube Canvas Page; **Pipecat required zero changes.** Whe
 
 ---
 
-## Coming next — S65c (Live Room Action Buttons)
+## Coming next — S66 (Flow Scene-Switching Performance)
 
-Three capability-gated icon buttons in the full-bleed shell (Script · Survey · Quiz). Agent-side deliverables:
+A **benchmark-gated** performance session (Phase 9i) — instrument first, optimize the measured bottleneck, re-measure. **No Canvas Protocol contract change.** Agent-side cuts (Block 5):
 
-- **Factor `generate_quiz_from_knowledge` core into a plain callable** (`run_quiz_generation(...)`) shared by the existing LLM tool and a new manual `request_quiz` trigger. The LLM tool wraps the core — its return shape must not change (a regression there breaks the shipped S64e voice-quiz path).
-- **Inbound `{type:'request_narrate'}` handler** in `on_app_message`: calls `narrate_scene_script(force=True, trigger='manual')`. The `force=True` bypasses the once-per-entry guard so manual replay always works; `trigger='manual'` propagates to the `script_complete` payload so the shell's auto-advance handler ignores it.
-- **Inbound `{type:'request_quiz'}` handler**: runs `run_quiz_generation(...)` with an `on_state` hook that emits `{type:'quiz_generation_state', state:'generating'|'ready'|'error'}` so the frontend button can spinner. Silently ignored if the agent isn't ready (S64d lazy-spawn lesson).
-- **Add `trigger: 'auto' | 'manual'` to `script_complete`** (default `'auto'` for back-compat with the existing S65 emit). Single line in `narration.py`'s `send_app_message` call.
-- **Tests:** +5–7 in `test_request_narrate.py` / `test_request_quiz.py` / `test_quiz_factor.py` / `test_script_complete_trigger.py`. The factor regression test (`test_llm_tool_return_shape_unchanged`) is the most important — it snapshots `make_handle_generate_quiz`'s return shape before vs. after the refactor.
+- **5a — Lazy vision frame** (`VISION_REFRESH_MODE=lazy|eager`, default `lazy`): stop rendering the Pillow PNG on every scene change; fetch `/scene-snapshot/image` only on a visual question / first `canvas_analyze` of a scene. Likely the biggest agent-side `T_agent` win (removes a backend image-render from the hot path).
+- **5b — Reuse cached flow-knowledge** across scene changes: refresh only the per-scene bits (instruction, elements, aliases, link, scripts); keep the flow-knowledge block (S66 backend caches it; the agent can hold it in-session keyed by knowledge version and skip re-stitching).
+- **5c — Fetch by `scene_id`** from the new cursor-independent endpoint: `canvas.sceneChanged` carries `sceneId`; the agent fetches by id (no cursor race), keeping the cursor-based fetch as fallback. (Payload-piggyback of the whole snapshot is a deferrable option-b.)
 
-After S65c: **S66 (Flow Scene-Switching Performance)** — agent-side cuts are **lazy vision frame refresh** (`VISION_REFRESH_MODE=lazy|eager`, default lazy), **reuse cached flow-knowledge** across scene changes, and **snapshot-by-scene-id** (cursor-independent endpoint from S66 backend) or accept a snapshot pushed on `canvas.sceneChanged`. No Canvas Protocol contract change.
+Tests: `VISION_REFRESH_MODE=lazy` → no image fetch on scene change; on-demand vision fetch caches per scene; flow-knowledge reuse vs re-stitch by version; `sceneId` → by-id fetch with cursor fallback. After S66, **Phase 9i closes** and S67 (knowledge-aware Generate Scene) is next.
 
 ---
 

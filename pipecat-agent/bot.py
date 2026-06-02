@@ -21,6 +21,7 @@ Production: Deployed to Pipecat Cloud with DailyTransport
 import asyncio
 import json
 import os
+import time
 import uuid
 
 import httpx
@@ -85,6 +86,7 @@ from config import (
     NARRATION_TTS_MODEL_ID,
     NARRATION_AUDIO_SAMPLE_RATE,
     NARRATION_AUDIO_NUM_CHANNELS,
+    VISION_REFRESH_MODE,
     resolve_deepgram_language,
 )
 from persona import build_system_prompt
@@ -127,6 +129,14 @@ from narration import (
 # closures (~run_bot_classic) populate and consume the cache; on a miss
 # the service falls through to live Cartesia synthesis.
 from services.cached_first_tts import CachedFirstTTSService, CachedSegment
+# S66 Block 5a — lazy vision-frame tracker. Owns "which scene_id's vision
+# is currently in context"; the canvas_analyze handler calls ensure() to
+# fetch+inject on demand instead of every scene change.
+from vision_refresh import VisionFrameTracker, ensure_vision_frame_for_scene
+# S66 Block 5b — per-session memoisation of the FLOW-scope knowledge
+# block. Constructed once per pipeline; threaded through build_system_prompt
+# on session start and every scene-change refresh.
+from flow_knowledge_cache import FlowKnowledgeCache
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -691,12 +701,18 @@ async def run_bot_classic(
     # post_scene_change clears + repopulates it on every scene nav so
     # the tool handlers always see the current scene's aliases.
     element_alias_map: dict[str, str] = {}
+    # S66 Block 5b — single per-session FlowKnowledgeCache. Reused on
+    # every build_system_prompt call (session start + each scene-change
+    # refresh) so the FLOW block is rendered once per knowledge content
+    # hash. SCENE-scope is always rebuilt (varies per navigation).
+    flow_knowledge_cache = FlowKnowledgeCache()
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
         scene_id=scene_id,
         api_url=api_url,
         aliases_out=element_alias_map,
+        flow_cache=flow_knowledge_cache,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
@@ -785,6 +801,15 @@ async def run_bot_classic(
         session_context.get_current_scene_id(),
     )
 
+    # S66 Block 5a — lazy vision-frame tracker. Marks the initial scene
+    # as loaded so the first canvas_analyze doesn't fire a redundant
+    # re-fetch when scene_image_b64 succeeded above. The closure
+    # _ensure_vision_for_active_scene is wired into canvas_ctx after the
+    # LLMContext is constructed (Python looks up `context` at call time).
+    vision_tracker = VisionFrameTracker()
+    if scene_image_b64 and initial_scene_id:
+        vision_tracker.mark_loaded(str(initial_scene_id))
+
     # S64d — persona.build_system_prompt doesn't include the CANVAS PAGE
     # section (the migration to prompt_builder.build_system_prompt_split was
     # planned but never landed). Append it here so the LLM knows what verbs
@@ -870,6 +895,33 @@ async def run_bot_classic(
         tools=canvas_tools,
     )
 
+    # S66 Block 5a — bridge vision_tracker + per-session state to the
+    # canvas_analyze handler. The closure captures `context` (LLMContext),
+    # `vision_tracker`, and `session_context` so it can fetch the current
+    # scene's image and add it to context on demand. No-op when the
+    # tracker already covers the active scene (cache hit).
+    async def _ensure_vision_for_active_scene() -> None:
+        if not room_id:
+            return
+        current_scene_id = session_context.get_current_scene_id()
+
+        async def _fetch_image() -> str | None:
+            from api_client import get_scene_image_base64
+            return await get_scene_image_base64(room_id, api_url)
+
+        def _add_message(img: str) -> None:
+            from scene_context import build_vision_message
+            context.add_message(build_vision_message(img))
+
+        await ensure_vision_frame_for_scene(
+            tracker=vision_tracker,
+            current_scene_id=current_scene_id,
+            fetch_image_base64=_fetch_image,
+            add_vision_message=_add_message,
+        )
+
+    canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
+
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
     # visitor-initiated scene navigation. The frontend's navigateToIndex
@@ -886,15 +938,40 @@ async def run_bot_classic(
     # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
     # in place so the next canvas_highlight / canvas_action resolves
     # aliases against the new scene's elements.
-    async def refresh_agent_for_current_scene() -> None:
+    async def refresh_agent_for_current_scene(
+        target_scene_id: str | None = None,
+    ) -> None:
+        # S66 Block 5c — ``target_scene_id`` is the scene_id forwarded
+        # from canvas.sceneChanged. When present, every snapshot fetch
+        # in this closure targets THAT scene by id rather than relying
+        # on the room's cursor — eliminates the cursor race where
+        # canvas.sceneChanged arrives before the backend's cursor
+        # commits. None preserves pre-5c cursor-based behavior.
         if not room_id:
             logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
             return
 
+        # S66 Block 0 — perf instrumentation. T_agent = entry → prompt
+        # reassigned (the gate metric per the S66 plan). vision is logged
+        # separately since vision is eager today but will become lazy in
+        # Block 5a — the log shape stays stable so before/after deltas
+        # are directly comparable.
+        t0 = time.monotonic()
+
         nonlocal base_system_prompt
+        # S66 Block 5c — only the broadcast scene_id drives the by-id
+        # snapshot fetch. The body's ``scene_id`` is a Pipecat
+        # runner-args hint that can be stale for flow rooms (the room
+        # cursor moves; the body doesn't), so it stays Strategy-2-only
+        # via the legacy ``scene_id=`` kwarg below — it is NOT forwarded
+        # to the snapshot fetch. When the broadcast lacks sceneId
+        # (target_scene_id is None) we fall through to a cursor-based
+        # fetch, which is also correct.
         new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
+            flow_cache=flow_knowledge_cache,
+            snapshot_scene_id=target_scene_id or None,
         )
         # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
         # the section is dropped on every navigation and the LLM loses its
@@ -907,6 +984,7 @@ async def run_bot_classic(
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
         except Exception:
             logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+        t_prompt = time.monotonic()
 
         # S64e — refresh session_context.current_scene_id from the
         # post-nav snapshot so generate_quiz_from_knowledge targets the
@@ -916,7 +994,11 @@ async def run_bot_classic(
         # through every prompt-builder caller.
         # S65 (Option B) — scene_id nested under current_scene.
         from api_client import get_scene_snapshot, get_scene_image_base64
-        fresh_snapshot = await get_scene_snapshot(room_id, api_url)
+        # S66 Block 5c — second fetch also takes the broadcast scene_id
+        # so both refresh paths agree on which scene is "current".
+        fresh_snapshot = await get_scene_snapshot(
+            room_id, api_url, scene_id=target_scene_id or None
+        )
         fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
         if fresh_snapshot and fresh_cs.get("scene_id"):
             new_scene_id = str(fresh_cs["scene_id"])
@@ -928,13 +1010,42 @@ async def run_bot_classic(
                 )
             session_context.set_scene(new_scene_id)
 
-        new_image = await get_scene_image_base64(room_id, api_url)
-        if new_image:
-            from scene_context import build_vision_message
-            context.add_message(build_vision_message(new_image))
-            logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+        # S66 Block 5a — vision-frame refresh policy. Lazy (default)
+        # invalidates the tracker so the next canvas_analyze refetches;
+        # eager preserves pre-5a behavior (fetch + add to context here).
+        # The session-start fetch is unconditional and lives outside this
+        # closure — only the per-scene-change refetch is gated.
+        if VISION_REFRESH_MODE == "eager":
+            new_image = await get_scene_image_base64(room_id, api_url)
+            if new_image:
+                from scene_context import build_vision_message
+                context.add_message(build_vision_message(new_image))
+                vision_tracker.mark_loaded(session_context.get_current_scene_id())
+                logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+            else:
+                logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
         else:
-            logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+            vision_tracker.invalidate()
+            logger.info(
+                "[CANVAS SCENECHANGED] vision-refresh mode=lazy — scene image will be fetched on next canvas_analyze"
+            )
+
+        # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.
+        # In lazy mode (Block 5a) the "vision" half measures the invalidate
+        # tick (sub-ms) rather than a backend round-trip — the win shows
+        # up as a smaller T_agent on subsequent scene changes.
+        # pipeline=classic distinguishes this from the run_bot_relay
+        # closure's [perf-refresh] line.
+        # Block 5b: flow_cache.hits/misses report whether the FLOW-scope
+        # render hit the per-session cache for this refresh.
+        logger.info(
+            "[perf-refresh] pipeline=classic T_agent={}ms vision={}ms mode={} flow_cache(hits={},misses={})",
+            int((t_prompt - t0) * 1000),
+            int((time.monotonic() - t_prompt) * 1000),
+            VISION_REFRESH_MODE,
+            flow_knowledge_cache.hits,
+            flow_knowledge_cache.misses,
+        )
 
         # ── S65 Bug #2 — narrate the new scene + emit script_complete ──
         # The shell's auto-advance keys off script_complete; if the agent
@@ -1307,8 +1418,13 @@ async def run_bot_classic(
             # for voice nav) are processed by the loop, keeping the prompt
             # fresh by the time the LLM speaks its tool result.
             scene_index = message.get("sceneIndex")
-            logger.info(f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r}")
-            await refresh_agent_for_current_scene()
+            scene_id_from_msg = message.get("sceneId")  # S66 Block 5c
+            logger.info(
+                f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r} sceneId={scene_id_from_msg!r}"
+            )
+            await refresh_agent_for_current_scene(
+                target_scene_id=scene_id_from_msg or None
+            )
         elif msg_type == "canvas.commandResult":
             cid = message.get("commandId")
             logger.info(f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}")
@@ -1406,12 +1522,15 @@ async def run_bot_relay(
     # post_scene_change clears + repopulates it on every scene nav so
     # the tool handlers always see the current scene's aliases.
     element_alias_map: dict[str, str] = {}
+    # S66 Block 5b — see run_bot_classic. One cache per session.
+    flow_knowledge_cache = FlowKnowledgeCache()
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
         scene_id=scene_id,
         api_url=api_url,
         aliases_out=element_alias_map,
+        flow_cache=flow_knowledge_cache,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
 
@@ -1485,6 +1604,12 @@ async def run_bot_relay(
         session_context.get_current_scene_id(),
     )
 
+    # S66 Block 5a — see run_bot_classic for rationale. Mirror tracker
+    # init so lazy mode invalidates on scene change here too.
+    vision_tracker = VisionFrameTracker()
+    if scene_image_b64 and initial_scene_id:
+        vision_tracker.mark_loaded(str(initial_scene_id))
+
     # S64d — see run_bot_classic for rationale. Append CANVAS PAGE section
     # to system_prompt so the LLM knows the active Page's verbs; on
     # canvas.register, rebuild via base_system_prompt + new section.
@@ -1546,6 +1671,29 @@ async def run_bot_relay(
         tools=canvas_tools,
     )
 
+    # S66 Block 5a — mirror run_bot_classic. See there for rationale.
+    async def _ensure_vision_for_active_scene() -> None:
+        if not room_id:
+            return
+        current_scene_id = session_context.get_current_scene_id()
+
+        async def _fetch_image() -> str | None:
+            from api_client import get_scene_image_base64
+            return await get_scene_image_base64(room_id, api_url)
+
+        def _add_message(img: str) -> None:
+            from scene_context import build_vision_message
+            context.add_message(build_vision_message(img))
+
+        await ensure_vision_frame_for_scene(
+            tracker=vision_tracker,
+            current_scene_id=current_scene_id,
+            fetch_image_base64=_fetch_image,
+            add_vision_message=_add_message,
+        )
+
+    canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
+
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
     # visitor-initiated scene navigation. The frontend's navigateToIndex
@@ -1562,15 +1710,40 @@ async def run_bot_relay(
     # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
     # in place so the next canvas_highlight / canvas_action resolves
     # aliases against the new scene's elements.
-    async def refresh_agent_for_current_scene() -> None:
+    async def refresh_agent_for_current_scene(
+        target_scene_id: str | None = None,
+    ) -> None:
+        # S66 Block 5c — ``target_scene_id`` is the scene_id forwarded
+        # from canvas.sceneChanged. When present, every snapshot fetch
+        # in this closure targets THAT scene by id rather than relying
+        # on the room's cursor — eliminates the cursor race where
+        # canvas.sceneChanged arrives before the backend's cursor
+        # commits. None preserves pre-5c cursor-based behavior.
         if not room_id:
             logger.warning("[CANVAS SCENECHANGED] refresh skipped: no room_id")
             return
 
+        # S66 Block 0 — perf instrumentation. T_agent = entry → prompt
+        # reassigned (the gate metric per the S66 plan). vision is logged
+        # separately since vision is eager today but will become lazy in
+        # Block 5a — the log shape stays stable so before/after deltas
+        # are directly comparable.
+        t0 = time.monotonic()
+
         nonlocal base_system_prompt
+        # S66 Block 5c — only the broadcast scene_id drives the by-id
+        # snapshot fetch. The body's ``scene_id`` is a Pipecat
+        # runner-args hint that can be stale for flow rooms (the room
+        # cursor moves; the body doesn't), so it stays Strategy-2-only
+        # via the legacy ``scene_id=`` kwarg below — it is NOT forwarded
+        # to the snapshot fetch. When the broadcast lacks sceneId
+        # (target_scene_id is None) we fall through to a cursor-based
+        # fetch, which is also correct.
         new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
+            flow_cache=flow_knowledge_cache,
+            snapshot_scene_id=target_scene_id or None,
         )
         # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
         # the section is dropped on every navigation and the LLM loses its
@@ -1583,6 +1756,7 @@ async def run_bot_relay(
             logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
         except Exception:
             logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+        t_prompt = time.monotonic()
 
         # S64e — refresh session_context.current_scene_id from the
         # post-nav snapshot so generate_quiz_from_knowledge targets the
@@ -1592,7 +1766,11 @@ async def run_bot_relay(
         # through every prompt-builder caller.
         # S65 (Option B) — scene_id nested under current_scene.
         from api_client import get_scene_snapshot, get_scene_image_base64
-        fresh_snapshot = await get_scene_snapshot(room_id, api_url)
+        # S66 Block 5c — second fetch also takes the broadcast scene_id
+        # so both refresh paths agree on which scene is "current".
+        fresh_snapshot = await get_scene_snapshot(
+            room_id, api_url, scene_id=target_scene_id or None
+        )
         fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
         if fresh_snapshot and fresh_cs.get("scene_id"):
             new_scene_id = str(fresh_cs["scene_id"])
@@ -1604,13 +1782,34 @@ async def run_bot_relay(
                 )
             session_context.set_scene(new_scene_id)
 
-        new_image = await get_scene_image_base64(room_id, api_url)
-        if new_image:
-            from scene_context import build_vision_message
-            context.add_message(build_vision_message(new_image))
-            logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+        # S66 Block 5a — see run_bot_classic for rationale.
+        if VISION_REFRESH_MODE == "eager":
+            new_image = await get_scene_image_base64(room_id, api_url)
+            if new_image:
+                from scene_context import build_vision_message
+                context.add_message(build_vision_message(new_image))
+                vision_tracker.mark_loaded(session_context.get_current_scene_id())
+                logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+            else:
+                logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
         else:
-            logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+            vision_tracker.invalidate()
+            logger.info(
+                "[CANVAS SCENECHANGED] vision-refresh mode=lazy — scene image will be fetched on next canvas_analyze"
+            )
+
+        # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.
+        # In lazy mode (Block 5a) "vision" measures the invalidate tick.
+        # pipeline=relay distinguishes this from the run_bot_classic
+        # closure's [perf-refresh] line.
+        logger.info(
+            "[perf-refresh] pipeline=relay T_agent={}ms vision={}ms mode={} flow_cache(hits={},misses={})",
+            int((t_prompt - t0) * 1000),
+            int((time.monotonic() - t_prompt) * 1000),
+            VISION_REFRESH_MODE,
+            flow_knowledge_cache.hits,
+            flow_knowledge_cache.misses,
+        )
 
         # ── S65 Bug #2 — narrate the new scene + emit script_complete ──
         # The shell's auto-advance keys off script_complete; if the agent
@@ -2071,8 +2270,13 @@ async def run_bot_relay(
                 # visitor-initiated nav; awaited inline so the refresh
                 # finishes before canvas.commandResult is processed.
                 scene_index = message.get("sceneIndex")
-                logger.info(f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r}")
-                await refresh_agent_for_current_scene()
+                scene_id_from_msg = message.get("sceneId")  # S66 Block 5c
+                logger.info(
+                    f"[CANVAS SCENECHANGED] sceneIndex={scene_index!r} sceneId={scene_id_from_msg!r}"
+                )
+                await refresh_agent_for_current_scene(
+                    target_scene_id=scene_id_from_msg or None
+                )
                 return
             if msg_type == "canvas.commandResult":
                 cid = message.get("commandId")

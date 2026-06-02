@@ -42,6 +42,25 @@ NARRATION_TTS_MODEL_ID = os.getenv("NARRATION_TTS_MODEL_ID", "sonic-3")
 NARRATION_AUDIO_SAMPLE_RATE = int(os.getenv("NARRATION_AUDIO_SAMPLE_RATE", "24000"))
 NARRATION_AUDIO_NUM_CHANNELS = int(os.getenv("NARRATION_AUDIO_NUM_CHANNELS", "1"))
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Vision-frame refresh policy (S66 Block 5a)
+# ──────────────────────────────────────────────────────────────────────
+# Pre-5a, every scene change re-fetched the Pillow-rendered scene image
+# (a backend round-trip in the hot path of every navigation). Lazy mode
+# (default) skips the per-scene fetch and defers it to the first
+# canvas_analyze of the scene — the session-start bootstrap fetch is
+# unchanged. Set to "eager" to restore the pre-5a behavior if a quality
+# regression surfaces.
+VISION_REFRESH_MODE = os.getenv("VISION_REFRESH_MODE", "lazy").strip().lower()
+
+_VALID_VISION_REFRESH_MODES = {"lazy", "eager"}
+if VISION_REFRESH_MODE not in _VALID_VISION_REFRESH_MODES:
+    raise ValueError(
+        f"VISION_REFRESH_MODE must be one of {sorted(_VALID_VISION_REFRESH_MODES)}, "
+        f"got '{VISION_REFRESH_MODE}'"
+    )
+
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")

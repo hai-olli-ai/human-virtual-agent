@@ -91,7 +91,11 @@ async def get_persona_prompt(room_id: str, api_url: str | None = None) -> str | 
         return None
 
 
-async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict | None:
+async def get_scene_snapshot(
+    room_id: str,
+    api_url: str | None = None,
+    scene_id: str | None = None,
+) -> dict | None:
     """Fetch the current scene snapshot for a live room.
 
     Uses GET /live-rooms/{room_id}/scene-snapshot (no auth).
@@ -103,13 +107,26 @@ async def get_scene_snapshot(room_id: str, api_url: str | None = None) -> dict |
     the flow level. This keeps the agent's flow-knowledge prompt
     block stable across scene navigations and lets the agent answer
     from any scene's knowledge regardless of which scene is current.
+
+    S66 Block 5c — when ``scene_id`` is provided, it's passed as
+    ``?scene_id=…`` so the backend (once Block 1 lands) returns the
+    snapshot for THAT scene specifically rather than the room's
+    cursor-current scene. This eliminates the cursor race on
+    canvas.sceneChanged. If the backend doesn't yet honor the param,
+    the response falls back to cursor-based snapshot — which is the
+    correct scene anyway because the cursor was advanced by
+    navigateToIndex BEFORE the broadcast. Graceful degradation by
+    construction; no error path required.
     """
     base_url = api_url or HV_API_URL
+    params: dict[str, str] = {"include_all_scene_knowledge": "true"}
+    if scene_id:
+        params["scene_id"] = scene_id
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{base_url}/live-rooms/{room_id}/scene-snapshot",
-                params={"include_all_scene_knowledge": "true"},
+                params=params,
             )
             response.raise_for_status()
             data = response.json()

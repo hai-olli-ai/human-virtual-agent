@@ -186,8 +186,44 @@ def _format_scope(scope_data: dict[str, Any] | None, scope_label: str) -> str:
     return f"\n# {scope_label} KNOWLEDGE\n\n" + "\n\n---\n\n".join(parts)
 
 
+def build_flow_knowledge_section(knowledge: dict[str, Any] | None) -> str:
+    """Format the FLOW-scope knowledge into its system-prompt section.
+
+    Split out of :func:`build_knowledge_context` for S66 Block 5b so the
+    FLOW section — stable across scene navigations within a session —
+    can be memoised by ``FlowKnowledgeCache``. Returns "" when no flow
+    knowledge is present.
+    """
+    if not knowledge:
+        return ""
+    flow_scope = knowledge.get("flow")
+    if not flow_scope:
+        return ""
+    return _format_scope(flow_scope, "FLOW")
+
+
+def build_scene_knowledge_section(knowledge: dict[str, Any] | None) -> str:
+    """Format the SCENE-scope knowledge into its system-prompt section.
+
+    Counterpart of :func:`build_flow_knowledge_section` (S66 Block 5b).
+    Re-stitched per scene change — the SCENE block varies by navigation
+    so it's intentionally NOT cached.
+    """
+    if not knowledge:
+        return ""
+    scene_scope = knowledge.get("scene")
+    if not scene_scope:
+        return ""
+    return _format_scope(scene_scope, "SCENE")
+
+
 def build_knowledge_context(knowledge: dict[str, Any] | None) -> str:
     """Format the snapshot's knowledge dict into a system-prompt section.
+
+    Façade over :func:`build_flow_knowledge_section` +
+    :func:`build_scene_knowledge_section` (S66 Block 5b). Callers that
+    don't need cache integration keep using this; ``persona.py``'s
+    runtime path uses the split helpers via ``FlowKnowledgeCache``.
 
     Args:
       knowledge: The `knowledge` object from scene-snapshot, or None.
@@ -205,26 +241,10 @@ def build_knowledge_context(knowledge: dict[str, Any] | None) -> str:
       section second (more specific). Empty string when no usable knowledge
       is present. Never raises — defensive against missing keys.
     """
-    if not knowledge:
-        return ""
-
-    sections: list[str] = []
-
-    # FLOW first — broader, applies across scenes
-    flow_scope = knowledge.get("flow")
-    if flow_scope:
-        flow_str = _format_scope(flow_scope, "FLOW")
-        if flow_str:
-            sections.append(flow_str)
-
-    # SCENE second — specific to this scene
-    scene_scope = knowledge.get("scene")
-    if scene_scope:
-        scene_str = _format_scope(scene_scope, "SCENE")
-        if scene_str:
-            sections.append(scene_str)
-
-    return "\n\n".join(sections)
+    flow_section = build_flow_knowledge_section(knowledge)
+    scene_section = build_scene_knowledge_section(knowledge)
+    parts = [s for s in (flow_section, scene_section) if s]
+    return "\n\n".join(parts)
 
 
 VISION_MESSAGE = "This is the current scene canvas that the visitor is seeing. The canvas is 1280x720 pixels (origin top-left). Remember the layout, colors, positions, and content of all elements. When discussing the scene, reference what you see in this image. When using canvas action tools (highlight, arrow, annotation), estimate pixel coordinates from this image."

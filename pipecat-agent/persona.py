@@ -11,16 +11,18 @@ from api_client import (
     get_scene,
     get_scene_snapshot,
 )
+from flow_knowledge_cache import FlowKnowledgeCache
 from scene_context import (
     KNOWLEDGE_PREAMBLE,
     build_canvas_tools_section,
+    build_flow_knowledge_section,
     build_instruction_section,
-    build_knowledge_context,
     build_language_directive,
     build_language_reminder,
     build_link_narration_directive,
     build_recipient_context,
     build_scene_description,
+    build_scene_knowledge_section,
     build_scripts_section,
     compute_element_aliases,
 )
@@ -36,17 +38,33 @@ You are a friendly AI assistant for Human Virtual.
 - If asked something you don't know, say so honestly"""
 
 
-def _build_knowledge_block(snapshot: dict) -> str:
+def _build_knowledge_block(
+    snapshot: dict,
+    flow_cache: FlowKnowledgeCache | None = None,
+) -> str:
     """Build the knowledge section for the system prompt.
 
     Returns preamble + formatted knowledge, or "" when the snapshot has no
     usable knowledge. Emits one log line with snapshot metadata when content
     is injected — helps debug why the avatar does/doesn't know something.
+
+    S66 Block 5b — when ``flow_cache`` is supplied, the FLOW-scope render is
+    memoised across scene-change refreshes within a session; the SCENE-scope
+    block is always rebuilt (it varies per navigation).
     """
     knowledge = snapshot.get("knowledge")
-    knowledge_context = build_knowledge_context(knowledge)
-    if not knowledge_context:
+    if not knowledge:
         return ""
+
+    if flow_cache is not None:
+        flow_section = flow_cache.get_or_build(knowledge)
+    else:
+        flow_section = build_flow_knowledge_section(knowledge)
+    scene_section = build_scene_knowledge_section(knowledge)
+    parts = [s for s in (flow_section, scene_section) if s]
+    if not parts:
+        return ""
+    knowledge_context = "\n\n".join(parts)
 
     logger.info(
         "Knowledge injected into system prompt: total_chars={tc}, budget_exceeded={be}, scene_sources={ss}, flow_sources={fs}",
@@ -64,6 +82,8 @@ async def build_system_prompt(
     scene_id: str = "",
     api_url: str | None = None,
     aliases_out: dict[str, str] | None = None,
+    flow_cache: FlowKnowledgeCache | None = None,
+    snapshot_scene_id: str | None = None,
 ) -> str:
     """Build the full system prompt for the voice agent.
 
@@ -100,9 +120,21 @@ async def build_system_prompt(
     # S65 (Option B) — snapshot nested under {live_room, flow_state,
     # current_scene, knowledge, survey}. Pull live_room + current_scene
     # blocks once so the rest of the function reads from local handles.
+    # S66 Block 5c — only ``snapshot_scene_id`` (the broadcast scene_id
+    # from canvas.sceneChanged) drives the by-id snapshot fetch; the
+    # legacy ``scene_id`` param is intentionally NOT forwarded here
+    # because in production it carries the Pipecat runner-args body's
+    # scene_id — a hint from whoever started the agent, which for flow
+    # rooms can be stale (the room's cursor moves; the body doesn't).
+    # ``scene_id`` stays Strategy-2-only (avatar+scene path below).
+    # Backend that doesn't yet honor ``?scene_id=`` degrades to cursor
+    # snapshot (correct anyway: navigateToIndex advanced the cursor
+    # before broadcasting).
     snapshot: dict | None = None
     if room_id:
-        snapshot = await get_scene_snapshot(room_id, api_url)
+        snapshot = await get_scene_snapshot(
+            room_id, api_url, scene_id=snapshot_scene_id or None
+        )
 
     live_room_block = (snapshot or {}).get("live_room") or {}
     current_scene_block = (snapshot or {}).get("current_scene") or {}
@@ -135,7 +167,7 @@ async def build_system_prompt(
 
             if snapshot:
                 # Knowledge section (S56) — after persona/audience, before tools
-                knowledge_block = _build_knowledge_block(snapshot)
+                knowledge_block = _build_knowledge_block(snapshot, flow_cache=flow_cache)
                 if knowledge_block:
                     body_parts.append(knowledge_block)
 
