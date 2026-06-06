@@ -19,7 +19,7 @@ import json
 import logging
 
 from . import EagerToolCallTracker, maybe_fire_eager, is_arg_less_verb
-from tools.canvas_protocol_tools import build_canvas_command, EAGER_DISPATCH_VERBS
+from tools.canvas_protocol_tools import build_canvas_command
 
 logger = logging.getLogger(__name__)
 

@@ -37,7 +37,7 @@ dependency closure), so each async test goes through ``asyncio.run``.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, call
 
 from narration import (
     NarrationSegment,

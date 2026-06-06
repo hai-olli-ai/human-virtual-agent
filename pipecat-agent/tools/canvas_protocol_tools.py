@@ -23,7 +23,6 @@ handler skips re-dispatching when stop_reason finally arrives.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -147,10 +146,13 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
         FunctionSchema(
             name="canvas_analyze",
             description=(
-                "Ask a question about what is currently visible on the canvas. "
-                "Returns a text answer using the active Page's semantic state. "
-                "Use this when the user asks about screen contents you cannot determine "
-                "from your existing context."
+                "Ask about anything visible on the visitor's screen. The visitor's "
+                "LIVE screen — the actual rendered frame, any video, and any pen "
+                "marks / highlights / text they've drawn — is NOT in your text "
+                "context, so do NOT answer a 'what's on screen / what do you see' "
+                "question from the scene description. Call this whenever the visitor "
+                "asks what is on the screen, what you can see, to look at / read / "
+                "check the screen, or about anything they've drawn or pointed at."
             ),
             properties={
                 "question": {"type": "string", "description": "The question in natural language."},
@@ -344,7 +346,7 @@ class CanvasToolContext:
     # behavior, where bot.py refreshes the vision frame on every scene
     # change). bot.py constructs the closure that bridges this to
     # vision_refresh.ensure_vision_frame_for_scene.
-    ensure_vision: Optional[Callable[[], Awaitable[None]]] = None
+    ensure_vision: Optional[Callable[[str], Awaitable[None]]] = None
 
 
 def _validate_highlight_target(target: Any) -> Optional["CanvasCommandError"]:
@@ -486,7 +488,9 @@ def make_handlers(ctx: CanvasToolContext):
         # semantic state alone still answers most questions.
         if ctx.ensure_vision is not None:
             try:
-                await ctx.ensure_vision()
+                # S67b — pass the visitor's question so the vision path can
+                # derive its mode (point / assess / describe) from the utterance.
+                await ctx.ensure_vision(question)
             except Exception as exc:
                 logger.warning(f"[CANVAS_ANALYZE] ensure_vision failed: {exc!r}")
         try:

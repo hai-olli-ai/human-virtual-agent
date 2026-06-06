@@ -166,6 +166,34 @@ async def get_scene_image_base64(room_id: str, api_url: str | None = None) -> st
         return None
 
 
+async def get_vision_capture(
+    slug: str, capture_id: str, api_url: str | None = None
+) -> bytes | None:
+    """Fetch the JPEG bytes the shell uploaded for a vision capture (S67b).
+
+    Uses GET /live-rooms/by-slug/{slug}/vision-capture/{capture_id} (no auth) —
+    same public, no-auth style as get_scene_image_base64. The backend serves
+    the raw image bytes from its short-TTL (~60s) Redis ingest and deletes on
+    read, so a given capture_id is fetchable exactly once. Returns the raw
+    JPEG bytes, or None on any failure (expired / already-read capture,
+    backend down, network) — the caller degrades to the Pillow fallback +
+    blind-spot flag on None.
+    """
+    base_url = api_url or HV_API_URL
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{base_url}/live-rooms/by-slug/{slug}/vision-capture/{capture_id}",
+            )
+            response.raise_for_status()
+            return response.content
+    except Exception as e:
+        logger.warning(
+            f"Failed to fetch vision capture {capture_id} for slug {slug}: {e}"
+        )
+        return None
+
+
 async def generate_quiz(
     slug: str,
     scene_id: str,

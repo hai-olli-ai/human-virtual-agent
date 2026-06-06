@@ -87,6 +87,8 @@ from config import (
     NARRATION_AUDIO_SAMPLE_RATE,
     NARRATION_AUDIO_NUM_CHANNELS,
     VISION_REFRESH_MODE,
+    VISION_CAPTURE_TIMEOUT_MS,
+    VISION_MAX_DIM,
     resolve_deepgram_language,
 )
 from persona import build_system_prompt
@@ -132,7 +134,9 @@ from services.cached_first_tts import CachedFirstTTSService, CachedSegment
 # S66 Block 5a — lazy vision-frame tracker. Owns "which scene_id's vision
 # is currently in context"; the canvas_analyze handler calls ensure() to
 # fetch+inject on demand instead of every scene change.
-from vision_refresh import VisionFrameTracker, ensure_vision_frame_for_scene
+from vision_refresh import VisionFrameTracker
+from services.vision_client import VisionClient
+from services.vision_query import run_vision_query
 # S66 Block 5b — per-session memoisation of the FLOW-scope knowledge
 # block. Constructed once per pipeline; threaded through build_system_prompt
 # on session start and every scene-change refresh.
@@ -765,6 +769,54 @@ async def run_bot_classic(
         except Exception as exc:
             logger.warning("Failed to send canvas message: {}", exc)
 
+    # ── S67b — vision capture round-trip (sibling of canvas_pending) ──
+    # Keyed by a fresh captureId, NOT a canvas commandId: a separate dict so
+    # the two correlation spaces can never collide. The shell screenshots the
+    # visitor's canvas, uploads the JPEG to the backend ingest, and replies
+    # with a tiny canvas_capture_result carrying {status,w,h} only — the bytes
+    # are fetched separately by captureId (api_client.get_vision_capture).
+    _pending_captures: dict[str, asyncio.Future] = {}
+
+    async def request_canvas_capture(hint: str) -> tuple[str, dict | None]:
+        """Ask the shell to capture the visitor's canvas; await the ack.
+
+        Returns ``(capture_id, result)`` — result is the dict
+        {captureId, status, w?, h?, error?} on reply, or None on timeout. The
+        caller needs the capture_id to fetch the bytes by id (run_vision_query →
+        _fetch_live_bytes), so we surface it alongside the result (B12). Rides send_canvas_message
+        (the generic outbound helper — non-canvas payloads ride it too, e.g.
+        quiz_generation_state); the reply lands in the canvas_capture_result
+        on_app_message branch. The captured BYTES are not in the dict.
+        """
+        capture_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        _pending_captures[capture_id] = fut
+        logger.info("[VISION] requesting canvas capture {} hint={!r}", capture_id, hint)
+        try:
+            await send_canvas_message({
+                "type": "request_canvas_capture",
+                "captureId": capture_id,
+                "hint": hint,
+                "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
+            })
+            result = await asyncio.wait_for(
+                fut, timeout=VISION_CAPTURE_TIMEOUT_MS / 1000
+            )
+            logger.info(
+                "[VISION] capture {} resolved status={!r}",
+                capture_id, (result or {}).get("status"),
+            )
+            return capture_id, result
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[VISION] capture {} timed out after {}ms",
+                capture_id, VISION_CAPTURE_TIMEOUT_MS,
+            )
+            return capture_id, None
+        finally:
+            _pending_captures.pop(capture_id, None)
+
     canvas_ctx = CanvasToolContext(
         manifest_registry=canvas_manifest,
         pending=canvas_pending,
@@ -809,6 +861,11 @@ async def run_bot_classic(
     vision_tracker = VisionFrameTracker()
     if scene_image_b64 and initial_scene_id:
         vision_tracker.mark_loaded(str(initial_scene_id))
+
+    # S67b — one dedicated Gemini vision client per session (reads VISION_MODEL
+    # + GOOGLE_AI_API_KEY itself; stubs gracefully when the key is unset). Reused
+    # across every visual question; see services/vision_query.run_vision_query.
+    vision_client = VisionClient()
 
     # S64d — persona.build_system_prompt doesn't include the CANVAS PAGE
     # section (the migration to prompt_builder.build_system_prompt_split was
@@ -900,25 +957,33 @@ async def run_bot_classic(
     # `vision_tracker`, and `session_context` so it can fetch the current
     # scene's image and add it to context on demand. No-op when the
     # tracker already covers the active scene (cache hit).
-    async def _ensure_vision_for_active_scene() -> None:
-        if not room_id:
-            return
-        current_scene_id = session_context.get_current_scene_id()
+    async def _ensure_vision_for_active_scene(question: str = "") -> None:
+        # S67b — Design B: prefer a live capture of the visitor's annotated
+        # canvas (reasoned by the dedicated Gemini client), fall back to the
+        # base-scene Pillow PNG with a blind-spot note. The orchestration is
+        # the testable run_vision_query core; this closure just injects its
+        # result (a developer message) into the LLM context. Always fresh per
+        # question — no VisionFrameTracker reuse, because live annotations
+        # change WITHIN a scene (A-AG-3 gotcha #1).
+        # S67b — deterministic visual-indicator signal: bracket the Gemini
+        # analyze call so the shell can show "looking at your screen…" only
+        # while the model is actually running. Non-canvas, session-level
+        # (mirrors quiz_generation_state); state ∈ {"analyzing","idle"}.
+        async def _emit_vision_state(state: str) -> None:
+            await send_canvas_message({"type": "vision_state", "state": state})
 
-        async def _fetch_image() -> str | None:
-            from api_client import get_scene_image_base64
-            return await get_scene_image_base64(room_id, api_url)
-
-        def _add_message(img: str) -> None:
-            from scene_context import build_vision_message
-            context.add_message(build_vision_message(img))
-
-        await ensure_vision_frame_for_scene(
-            tracker=vision_tracker,
-            current_scene_id=current_scene_id,
-            fetch_image_base64=_fetch_image,
-            add_vision_message=_add_message,
+        msg = await run_vision_query(
+            question,
+            request_capture=request_canvas_capture,
+            vision_client=vision_client,
+            backend_client=api_client,
+            session_context=session_context,
+            room_id=room_id,
+            api_url=api_url,
+            on_vision_state=_emit_vision_state,
         )
+        if msg:
+            context.add_message(msg)
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
@@ -1390,6 +1455,25 @@ async def run_bot_classic(
                 )
             return
 
+        if msg_type == "canvas_capture_result":
+            # ── S67b — vision capture ack (sibling of canvas.commandResult) ──
+            # Non-canvas, session-level: resolve the captureId future opened by
+            # request_canvas_capture. Carries {status,w,h} only — the JPEG bytes
+            # live in the backend (fetched by captureId). Early-return alongside
+            # request_*, BEFORE the canvas dispatch (A-AG-1).
+            cid = message.get("captureId")
+            fut = _pending_captures.get(cid)
+            logger.info(
+                "[VISION] canvas_capture_result reached on_app_message: captureId={} "
+                "status={!r} pending_future={}",
+                cid, message.get("status"),
+                "found" if fut is not None
+                else "MISSING (already timed out, unknown id, or this handler never received earlier captures)",
+            )
+            if fut is not None and not fut.done():
+                fut.set_result(message)
+            return
+
         if msg_type == "canvas.register":
             logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
             canvas_manifest.set_manifest(message)
@@ -1480,6 +1564,11 @@ async def run_bot_classic(
     async def on_client_disconnected(transport, client):
         logger.info("Visitor disconnected")
         canvas_pending.cancel_all("session_end")
+        # S67b — drain any in-flight capture futures (sibling registry).
+        for _cap_fut in _pending_captures.values():
+            if not _cap_fut.done():
+                _cap_fut.cancel()
+        _pending_captures.clear()
         # S65 G3 — surface any narration segments still awaiting their
         # TTSStoppedFrame so the disconnect doesn't leave coroutines
         # hung on futures that will never resolve.
@@ -1568,6 +1657,54 @@ async def run_bot_relay(
         except Exception as exc:
             logger.warning("Failed to send canvas message: {}", exc)
 
+    # ── S67b — vision capture round-trip (sibling of canvas_pending) ──
+    # Keyed by a fresh captureId, NOT a canvas commandId: a separate dict so
+    # the two correlation spaces can never collide. The shell screenshots the
+    # visitor's canvas, uploads the JPEG to the backend ingest, and replies
+    # with a tiny canvas_capture_result carrying {status,w,h} only — the bytes
+    # are fetched separately by captureId (api_client.get_vision_capture).
+    _pending_captures: dict[str, asyncio.Future] = {}
+
+    async def request_canvas_capture(hint: str) -> tuple[str, dict | None]:
+        """Ask the shell to capture the visitor's canvas; await the ack.
+
+        Returns ``(capture_id, result)`` — result is the dict
+        {captureId, status, w?, h?, error?} on reply, or None on timeout. The
+        caller needs the capture_id to fetch the bytes by id (run_vision_query →
+        _fetch_live_bytes), so we surface it alongside the result (B12). Rides send_canvas_message
+        (the generic outbound helper — non-canvas payloads ride it too, e.g.
+        quiz_generation_state); the reply lands in the canvas_capture_result
+        on_app_message branch. The captured BYTES are not in the dict.
+        """
+        capture_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        _pending_captures[capture_id] = fut
+        logger.info("[VISION] requesting canvas capture {} hint={!r}", capture_id, hint)
+        try:
+            await send_canvas_message({
+                "type": "request_canvas_capture",
+                "captureId": capture_id,
+                "hint": hint,
+                "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
+            })
+            result = await asyncio.wait_for(
+                fut, timeout=VISION_CAPTURE_TIMEOUT_MS / 1000
+            )
+            logger.info(
+                "[VISION] capture {} resolved status={!r}",
+                capture_id, (result or {}).get("status"),
+            )
+            return capture_id, result
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[VISION] capture {} timed out after {}ms",
+                capture_id, VISION_CAPTURE_TIMEOUT_MS,
+            )
+            return capture_id, None
+        finally:
+            _pending_captures.pop(capture_id, None)
+
     canvas_ctx = CanvasToolContext(
         manifest_registry=canvas_manifest,
         pending=canvas_pending,
@@ -1609,6 +1746,11 @@ async def run_bot_relay(
     vision_tracker = VisionFrameTracker()
     if scene_image_b64 and initial_scene_id:
         vision_tracker.mark_loaded(str(initial_scene_id))
+
+    # S67b — one dedicated Gemini vision client per session (reads VISION_MODEL
+    # + GOOGLE_AI_API_KEY itself; stubs gracefully when the key is unset). Reused
+    # across every visual question; see services/vision_query.run_vision_query.
+    vision_client = VisionClient()
 
     # S64d — see run_bot_classic for rationale. Append CANVAS PAGE section
     # to system_prompt so the LLM knows the active Page's verbs; on
@@ -1672,25 +1814,33 @@ async def run_bot_relay(
     )
 
     # S66 Block 5a — mirror run_bot_classic. See there for rationale.
-    async def _ensure_vision_for_active_scene() -> None:
-        if not room_id:
-            return
-        current_scene_id = session_context.get_current_scene_id()
+    async def _ensure_vision_for_active_scene(question: str = "") -> None:
+        # S67b — Design B: prefer a live capture of the visitor's annotated
+        # canvas (reasoned by the dedicated Gemini client), fall back to the
+        # base-scene Pillow PNG with a blind-spot note. The orchestration is
+        # the testable run_vision_query core; this closure just injects its
+        # result (a developer message) into the LLM context. Always fresh per
+        # question — no VisionFrameTracker reuse, because live annotations
+        # change WITHIN a scene (A-AG-3 gotcha #1).
+        # S67b — deterministic visual-indicator signal: bracket the Gemini
+        # analyze call so the shell can show "looking at your screen…" only
+        # while the model is actually running. Non-canvas, session-level
+        # (mirrors quiz_generation_state); state ∈ {"analyzing","idle"}.
+        async def _emit_vision_state(state: str) -> None:
+            await send_canvas_message({"type": "vision_state", "state": state})
 
-        async def _fetch_image() -> str | None:
-            from api_client import get_scene_image_base64
-            return await get_scene_image_base64(room_id, api_url)
-
-        def _add_message(img: str) -> None:
-            from scene_context import build_vision_message
-            context.add_message(build_vision_message(img))
-
-        await ensure_vision_frame_for_scene(
-            tracker=vision_tracker,
-            current_scene_id=current_scene_id,
-            fetch_image_base64=_fetch_image,
-            add_vision_message=_add_message,
+        msg = await run_vision_query(
+            question,
+            request_capture=request_canvas_capture,
+            vision_client=vision_client,
+            backend_client=api_client,
+            session_context=session_context,
+            room_id=room_id,
+            api_url=api_url,
+            on_vision_state=_emit_vision_state,
         )
+        if msg:
+            context.add_message(msg)
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
@@ -2117,6 +2267,11 @@ async def run_bot_relay(
         captured_audio_participant_id = None
         greeting_sent = False
         canvas_pending.cancel_all("session_end")
+        # S67b — drain any in-flight capture futures (sibling registry).
+        for _cap_fut in _pending_captures.values():
+            if not _cap_fut.done():
+                _cap_fut.cancel()
+        _pending_captures.clear()
         await task.cancel()
 
     # ── Event handlers (complex — participant role detection) ──
@@ -2244,6 +2399,23 @@ async def run_bot_relay(
                         "error",
                         f"unexpected: {type(exc).__name__}: {str(exc)[:200]}",
                     )
+                return
+
+            if msg_type == "canvas_capture_result":
+                # S67b — see classic handler for rationale. Non-canvas ack:
+                # resolve the captureId future; {status,w,h} only, bytes in the
+                # backend. Early-return before the canvas dispatch.
+                cid = message.get("captureId")
+                fut = _pending_captures.get(cid)
+                logger.info(
+                    "[VISION] canvas_capture_result reached on_app_message: captureId={} "
+                    "status={!r} pending_future={}",
+                    cid, message.get("status"),
+                    "found" if fut is not None
+                    else "MISSING (already timed out, unknown id, or this handler never received earlier captures)",
+                )
+                if fut is not None and not fut.done():
+                    fut.set_result(message)
                 return
 
             if msg_type == "canvas.register":

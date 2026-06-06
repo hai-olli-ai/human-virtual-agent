@@ -9,6 +9,12 @@ dependencies = [
     "httpx",
     "python-dotenv",
     "loguru",
+    # S67b — dedicated Gemini multimodal vision (services/vision_client.py).
+    # A BASE dep, not behind a gemini extra: vision must work regardless of
+    # LLM_CANVAS_PROVIDER (A-AG-4). Bare google-genai (not pipecat-ai[google])
+    # so the conversational GoogleLLMService isn't pulled in. Range matches
+    # pipecat-ai 0.0.108's google extra (google-genai<2,>=1.68.0).
+    "google-genai>=1.68.0,<2",
 ]
 
 [tool.setuptools]
@@ -17,6 +23,19 @@ packages = []
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# `live` tests hit the real Gemini API (network + GOOGLE_AI_API_KEY) and are
+# excluded by default so CI / normal runs stay offline and free. Run them with:
+#   pytest -m live
+addopts = "-m 'not live'"
+markers = [
+    "live: exercises the real Gemini API (network + GOOGLE_AI_API_KEY); excluded by default, run with `pytest -m live`.",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# bot.py runs load_dotenv(override=True) before importing config and other
+# modules that read env at import time, so its module-level imports legitimately
+# follow non-import statements (E402 is intentional here, not a lint slip).
+"bot.py" = ["E402"]
 
 [dependency-groups]
 dev = [

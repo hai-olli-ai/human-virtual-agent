@@ -1,5 +1,4 @@
-import pytest
-from scene_context import build_knowledge_context, _format_scope
+from scene_context import build_knowledge_context
 
 
 # Minimal fixtures

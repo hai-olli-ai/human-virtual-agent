@@ -17,7 +17,6 @@ tries to detect the verb after each chunk.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from . import EagerToolCallTracker, maybe_fire_eager
 

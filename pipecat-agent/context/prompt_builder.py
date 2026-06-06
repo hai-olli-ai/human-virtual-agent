@@ -112,7 +112,7 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
     version = manifest.get("version", "0.1")
     cap = manifest.get("capabilities") or {}
 
-    lines = [f"## CANVAS PAGE", f"Active page: **{page_type}** (v{version})."]
+    lines = ["## CANVAS PAGE", f"Active page: **{page_type}** (v{version})."]
 
     if cap.get("analyze", {}).get("supported"):
         lines.append("- analyze: supported (semantic state provider).")
@@ -202,10 +202,10 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
 def render_agent_playbook_section() -> str:
     """AGENT PLAYBOOK — situational sequences the agent should follow.
 
-    Currently documents the quiz flow (S64e). New entries can be added as
-    additional Page types ship their own multi-step interactions. Returns
-    a stable string regardless of active Page; the per-page verb listing
-    lives in the CANVAS PAGE section, not here.
+    Documents the quiz flow (S64e) and the vision / visitor-annotation flow
+    (S67b). New entries can be added as additional Page types ship their own
+    multi-step interactions. Returns a stable string regardless of active
+    Page; the per-page verb listing lives in the CANVAS PAGE section, not here.
     """
     return (
         "## AGENT PLAYBOOK\n"
@@ -290,7 +290,31 @@ def render_agent_playbook_section() -> str:
         "\n"
         "To exit the quiz back to the regular scene view at any time, call "
         "`canvas_set_page` with `pageType='composition'` (`pageInit` can be "
-        "empty; the visitor's shell will rebuild it from the snapshot)."
+        "empty; the visitor's shell will rebuild it from the snapshot).\n"
+        "\n"
+        "**Visual questions & visitor annotations (vision)** — the live screen "
+        "(the actual rendered frame, any video, and anything the visitor has "
+        "drawn) is NOT in your text context. Whenever the visitor asks what is on "
+        "the screen, what you see, to look at / read / check the screen, OR refers "
+        "to something they've drawn, circled, highlighted, or written — e.g. "
+        "\"what do you see on the screen?\", \"what's showing right now?\", \"what "
+        "am I pointing at?\", \"what did I circle?\", \"is this answer I wrote "
+        "correct?\" — do NOT answer from the scene description; instead:\n"
+        "\n"
+        "1. Call `canvas_analyze` with the visitor's question. This triggers a "
+        "live look at what the visitor actually sees, including their own "
+        "annotations, and grounds your answer in the real pixels. (You do not "
+        "choose how to look — just pass their question.)\n"
+        "2. A system message tagged `[vision: ...]` will then appear in your "
+        "context with the visual reasoning. Base your spoken reply on it, and "
+        "speak it naturally — never read the `[vision: ...]` tag aloud.\n"
+        "3. **Honesty rule — never invent what you cannot see.** If a "
+        "`[vision note: ...]` says only the base scene is visible (the "
+        "visitor's own drawings are NOT visible), or that you cannot see the "
+        "canvas this turn, you MUST NOT claim to see their circles, marks, "
+        "drawings, or handwriting. Say plainly that you can describe the scene "
+        "but cannot see what they drew, and invite them to share their screen "
+        "so you can. Never fabricate seeing an annotation."
     )
 
 

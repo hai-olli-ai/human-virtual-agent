@@ -61,6 +61,20 @@ if VISION_REFRESH_MODE not in _VALID_VISION_REFRESH_MODES:
         f"got '{VISION_REFRESH_MODE}'"
     )
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Vision capture round-trip (S67b)
+# ──────────────────────────────────────────────────────────────────────
+# Decoupled from LLM_CANVAS_PROVIDER: vision always runs on a fast Gemini
+# model regardless of the conversational LLM. VISION_MODEL is read by
+# services/vision_client.py; the timeout + max-dim drive the agent→shell
+# capture round-trip in bot.py (request_canvas_capture). VISION_MAX_DIM is
+# advisory — the shell owns the actual screenshot encode.
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.5-flash")
+VISION_CAPTURE_TIMEOUT_MS = int(os.getenv("VISION_CAPTURE_TIMEOUT_MS", "4000"))
+VISION_MAX_DIM = int(os.getenv("VISION_MAX_DIM", "1280"))  # advisory; shell owns encode
+
+
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")

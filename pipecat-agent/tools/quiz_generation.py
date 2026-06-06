@@ -95,6 +95,12 @@ class SessionContext:
 
     slug: str | None = None
     current_scene_id: str | None = None
+    # S67b — vision: tracks whether the agent has already nudged the visitor to
+    # turn on screen-share for a 'describe' question during the current
+    # screen-share-OFF period. First describe-while-off → nudge (no Pillow);
+    # repeated describe-while-off → Pillow. Reset to False whenever a capture
+    # comes back 'ready' (screen-share is on again).
+    describe_share_nudged: bool = False
 
     def get_slug(self) -> str | None:
         return self.slug
@@ -107,6 +113,12 @@ class SessionContext:
 
     def set_scene(self, scene_id: str | None) -> None:
         self.current_scene_id = scene_id
+
+    def get_describe_share_nudged(self) -> bool:
+        return self.describe_share_nudged
+
+    def set_describe_share_nudged(self, value: bool) -> None:
+        self.describe_share_nudged = value
 
 
 GENERATE_QUIZ_SCHEMA = FunctionSchema(

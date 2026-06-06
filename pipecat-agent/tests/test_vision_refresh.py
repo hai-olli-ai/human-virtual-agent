@@ -223,7 +223,7 @@ def test_handle_analyze_invokes_ensure_vision_when_wired():
 
     called = []
 
-    async def _ensure():
+    async def _ensure(question=""):
         called.append("ensure")
 
     ctx, sent = _make_canvas_ctx(ensure_vision=_ensure)
@@ -265,7 +265,7 @@ def test_handle_analyze_continues_when_ensure_raises():
     the iframe's semantic state alone still answers most questions."""
     from tools.canvas_protocol_tools import make_handlers
 
-    async def _ensure_fail():
+    async def _ensure_fail(question=""):
         raise RuntimeError("backend down")
 
     ctx, sent = _make_canvas_ctx(ensure_vision=_ensure_fail)
