@@ -74,6 +74,11 @@ VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.5-flash")
 VISION_CAPTURE_TIMEOUT_MS = int(os.getenv("VISION_CAPTURE_TIMEOUT_MS", "4000"))
 VISION_MAX_DIM = int(os.getenv("VISION_MAX_DIM", "1280"))  # advisory; shell owns encode
 
+# Block 8 — agent_annotate ack round-trip. Shorter than the capture timeout: the
+# overlay draw is best-effort (a timeout is treated as rendered), so the LLM turn
+# isn't held long waiting for a cosmetic ack.
+AGENT_ANNOTATE_TIMEOUT_MS = int(os.getenv("AGENT_ANNOTATE_TIMEOUT_MS", "2000"))
+
 
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision

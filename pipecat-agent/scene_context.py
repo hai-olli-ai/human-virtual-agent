@@ -277,10 +277,10 @@ def build_vision_message(image_base64: str) -> dict:
 #
 # Elements come from the backend with UUID7-shaped ids — long, opaque
 # strings that often share long prefixes (because UUID7 is timestamp-
-# ordered). LLMs fail to copy these reliably as `target.element_id` for
-# canvas_highlight or `from`/`to` for canvas_action(verb=draw_arrow):
+# ordered). LLMs fail to copy these reliably as `target.element` for
+# canvas_annotate or `from`/`to` for canvas_action(verb=draw_arrow):
 # the model picks the right element conceptually but mis-types the id
-# mid-stream, which surfaces as "highlighted the wrong element".
+# mid-stream, which surfaces as "annotated the wrong element".
 #
 # The alias layer fixes this without changing the wire protocol. We
 # derive a short, distinctive name per element (e.g. text_1, avatar_1,
@@ -380,7 +380,7 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
         # Note (S59): Element type "button" is a visitor-clickable CTA on
         # the scene canvas. The agent has no canvas-click tool — it should
         # describe buttons by their `title` (e.g. "the 'Sign up now' button
-        # in the lower right") and may use canvas_highlight to point at one,
+        # in the lower right") and may use canvas_annotate to point at one,
         # but it must NOT attempt to "click" buttons on the visitor's behalf.
         # Buttons are part of the visual scene; clicks are exclusively the
         # visitor's affordance.
@@ -392,7 +392,7 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
             desc = f"- {el_type}"
             # S64c — surface the element id (or its short alias when
             # available) so the LLM can pass it as
-            # `target={element_id: "..."}` to canvas_highlight.
+            # `target={element: "..."}` to canvas_annotate.
             eid = el.get("id")
             if eid:
                 display_id = uuid_to_alias.get(eid, eid)
@@ -506,7 +506,7 @@ def build_canvas_tools_section(
     When ``aliases`` (alias → element_id) is provided, the "Available
     canvas elements" listing surfaces short, distinctive aliases
     (e.g. ``text_1``, ``avatar_1``) instead of UUID7 ids. The LLM uses
-    these aliases as ``target.element_id`` (highlight) or
+    these aliases as ``target.element`` (canvas_annotate) or
     ``args.from`` / ``args.to`` (draw_arrow); the tool handlers in
     ``tools/canvas_protocol_tools.py`` translate aliases back to real
     UUIDs before sending the canvas.command. See
@@ -549,20 +549,20 @@ def build_canvas_tools_section(
         if page_type == "youtube":
             ids_line = (
                 "- Canvas elements on this scene (informational only — the YouTube page "
-                "does NOT accept element_id highlight targets and has no canvas_action "
-                "verbs in v0.1):\n" + "\n".join(listed)
+                "has no per-element aliases to annotate; use `describe` or `region` "
+                "targets, and `canvas_control` verbs for playback):\n" + "\n".join(listed)
             ) if listed else (
                 "- No standalone canvas elements declared on this scene."
             )
         else:
             ids_line = (
                 "- Available canvas elements (pass these aliases as "
-                "`element_id` for canvas_highlight, and as `from` / `to` "
+                "`target.element` for canvas_annotate, and as `from` / `to` "
                 "for canvas_action with verb=draw_arrow):\n"
                 + "\n".join(listed)
             ) if listed else (
-                "- No canvas elements are available on this scene — "
-                "`canvas_highlight` and `canvas_action(verb='draw_arrow')` cannot be called."
+                "- No canvas elements are available on this scene — annotate by "
+                "`describe`/`region` instead; `canvas_action(verb='draw_arrow')` cannot be called."
             )
     else:
         # Fallback path: aliases not wired (sync test builder, older callers).
@@ -571,35 +571,18 @@ def build_canvas_tools_section(
         if element_ids:
             ids_line = "- Available element ids: " + ", ".join(f"`{eid}`" for eid in element_ids) + "."
         else:
-            ids_line = "- No element ids are available on this scene — `canvas_highlight` cannot be called."
+            ids_line = "- No element ids are available on this scene — annotate by `describe`/`region` instead."
 
-    if page_type == "youtube":
-        highlight_bullet = (
-            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
-            "On the active YouTube page, `target` MUST be `{box: [x, y, w, h]}` in 1280x720 "
-            "design-space coordinates. Element-id targets (`{element_id: \"<id>\"}`) are "
-            "NOT supported on this page — do not use them. "
-            "If you don't know specific coordinates for what you want to highlight, call "
-            "`canvas_analyze` first to learn the layout, or describe verbally; do NOT call "
-            "`canvas_highlight` with a null or empty target (it will be rejected)."
-        )
-    elif page_type == "composition":
-        highlight_bullet = (
-            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
-            "`target` MUST be `{element_id: \"<id>\"}` using one of the aliases listed in "
-            "Notes below. Box-coordinate targets (`{box: [x, y, w, h]}`) are NOT supported "
-            "on the composition page — do not use them. "
-            "Pick a specific alias from the Available canvas elements list; do NOT call "
-            "`canvas_highlight` with a null or empty target."
-        )
-    else:
-        highlight_bullet = (
-            "2. `canvas_highlight(target, options={})` — draw a highlight on the canvas. "
-            "Check the CANVAS PAGE section below for the exact target shape this Page "
-            "supports — either `{element_id: \"<id>\"}` or `{box: [x, y, w, h]}` "
-            "(1280x720 design space). Sending the wrong shape returns INVALID_ARGS, "
-            "and a null/empty target is rejected outright."
-        )
+    annotate_bullet = (
+        "2. `canvas_annotate(op, target)` — draw a temporary annotation on the overlay "
+        "the visitor sees (`op`: circle | arrow | shape | highlight | text | erase). Set "
+        "`target` to `{element: \"<alias>\"}` for a known scene element, `{describe: "
+        "\"...\"}` for something in a video/image (you'll look at the screen to locate "
+        "it), or `{region: {x, y, w, h}}` (0-1 fractions) if you already have coords. "
+        "Annotations clear on scene change; use `op='erase'` to clear sooner. See the "
+        "AGENT PLAYBOOK for when to annotate. (The old in-iframe `canvas_highlight` tool "
+        "no longer exists.)"
+    )
 
     return "\n".join([
         "## Canvas Actions",
@@ -610,7 +593,7 @@ def build_canvas_tools_section(
         "visible on the canvas using the active page's semantic state. Use when the "
         "visitor asks something you cannot determine from your existing context.",
         "",
-        highlight_bullet,
+        annotate_bullet,
         "",
         f"3. `canvas_control(verb, args={{}})` — state-transition verbs. Supported: "
         f"{control_verbs}. Most take `args={{}}`.",

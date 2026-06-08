@@ -89,6 +89,7 @@ from config import (
     VISION_REFRESH_MODE,
     VISION_CAPTURE_TIMEOUT_MS,
     VISION_MAX_DIM,
+    AGENT_ANNOTATE_TIMEOUT_MS,
     resolve_deepgram_language,
 )
 from persona import build_system_prompt
@@ -136,7 +137,11 @@ from services.cached_first_tts import CachedFirstTTSService, CachedSegment
 # fetch+inject on demand instead of every scene change.
 from vision_refresh import VisionFrameTracker
 from services.vision_client import VisionClient
-from services.vision_query import run_vision_query
+from services.vision_query import _fetch_live_bytes, run_vision_query
+from tools.canvas_annotate import (
+    AGENT_ANNOTATE_SCHEMA,
+    make_handle_canvas_annotate,
+)
 # S66 Block 5b — per-session memoisation of the FLOW-scope knowledge
 # block. Constructed once per pipeline; threaded through build_system_prompt
 # on session start and every scene-change refresh.
@@ -776,6 +781,10 @@ async def run_bot_classic(
     # with a tiny canvas_capture_result carrying {status,w,h} only — the bytes
     # are fetched separately by captureId (api_client.get_vision_capture).
     _pending_captures: dict[str, asyncio.Future] = {}
+    # ── Block 8 — agent-annotate ack registry (sibling of _pending_captures) ──
+    # Keyed by a fresh annotateId so annotate acks and capture acks never collide;
+    # drained on disconnect alongside _pending_captures.
+    _pending_annotates: dict[str, asyncio.Future] = {}
 
     async def request_canvas_capture(hint: str) -> tuple[str, dict | None]:
         """Ask the shell to capture the visitor's canvas; await the ack.
@@ -888,6 +897,7 @@ async def run_bot_classic(
             # the backend directly, not through the iframe), but it
             # shares the same registration surface.
             GENERATE_QUIZ_SCHEMA,
+            AGENT_ANNOTATE_SCHEMA,
         ],
     )
 
@@ -1001,7 +1011,7 @@ async def run_bot_classic(
     # already advanced the backend cursor by the time this fires, so
     # build_system_prompt's internal /scene-snapshot fetch returns the
     # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
-    # in place so the next canvas_highlight / canvas_action resolves
+    # in place so the next canvas_annotate / canvas_action resolves
     # aliases against the new scene's elements.
     async def refresh_agent_for_current_scene(
         target_scene_id: str | None = None,
@@ -1164,6 +1174,28 @@ async def run_bot_classic(
     llm.register_function(
         "generate_quiz_from_knowledge",
         make_handle_generate_quiz(api_client, session_context, canvas_ctx),
+    )
+
+    # ── Block 8 — canvas_annotate (agent overlay annotations) ──
+    # Standalone tool (like generate_quiz_from_knowledge), NOT a canvas protocol
+    # tool: it emits a session-level agent_annotate message instead of dispatching
+    # a canvas.command. Factory-bound to this session's S67b capture + vision
+    # machinery; the agent_annotate_result ack resolves _pending_annotates futures.
+    llm.register_function(
+        "canvas_annotate",
+        make_handle_canvas_annotate(
+            send_message=send_canvas_message,
+            pending=_pending_annotates,
+            vision_client=vision_client,
+            request_capture=request_canvas_capture,
+            fetch_live_bytes=_fetch_live_bytes,
+            backend_client=api_client,
+            session_context=session_context,
+            element_alias_map=element_alias_map,
+            room_id=room_id,
+            api_url=api_url,
+            timeout_s=AGENT_ANNOTATE_TIMEOUT_MS / 1000,
+        ),
     )
 
     # ── Aggregators with VAD ──
@@ -1474,6 +1506,17 @@ async def run_bot_classic(
                 fut.set_result(message)
             return
 
+        if msg_type == "agent_annotate_result":
+            # ── Block 8 — agent-annotate ack (sibling of canvas_capture_result) ──
+            # Non-canvas, session-level: resolve the annotateId future opened by
+            # make_handle_canvas_annotate's _emit. Early-return BEFORE the canvas
+            # dispatch — same discipline as request_* / canvas_capture_result.
+            aid = message.get("annotateId")
+            ann_fut = _pending_annotates.get(aid)
+            if ann_fut is not None and not ann_fut.done():
+                ann_fut.set_result(message)
+            return
+
         if msg_type == "canvas.register":
             logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
             canvas_manifest.set_manifest(message)
@@ -1569,6 +1612,10 @@ async def run_bot_classic(
             if not _cap_fut.done():
                 _cap_fut.cancel()
         _pending_captures.clear()
+        for _ann_fut in _pending_annotates.values():
+            if not _ann_fut.done():
+                _ann_fut.cancel()
+        _pending_annotates.clear()
         # S65 G3 — surface any narration segments still awaiting their
         # TTSStoppedFrame so the disconnect doesn't leave coroutines
         # hung on futures that will never resolve.
@@ -1664,6 +1711,10 @@ async def run_bot_relay(
     # with a tiny canvas_capture_result carrying {status,w,h} only — the bytes
     # are fetched separately by captureId (api_client.get_vision_capture).
     _pending_captures: dict[str, asyncio.Future] = {}
+    # ── Block 8 — agent-annotate ack registry (sibling of _pending_captures) ──
+    # Keyed by a fresh annotateId so annotate acks and capture acks never collide;
+    # drained on disconnect alongside _pending_captures.
+    _pending_annotates: dict[str, asyncio.Future] = {}
 
     async def request_canvas_capture(hint: str) -> tuple[str, dict | None]:
         """Ask the shell to capture the visitor's canvas; await the ack.
@@ -1766,6 +1817,7 @@ async def run_bot_relay(
             *make_canvas_protocol_schemas(canvas_manifest.current()),
             # S64e — generate_quiz_from_knowledge alongside canvas tools.
             GENERATE_QUIZ_SCHEMA,
+            AGENT_ANNOTATE_SCHEMA,
         ],
     )
 
@@ -1858,7 +1910,7 @@ async def run_bot_relay(
     # already advanced the backend cursor by the time this fires, so
     # build_system_prompt's internal /scene-snapshot fetch returns the
     # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
-    # in place so the next canvas_highlight / canvas_action resolves
+    # in place so the next canvas_annotate / canvas_action resolves
     # aliases against the new scene's elements.
     async def refresh_agent_for_current_scene(
         target_scene_id: str | None = None,
@@ -2013,6 +2065,28 @@ async def run_bot_relay(
     llm.register_function(
         "generate_quiz_from_knowledge",
         make_handle_generate_quiz(api_client, session_context, canvas_ctx),
+    )
+
+    # ── Block 8 — canvas_annotate (agent overlay annotations) ──
+    # Standalone tool (like generate_quiz_from_knowledge), NOT a canvas protocol
+    # tool: it emits a session-level agent_annotate message instead of dispatching
+    # a canvas.command. Factory-bound to this session's S67b capture + vision
+    # machinery; the agent_annotate_result ack resolves _pending_annotates futures.
+    llm.register_function(
+        "canvas_annotate",
+        make_handle_canvas_annotate(
+            send_message=send_canvas_message,
+            pending=_pending_annotates,
+            vision_client=vision_client,
+            request_capture=request_canvas_capture,
+            fetch_live_bytes=_fetch_live_bytes,
+            backend_client=api_client,
+            session_context=session_context,
+            element_alias_map=element_alias_map,
+            room_id=room_id,
+            api_url=api_url,
+            timeout_s=AGENT_ANNOTATE_TIMEOUT_MS / 1000,
+        ),
     )
 
     # ── Aggregators with VAD ──
@@ -2272,6 +2346,10 @@ async def run_bot_relay(
             if not _cap_fut.done():
                 _cap_fut.cancel()
         _pending_captures.clear()
+        for _ann_fut in _pending_annotates.values():
+            if not _ann_fut.done():
+                _ann_fut.cancel()
+        _pending_annotates.clear()
         await task.cancel()
 
     # ── Event handlers (complex — participant role detection) ──
@@ -2416,6 +2494,14 @@ async def run_bot_relay(
                 )
                 if fut is not None and not fut.done():
                     fut.set_result(message)
+                return
+
+            if msg_type == "agent_annotate_result":
+                # ── Block 8 — agent-annotate ack (see classic handler) ──
+                aid = message.get("annotateId")
+                ann_fut = _pending_annotates.get(aid)
+                if ann_fut is not None and not ann_fut.done():
+                    ann_fut.set_result(message)
                 return
 
             if msg_type == "canvas.register":

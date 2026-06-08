@@ -2,9 +2,12 @@
 Canvas Protocol generic tools (S64c).
 
 Replaces the V2.13/S47 hardcoded tools (highlight_element, arrow_between,
-add_annotation, navigate_scene, clear_overlays). The agent now calls 5 stable
+add_annotation, navigate_scene, clear_overlays). The agent now calls 4 stable
 generic verbs that work uniformly across Canvas Page types (composition,
-youtube in S64d, quiz in S64e).
+youtube in S64d, quiz in S64e). The visitor-facing canvas tool set is 5 —
+canvas_annotate (Block 8) is the 5th, registered separately in bot.py because it
+draws on the shell overlay (an agent_annotate message) rather than dispatching a
+canvas.command through these protocol verbs.
 
 Each tool's handler:
   1. Validates the call against the active Page's manifest (canvas_manifest.py).
@@ -131,7 +134,7 @@ class CanvasCommandError(Exception):
 # ----------------------------------------------------------------------------
 
 def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
-    """Build the 5 generic tool schemas. The descriptions reference the active
+    """Build the 4 generic canvas-protocol tool schemas. The descriptions reference the active
     Page's manifest if available — this gives the LLM verb-level guidance
     without bloating the system prompt."""
 
@@ -159,76 +162,6 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
                 "options": {"type": "object", "description": "Reserved for future provider hints. Pass {} for v0.1."},
             },
             required=["question"],
-        ),
-        FunctionSchema(
-            name="canvas_highlight",
-            description=(
-                "Draw a highlight overlay on the canvas. Each Canvas Page declares which "
-                "target shape it accepts in the CANVAS PAGE section of the system prompt — "
-                "composition pages accept element_id targets, the youtube page accepts box "
-                "targets. Send the shape the active Page accepts; sending the wrong shape "
-                "returns INVALID_ARGS and no highlight is drawn."
-            ),
-            properties={
-                # Pipecat 0.0.108's FunctionSchema.to_default_dict() forwards
-                # this property dict straight into OpenAI's tool spec. It does
-                # NOT emit strict: true, so the LLM is allowed to violate
-                # `required` and we observed gpt-5.4 emitting target=null on
-                # box-only pages when it couldn't construct coordinates. The
-                # oneOf branches below give the model a structurally
-                # unambiguous schema (a second hint on top of the prompt
-                # text); the agent-side _validate_highlight_target gate is
-                # the contract that actually catches malformed calls before
-                # dispatch.
-                "target": {
-                    "type": "object",
-                    "description": (
-                        "Highlight target. Send EXACTLY ONE of the two shapes documented "
-                        "under oneOf — pick the shape the active Page accepts (see "
-                        "CANVAS PAGE in the system prompt). Do not call this tool with "
-                        "target=null or an empty target."
-                    ),
-                    "oneOf": [
-                        {
-                            "title": "element_id target",
-                            "type": "object",
-                            "properties": {
-                                "element_id": {
-                                    "type": "string",
-                                    "description": (
-                                        "Element id from CANVAS ELEMENTS — an alias like "
-                                        "'text_1' or 'avatar_1', or a full UUID. Accepted "
-                                        "by composition-style pages."
-                                    ),
-                                },
-                            },
-                            "required": ["element_id"],
-                            "additionalProperties": False,
-                        },
-                        {
-                            "title": "box target",
-                            "type": "object",
-                            "properties": {
-                                "box": {
-                                    "type": "array",
-                                    "description": (
-                                        "[x, y, width, height] in 1280x720 design-space "
-                                        "coordinates. Accepted by pages that highlight "
-                                        "arbitrary regions (e.g. youtube)."
-                                    ),
-                                    "items": {"type": "number"},
-                                    "minItems": 4,
-                                    "maxItems": 4,
-                                },
-                            },
-                            "required": ["box"],
-                            "additionalProperties": False,
-                        },
-                    ],
-                },
-                "options": {"type": "object", "description": "Reserved. Pass {} for v0.1."},
-            },
-            required=["target"],
         ),
         FunctionSchema(
             name="canvas_control",
@@ -330,9 +263,8 @@ class CanvasToolContext:
     manifest_registry: CanvasManifestRegistry
     pending: PendingCommandRegistry
     send_app_message: Any  # callable(payload: dict) -> None — sends a Daily app-message
-    # S64c — alias→element_id map for the active snapshot. Tool handlers
-    # translate target.element_id (canvas_highlight) and args.from /
-    # args.to (canvas_action verb=draw_arrow) through this map before
+    # S64c — alias→element_id map for the active snapshot. The canvas_action
+    # draw_arrow handler translates args.from / args.to through this map before
     # dispatching, so the LLM can reference elements by short, stable
     # aliases (text_1, avatar_1, …) instead of long UUID7 strings it
     # routinely fails to copy verbatim. bot.py refreshes this map on
@@ -347,59 +279,6 @@ class CanvasToolContext:
     # change). bot.py constructs the closure that bridges this to
     # vision_refresh.ensure_vision_frame_for_scene.
     ensure_vision: Optional[Callable[[str], Awaitable[None]]] = None
-
-
-def _validate_highlight_target(target: Any) -> Optional["CanvasCommandError"]:
-    """Shape-check the LLM-supplied highlight target before dispatch.
-
-    Pipecat 0.0.108's `FunctionSchema.to_default_dict` does not emit
-    `strict: true`, so OpenAI treats our `required: ["target"]` as a hint
-    and the model can produce calls with `target` missing/null. We observed
-    gpt-5.4 doing exactly that on YouTube scenes (box-only page) when it
-    couldn't construct coordinates — see the 2026-05-13 production warning
-    `INVALID_TOOL: highlight requires args.target`.
-
-    Catching here (instead of letting the wire-format check in the
-    frontend's daily-relay reject) lets us return a richer, instructive
-    error to the LLM via the result_callback, which the model can act on
-    the very next turn. Manifest-aware "page rejects this shape"
-    validation deliberately stays in the frontend
-    (lib/canvas-protocol/validate.ts) as the single source of truth — this
-    gate only catches structural failures (no target, no shape).
-
-    Returns None when the target is well-shaped, otherwise a
-    CanvasCommandError ready to hand to `_emit_error`.
-    """
-    if not isinstance(target, dict):
-        return CanvasCommandError({
-            "code": "INVALID_ARGS",
-            "message": (
-                "canvas_highlight requires `target` as an object. "
-                "Use {\"element_id\": \"<id>\"} on element-id pages, or "
-                "{\"box\": [x, y, w, h]} on box pages. The active Page's accepted "
-                "shape is listed in CANVAS PAGE — do not call canvas_highlight "
-                "with a null or missing target. If you don't know what to "
-                "highlight, call canvas_analyze first or respond verbally."
-            ),
-        })
-    has_element_id = isinstance(target.get("element_id"), str) and bool(target["element_id"])
-    box = target.get("box")
-    has_box = (
-        isinstance(box, (list, tuple))
-        and len(box) == 4
-        and all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in box)
-    )
-    if not has_element_id and not has_box:
-        return CanvasCommandError({
-            "code": "INVALID_ARGS",
-            "message": (
-                "canvas_highlight target must include either `element_id` "
-                "(non-empty string) or `box` ([x, y, w, h] of four numbers). "
-                "Check CANVAS PAGE for the shape the active Page accepts, "
-                "then retry with a valid target."
-            ),
-        })
-    return None
 
 
 async def dispatch_canvas_command(
@@ -498,38 +377,6 @@ def make_handlers(ctx: CanvasToolContext):
             await params.result_callback(result)
         except CanvasCommandError as exc:
             await _emit_error(params, exc, "CANVAS_ANALYZE")
-
-    async def handle_highlight(params: FunctionCallParams):
-        args = params.arguments or {}
-        target = args.get("target")
-        logger.info(f"[CANVAS_HIGHLIGHT] called: target={target!r}")
-        # Pre-dispatch shape check — see _validate_highlight_target for the
-        # reasoning. Without this gate, malformed calls (target=None,
-        # empty target object) round-trip through Daily to the frontend
-        # relay, which returns a generic INVALID_TOOL the model has to
-        # decode. Returning a tailored error here keeps the model in the
-        # conversation with a clearer correction hint.
-        shape_error = _validate_highlight_target(target)
-        if shape_error is not None:
-            await _emit_error(params, shape_error, "CANVAS_HIGHLIGHT")
-            return
-        # S64c — translate alias → real UUID before dispatch. The LLM sees
-        # short aliases in the prompt's "Available canvas elements"
-        # listing and reproduces them in target.element_id; the frontend
-        # only knows real UUIDs. Safe to assume target is a dict here —
-        # the shape check above rejected non-dict targets.
-        if "element_id" in target:
-            resolved = _resolve_element_id(target["element_id"])
-            if resolved != target["element_id"]:
-                logger.info(
-                    f"[CANVAS_HIGHLIGHT] resolved alias {target['element_id']!r} -> {resolved!r}"
-                )
-            target = {**target, "element_id": resolved}
-        try:
-            result = await _dispatch("highlight", {"target": target, "options": args.get("options", {})})
-            await params.result_callback(result)
-        except CanvasCommandError as exc:
-            await _emit_error(params, exc, "CANVAS_HIGHLIGHT")
 
     async def handle_control(params: FunctionCallParams):
         args = params.arguments or {}
@@ -633,7 +480,6 @@ def make_handlers(ctx: CanvasToolContext):
 
     return {
         "canvas_analyze": handle_analyze,
-        "canvas_highlight": handle_highlight,
         "canvas_control": handle_control,
         "canvas_action": handle_action,
         "canvas_set_page": handle_set_page,

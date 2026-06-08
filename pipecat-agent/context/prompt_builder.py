@@ -104,7 +104,7 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
         return (
             "## CANVAS PAGE\n"
             "No page registered yet. Wait for canvas.register before issuing "
-            "highlight/control/action/analyze tool calls. canvas_set_page is "
+            "control/action/analyze tool calls. canvas_set_page is "
             "the only tool you can safely call without a registered page."
         )
 
@@ -116,43 +116,6 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
 
     if cap.get("analyze", {}).get("supported"):
         lines.append("- analyze: supported (semantic state provider).")
-
-    h = cap.get("highlight") or {}
-    if h.get("supported"):
-        targets = h.get("targets") or []
-        if "box" in targets and "element_id" in targets:
-            lines.append(
-                "- highlight: target may be `{element_id: \"<id>\"}` (from CANVAS "
-                "ELEMENTS) OR `{box: [x, y, w, h]}` in 1280x720 design space."
-            )
-        elif "box" in targets:
-            lines.append(
-                "- highlight: target MUST be `{box: [x, y, w, h]}` in 1280x720 design "
-                "space. `{element_id: ...}` targets are NOT supported on this page."
-            )
-            # Fallback guidance: without an element list (which box-only pages
-            # don't surface as highlight targets), the LLM has been observed
-            # to emit canvas_highlight with target=null when it can't infer
-            # coordinates. Steer it to canvas_analyze or a verbal response
-            # instead of a degenerate tool call.
-            lines.append(
-                "  If you don't know specific box coordinates for what you want to "
-                "highlight, call `canvas_analyze` first to learn the layout, or "
-                "describe verbally — do NOT call `canvas_highlight` without a real "
-                "`{box: [x, y, w, h]}` value (a null or empty target is rejected)."
-            )
-        elif "element_id" in targets:
-            lines.append(
-                "- highlight: target MUST be `{element_id: \"<id>\"}` using an id from "
-                "CANVAS ELEMENTS. `{box: ...}` targets are NOT supported on this page."
-            )
-            lines.append(
-                "  Pick a specific alias from CANVAS ELEMENTS — do NOT call "
-                "`canvas_highlight` with a null or empty target."
-            )
-        else:
-            target_str = ", ".join(targets) or "(unspecified)"
-            lines.append(f"- highlight: targets={target_str}.")
 
     lines.extend(_render_verb_list("control", (cap.get("control") or {}).get("verbs") or []))
     lines.extend(_render_verb_list("action", (cap.get("action") or {}).get("verbs") or []))
@@ -314,7 +277,24 @@ def render_agent_playbook_section() -> str:
         "canvas this turn, you MUST NOT claim to see their circles, marks, "
         "drawings, or handwriting. Say plainly that you can describe the scene "
         "but cannot see what they drew, and invite them to share their screen "
-        "so you can. Never fabricate seeing an annotation."
+        "so you can. Never fabricate seeing an annotation.\n"
+        "\n"
+        "**Canvas annotation (`canvas_annotate`)** — to point at, circle, highlight, or "
+        "label something the visitor is discussing, call `canvas_annotate`:\n"
+        "\n"
+        "1. Pick an `op`: `circle`, `arrow`, `shape`, `highlight`, `text`, or `erase`.\n"
+        "2. Pick a `target` (required for every op except `erase`):\n"
+        "   - `{element: \"<alias>\"}` — when it's a known scene element (composition "
+        "scenes; use an alias from CANVAS ELEMENTS).\n"
+        "   - `{describe: \"...\"}` — when it's something in a video or image; you will "
+        "look at the live screen to locate it.\n"
+        "   - `{region: {x, y, w, h}}` — only if you already have normalized 0-1 coords.\n"
+        "3. Annotations appear on the SAME overlay the visitor draws on and clear on "
+        "scene change. Be purposeful and sparse — annotate to clarify, not decorate; "
+        "use `op='erase'` to clear when you're done.\n"
+        "\n"
+        "The old in-iframe `canvas_highlight` tool no longer exists — never reference an "
+        "in-iframe highlight; annotate on the overlay with `canvas_annotate` instead."
     )
 
 
@@ -337,9 +317,9 @@ def render_canvas_actions_section() -> str:
         "visible. Returns a text answer using the active Page's semantic state. "
         "Use when you cannot determine the answer from CANVAS ELEMENTS or your other context.\n"
         "\n"
-        "2. **canvas_highlight(target, options={})** — draw a highlight on the canvas. "
-        "target is either {element_id: \"el_xxx\"} (preferred when an id is known from "
-        "CANVAS ELEMENTS) or {box: [x, y, w, h]} in 1280x720 coordinates for arbitrary regions.\n"
+        "2. **canvas_annotate(op, target)** — draw a temporary annotation on the overlay "
+        "the visitor sees (op: circle | arrow | shape | highlight | text | erase). target is "
+        "{element: \"<alias>\"}, {describe: \"...\"}, or {region: {x, y, w, h}}. See AGENT PLAYBOOK.\n"
         "\n"
         "3. **canvas_control(verb, args={})** — invoke a state-transition verb. The CANVAS "
         "PAGE section above lists which verbs are supported. Most control verbs take {}.\n"
@@ -353,7 +333,7 @@ def render_canvas_actions_section() -> str:
         "set_page, a new manifest arrives and your CANVAS PAGE section updates.\n"
         "\n"
         "Notes:\n"
-        "- Highlights persist until canvas_control(verb=\"clear\") or scene change.\n"
+        "- Annotations persist until canvas_annotate(op=\"erase\") or scene change.\n"
         "- Reuse element ids from CANVAS ELEMENTS when possible — they are stable.\n"
         "- For arg-less verbs (next_scene, previous_scene, clear, pause, play, restart, "
         "next_question, previous_question), call control or action with verb only and args={}."

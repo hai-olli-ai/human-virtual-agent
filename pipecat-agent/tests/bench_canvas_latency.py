@@ -44,7 +44,7 @@ async def mock_anthropic_stream(verb: str) -> List[dict]:
     The name field uses the post-rename underscore form. OpenAI and
     Anthropic both reject tool names containing '.' (regex
     ``^[a-zA-Z0-9_-]+$``), so the S64c surface ships ``canvas_control``,
-    ``canvas_highlight``, etc. — see tools/canvas_protocol_tools.py.
+    ``canvas_annotate``, etc. — see tools/canvas_protocol_tools.py.
     The eager hook's verb-completion check matches on the underscore
     form (services/eager_dispatch/__init__.py:maybe_fire_eager), so the
     benchmark must use it too or the eager path never fires.

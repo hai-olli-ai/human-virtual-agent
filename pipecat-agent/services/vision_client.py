@@ -40,6 +40,7 @@ numeric ``thinking_budget``; "low" is a tuned low-latency setting on 3.5 Flash.
 
 from __future__ import annotations
 
+import json
 import os
 
 from loguru import logger
@@ -191,3 +192,71 @@ class VisionClient:
             # degrade to the Pillow fallback rather than breaking the turn.
             logger.warning("[VISION] analyze_image failed mode={!r}: {!r}", mode, exc)
             return VISION_UNAVAILABLE
+
+    async def locate(self, image_bytes: bytes, description: str) -> dict | None:
+        """Locate a described target in the image; return a normalized box or None.
+
+        Block 7 (S67b agent-annotate path) — ask Gemini *where* a described
+        element is so the shell can draw an annotation there. Returns
+        ``{"x", "y", "w", "h"}`` as fractions in 0-1 (top-left origin) — NOT
+        1000-space and NOT pixels — so the caller maps the fraction into
+        whichever target space the annotate command wants (design px / percent;
+        see A-AG-3's coordinate-space note). Returns None on stub / not-found /
+        degenerate box / error. Never raises — a vision failure must not break
+        the in-flight turn (mirrors analyze_image).
+        """
+        if not self.enabled:
+            logger.info("[VISION] GOOGLE_AI_API_KEY unset — locate stubbed")
+            return None
+        if not image_bytes:
+            logger.warning("[VISION] locate called with empty image bytes")
+            return None
+
+        # gemini-3.5-flash returns box_2d as [ymin, xmin, ymax, xmax] normalized
+        # 0-1000 with a top-left origin (A-AG-5, confirmed against the official
+        # image-understanding docs). response_mime_type forces parseable JSON.
+        prompt = (
+            "Return ONLY JSON locating this target in the image: " + description + ". "
+            'Format: {"box_2d": [ymin, xmin, ymax, xmax]} with integers normalized '
+            '0-1000 (top-left origin). If the target is not visible, return '
+            '{"box_2d": null}.'
+        )
+        try:
+            client = self._ensure_client()
+            from google.genai import types
+
+            # Native async surface (client.aio.*) — same discipline as
+            # analyze_image; the SDK's sync generate_content would block the
+            # Pipecat event loop. (The B7 sketch's asyncio.to_thread + sync call
+            # is the part adapted to A-AG-5's confirmed aio shape.)
+            resp = await client.aio.models.generate_content(
+                model=self.model,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_level="low"),
+                    response_mime_type="application/json",
+                ),
+            )
+            data = json.loads((getattr(resp, "text", "") or "").strip())
+            box = data.get("box_2d") if isinstance(data, dict) else None
+            if not box or len(box) != 4:
+                logger.info("[VISION] locate found nothing description={!r}", description)
+                return None
+            # Normalize 0-1000 → 0-1 fractions. box_2d order is [ymin, xmin, ymax, xmax].
+            ymin, xmin, ymax, xmax = (float(v) / 1000.0 for v in box)
+            x, y = max(0.0, xmin), max(0.0, ymin)
+            w, h = max(0.0, xmax - xmin), max(0.0, ymax - ymin)
+            if w <= 0 or h <= 0:
+                logger.info(
+                    "[VISION] locate degenerate box description={!r} box_2d={}",
+                    description, box,
+                )
+                return None
+            logger.info("[VISION] locate ok description={!r} box_2d={}", description, box)
+            return {"x": x, "y": y, "w": w, "h": h}
+        except Exception as exc:
+            logger.warning("[VISION] locate failed description={!r}: {!r}", description, exc)
+            return None
