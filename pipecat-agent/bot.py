@@ -60,6 +60,7 @@ from pipecat.runner.types import DailyRunnerArguments, RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
@@ -83,6 +84,9 @@ from config import (
     ANTHROPIC_MODEL,
     GOOGLE_AI_API_KEY,
     GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    MAIN_LLM_SUPPORTS_VISION,
     NARRATION_TTS_MODEL_ID,
     NARRATION_AUDIO_SAMPLE_RATE,
     NARRATION_AUDIO_NUM_CHANNELS,
@@ -103,9 +107,11 @@ from tools.canvas_protocol_tools import (
     make_tool_schemas as make_canvas_protocol_schemas,
 )
 from context.canvas_manifest import CanvasManifestRegistry
+from context.transcript_aggregator import WordBoundaryAggregator
 from context.prompt_builder import (
     render_agent_playbook_section,
     render_canvas_page_section,
+    render_voice_output_style_section,
 )
 # S64e — generate_quiz_from_knowledge tool + session-scoped slug/scene state.
 import api_client
@@ -283,24 +289,43 @@ def _build_transport_message(message: dict[str, object], participant_id: str | N
 # ──────────────────────────────────────────────────────────────────────
 
 class TranscriptForwarder(FrameProcessor):
-    """Forward user STT and bot text updates over the transport data channel."""
+    """Forward user STT and bot text updates over the transport data channel.
+
+    Avatar (LLM) text is aggregated to WORD boundaries before forwarding. The
+    LLM streams sub-token deltas — for Vietnamese a single syllable arrives in
+    pieces ("phân" → ["ph","ân"]) — and the shell's caption renders transcript
+    messages separated, so forwarding raw deltas rendered as "ph ân đo ạn".
+    Buffering until a whitespace boundary and emitting only whole (trimmed)
+    words keeps every word intact (see context/transcript_aggregator). The
+    frame stream is pushed through UNCHANGED, so TTS/audio is unaffected — only
+    the transcript side-channel is reshaped. User STT (TranscriptionFrame) is
+    already whole-utterance and is forwarded as-is.
+    """
 
     def __init__(self, transport: BaseTransport):
         super().__init__()
         self._transport = transport
+        self._avatar_agg = WordBoundaryAggregator()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and frame.text:
             await self._send_transcript("user", frame.text)
-
-        if (
+        elif (
             isinstance(frame, TextFrame)
             and not isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
             and frame.text
         ):
-            await self._send_transcript("avatar", frame.text)
+            ready = self._avatar_agg.feed(frame.text)
+            if ready:
+                await self._send_transcript("avatar", ready)
+        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame, EndFrame, CancelFrame)):
+            # Turn/stream boundary — release the final partial word so the
+            # caption isn't left missing the tail of the utterance.
+            ready = self._avatar_agg.flush()
+            if ready:
+                await self._send_transcript("avatar", ready)
 
         await self.push_frame(frame, direction)
 
@@ -611,18 +636,21 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
 # LLM_CANVAS_PROVIDER env var after installing the corresponding extra.
 
 def _assemble_full_prompt(base: str, manifest: dict | None) -> str:
-    """Concatenate the base persona prompt, CANVAS PAGE, and AGENT PLAYBOOK.
+    """Concatenate base persona prompt, CANVAS PAGE, AGENT PLAYBOOK, VOICE OUTPUT.
 
     Single helper for the three sites that rebuild the prompt (session
     start, canvas.register, canvas.sceneChanged). The CANVAS PAGE section
     is driven by the active Page's manifest; AGENT PLAYBOOK is a stable
     string that documents cross-tool sequences the agent should follow
-    (currently the quiz flow — S64e).
+    (currently the quiz flow — S64e). VOICE OUTPUT STYLE is appended last
+    (recency) to keep the model's reply plain-spoken — no Markdown/ellipsis
+    noise reaching the TTS or the live caption.
     """
     return "\n\n".join([
         base,
         render_canvas_page_section(manifest),
         render_agent_playbook_section(),
+        render_voice_output_style_section(),
     ])
 
 
@@ -644,6 +672,23 @@ def _build_llm_and_eager_hook(
             api_key=OPENAI_API_KEY,
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL,
+                system_instruction=system_prompt,
+            ),
+        )
+        return llm, OpenAIEagerHook(canvas_pending, send_canvas_message)
+
+    if provider == "groq":
+        # Groq's GroqLLMService subclasses OpenAILLMService (OpenAI-compatible
+        # wire format), so OpenAIEagerHook parses its streamed tool calls
+        # verbatim — no groq-specific adapter needed. Import the .llm submodule
+        # directly: the package __init__ eagerly pulls groq/tts.py, which needs
+        # the native `groq` SDK shipped via the pipecat-ai[groq] extra.
+        from pipecat.services.groq.llm import GroqLLMService
+        from services.eager_dispatch.openai_adapter import OpenAIEagerHook
+        llm = GroqLLMService(
+            api_key=GROQ_API_KEY,
+            settings=GroqLLMService.Settings(
+                model=GROQ_MODEL,
                 system_instruction=system_prompt,
             ),
         )
@@ -929,6 +974,13 @@ async def run_bot_classic(
     tts = CachedFirstTTSService(
         api_key=CARTESIA_API_KEY,
         sample_rate=NARRATION_AUDIO_SAMPLE_RATE,
+        # #2 — strip any Markdown gpt-oss emits (**, *, `, #, lists) before
+        # synthesis so it isn't spoken as literal symbols. Audio-side safety
+        # net; the VOICE OUTPUT prompt directive curbs it at the source (and
+        # also keeps the caption clean — the transcript forwarder sits
+        # upstream of this filter). Flows through CachedFirstTTSService /
+        # CartesiaTTSService **kwargs to the base TTSService.
+        text_filters=[MarkdownTextFilter()],
         settings=CartesiaTTSService.Settings(
             voice=voice_id,
             model=NARRATION_TTS_MODEL_ID,
@@ -952,10 +1004,21 @@ async def run_bot_classic(
     # path (no eager-dispatch latency win, but correctness is identical).
 
     # ── Conversation context ──
+    # S46 injects the scene image straight into the MAIN LLM context. Gate on
+    # MAIN_LLM_SUPPORTS_VISION — a text-only main model (e.g. Groq gpt-oss-120b)
+    # 400s on image content ("content must be a string"). Visual questions are
+    # still answered via the decoupled S67b Gemini path (canvas_analyze →
+    # run_vision_query), which injects TEXT reasoning, not a raw image.
     initial_messages = []
-    if scene_image_b64:
+    if scene_image_b64 and MAIN_LLM_SUPPORTS_VISION:
         from scene_context import build_vision_message
         initial_messages.append(build_vision_message(scene_image_b64))
+    elif scene_image_b64:
+        logger.info(
+            "[VISION] not injecting scene image into main-LLM context "
+            "(MAIN_LLM_SUPPORTS_VISION=false, provider={}); S67b Gemini path still handles visual Q&A",
+            LLM_CANVAS_PROVIDER,
+        )
 
     context = LLMContext(
         messages=initial_messages if initial_messages else None,
@@ -967,12 +1030,13 @@ async def run_bot_classic(
     # `vision_tracker`, and `session_context` so it can fetch the current
     # scene's image and add it to context on demand. No-op when the
     # tracker already covers the active scene (cache hit).
-    async def _ensure_vision_for_active_scene(question: str = "") -> None:
+    async def _ensure_vision_for_active_scene(question: str = "") -> str | None:
         # S67b — Design B: prefer a live capture of the visitor's annotated
         # canvas (reasoned by the dedicated Gemini client), fall back to the
         # base-scene Pillow PNG with a blind-spot note. The orchestration is
-        # the testable run_vision_query core; this closure just injects its
-        # result (a developer message) into the LLM context. Always fresh per
+        # the testable run_vision_query core; this closure RETURNS its result
+        # text (handle_analyze folds it into the canvas_analyze tool result —
+        # in-band, S67b fix). Always fresh per
         # question — no VisionFrameTracker reuse, because live annotations
         # change WITHIN a scene (A-AG-3 gotcha #1).
         # S67b — deterministic visual-indicator signal: bracket the Gemini
@@ -992,8 +1056,11 @@ async def run_bot_classic(
             api_url=api_url,
             on_vision_state=_emit_vision_state,
         )
-        if msg:
-            context.add_message(msg)
+        # S67b fix — RETURN the vision text so handle_analyze folds it into the
+        # canvas_analyze TOOL RESULT (in-band). Previously injected out-of-band
+        # via context.add_message, which raced the function-call re-run and
+        # intermittently left the spoken reply without the vision answer.
+        return msg.get("content") if msg else None
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
@@ -1090,7 +1157,7 @@ async def run_bot_classic(
         # eager preserves pre-5a behavior (fetch + add to context here).
         # The session-start fetch is unconditional and lives outside this
         # closure — only the per-scene-change refetch is gated.
-        if VISION_REFRESH_MODE == "eager":
+        if VISION_REFRESH_MODE == "eager" and MAIN_LLM_SUPPORTS_VISION:
             new_image = await get_scene_image_base64(room_id, api_url)
             if new_image:
                 from scene_context import build_vision_message
@@ -1100,9 +1167,14 @@ async def run_bot_classic(
             else:
                 logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
         else:
+            # lazy mode, OR a text-only main LLM (MAIN_LLM_SUPPORTS_VISION=false)
+            # where injecting the image would 400 — either way defer to the
+            # S67b Gemini path (run_vision_query) on the next canvas_analyze.
             vision_tracker.invalidate()
             logger.info(
-                "[CANVAS SCENECHANGED] vision-refresh mode=lazy — scene image will be fetched on next canvas_analyze"
+                "[CANVAS SCENECHANGED] vision-refresh deferred (mode={}, main_llm_vision={}) — "
+                "scene image fetched on next canvas_analyze via S67b",
+                VISION_REFRESH_MODE, MAIN_LLM_SUPPORTS_VISION,
             )
 
         # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.
@@ -1855,10 +1927,21 @@ async def run_bot_relay(
     # into the streaming loop yet.
 
     # ── Conversation context ──
+    # S46 injects the scene image straight into the MAIN LLM context. Gate on
+    # MAIN_LLM_SUPPORTS_VISION — a text-only main model (e.g. Groq gpt-oss-120b)
+    # 400s on image content ("content must be a string"). Visual questions are
+    # still answered via the decoupled S67b Gemini path (canvas_analyze →
+    # run_vision_query), which injects TEXT reasoning, not a raw image.
     initial_messages = []
-    if scene_image_b64:
+    if scene_image_b64 and MAIN_LLM_SUPPORTS_VISION:
         from scene_context import build_vision_message
         initial_messages.append(build_vision_message(scene_image_b64))
+    elif scene_image_b64:
+        logger.info(
+            "[VISION] not injecting scene image into main-LLM context "
+            "(MAIN_LLM_SUPPORTS_VISION=false, provider={}); S67b Gemini path still handles visual Q&A",
+            LLM_CANVAS_PROVIDER,
+        )
 
     context = LLMContext(
         messages=initial_messages if initial_messages else None,
@@ -1866,12 +1949,13 @@ async def run_bot_relay(
     )
 
     # S66 Block 5a — mirror run_bot_classic. See there for rationale.
-    async def _ensure_vision_for_active_scene(question: str = "") -> None:
+    async def _ensure_vision_for_active_scene(question: str = "") -> str | None:
         # S67b — Design B: prefer a live capture of the visitor's annotated
         # canvas (reasoned by the dedicated Gemini client), fall back to the
         # base-scene Pillow PNG with a blind-spot note. The orchestration is
-        # the testable run_vision_query core; this closure just injects its
-        # result (a developer message) into the LLM context. Always fresh per
+        # the testable run_vision_query core; this closure RETURNS its result
+        # text (handle_analyze folds it into the canvas_analyze tool result —
+        # in-band, S67b fix). Always fresh per
         # question — no VisionFrameTracker reuse, because live annotations
         # change WITHIN a scene (A-AG-3 gotcha #1).
         # S67b — deterministic visual-indicator signal: bracket the Gemini
@@ -1891,8 +1975,11 @@ async def run_bot_relay(
             api_url=api_url,
             on_vision_state=_emit_vision_state,
         )
-        if msg:
-            context.add_message(msg)
+        # S67b fix — RETURN the vision text so handle_analyze folds it into the
+        # canvas_analyze TOOL RESULT (in-band). Previously injected out-of-band
+        # via context.add_message, which raced the function-call re-run and
+        # intermittently left the spoken reply without the vision answer.
+        return msg.get("content") if msg else None
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
@@ -1985,7 +2072,7 @@ async def run_bot_relay(
             session_context.set_scene(new_scene_id)
 
         # S66 Block 5a — see run_bot_classic for rationale.
-        if VISION_REFRESH_MODE == "eager":
+        if VISION_REFRESH_MODE == "eager" and MAIN_LLM_SUPPORTS_VISION:
             new_image = await get_scene_image_base64(room_id, api_url)
             if new_image:
                 from scene_context import build_vision_message
@@ -1995,9 +2082,14 @@ async def run_bot_relay(
             else:
                 logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
         else:
+            # lazy mode, OR a text-only main LLM (MAIN_LLM_SUPPORTS_VISION=false)
+            # where injecting the image would 400 — either way defer to the
+            # S67b Gemini path (run_vision_query) on the next canvas_analyze.
             vision_tracker.invalidate()
             logger.info(
-                "[CANVAS SCENECHANGED] vision-refresh mode=lazy — scene image will be fetched on next canvas_analyze"
+                "[CANVAS SCENECHANGED] vision-refresh deferred (mode={}, main_llm_vision={}) — "
+                "scene image fetched on next canvas_analyze via S67b",
+                VISION_REFRESH_MODE, MAIN_LLM_SUPPORTS_VISION,
             )
 
         # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.

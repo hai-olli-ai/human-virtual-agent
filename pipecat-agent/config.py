@@ -9,6 +9,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 
 # Human Virtual API
@@ -82,8 +83,8 @@ AGENT_ANNOTATE_TIMEOUT_MS = int(os.getenv("AGENT_ANNOTATE_TIMEOUT_MS", "2000"))
 
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
-#LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+#LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -94,15 +95,16 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
 # Vision (S46) stays hardcoded on OpenAI GPT-4.1 regardless — they're
 # separate services. See CLAUDE.md "Vision (S46) — separate, hardcoded".
 #
-# Default is "openai" because that's the only LLM SDK extra currently
-# installed (pipecat-ai[openai]). To use anthropic or gemini, install
-# the corresponding pipecat extra (pipecat-ai[anthropic] /
-# pipecat-ai[google]) and set this env var. CLAUDE.md targets anthropic
-# as the eventual default; that flip happens once the extras land in
-# pyproject.toml + uv.lock.
-LLM_CANVAS_PROVIDER = os.getenv("LLM_CANVAS_PROVIDER", "openai").strip().lower()
+# Default is "groq" — the agent runs on Groq's OpenAI-compatible
+# GroqLLMService (LPU inference; model = GROQ_MODEL). The groq extra ships
+# in pyproject.toml (pipecat-ai[groq]); the openai extra stays installed
+# too, so swapping back to "openai" needs no new install. "anthropic" /
+# "gemini" still require their pipecat extras (pipecat-ai[anthropic] /
+# pipecat-ai[google]) before selecting them. In production this value is
+# set explicitly as a Pipecat Cloud env var.
+LLM_CANVAS_PROVIDER = os.getenv("LLM_CANVAS_PROVIDER", "groq").strip().lower()
 
-_VALID_CANVAS_PROVIDERS = {"anthropic", "openai", "gemini"}
+_VALID_CANVAS_PROVIDERS = {"anthropic", "openai", "gemini", "groq"}
 if LLM_CANVAS_PROVIDER not in _VALID_CANVAS_PROVIDERS:
     raise ValueError(
         f"LLM_CANVAS_PROVIDER must be one of {sorted(_VALID_CANVAS_PROVIDERS)}, "
@@ -112,6 +114,43 @@ if LLM_CANVAS_PROVIDER not in _VALID_CANVAS_PROVIDERS:
 # Per-provider model overrides (defaults match CLAUDE.md's documented choices).
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# Groq serves OpenAI's open-weight GPT-OSS models. NOTE: Groq's catalog
+# lists the 120B model as "openai/gpt-oss-120b"; the bare id below matches
+# the request as given — set GROQ_MODEL=openai/gpt-oss-120b if the API
+# returns model_not_found.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Main-LLM in-context vision capability
+# ──────────────────────────────────────────────────────────────────────
+# The S46 vision path injects the scene image straight into the MAIN LLM's
+# context (build_vision_message → an OpenAI `image_url` content block). That
+# only works if the selected conversational model accepts image input. Groq's
+# default gpt-oss-120b is TEXT-ONLY and returns 400 ("messages[].content must
+# be a string") on image content, which would break the very first turn
+# whenever a scene image is present. So that injection is gated on this flag.
+#
+# Default: False for the groq provider (gpt-oss text-only), True for
+# openai/anthropic/gemini. Set MAIN_LLM_SUPPORTS_VISION=true to opt back in if
+# you point GROQ_MODEL at a multimodal Groq model (or =false to force it off).
+# The decoupled S67b Gemini vision path (run_vision_query) is UNAFFECTED — it
+# injects text reasoning, never a raw image, so visual Q&A works under Groq.
+def _resolve_main_llm_vision(provider: str, override: str | None) -> bool:
+    """Whether the main LLM accepts images in its context.
+
+    ``override`` is the raw ``MAIN_LLM_SUPPORTS_VISION`` env value (or None
+    when unset). When set it wins; otherwise we derive from the provider —
+    only ``groq`` (text-only gpt-oss default) is False.
+    """
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return provider != "groq"
+
+
+MAIN_LLM_SUPPORTS_VISION = _resolve_main_llm_vision(
+    LLM_CANVAS_PROVIDER, os.getenv("MAIN_LLM_SUPPORTS_VISION")
+)
 
 
 # ──────────────────────────────────────────────────────────────────────

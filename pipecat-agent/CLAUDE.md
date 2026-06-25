@@ -1,7 +1,7 @@
 # pipecat-agent — CLAUDE.md
 
 > Voice agent for **Human Virtual** (hv.ai), built on the **Pipecat Framework**.
-> **Status:** S64c–e + S65 + S65b + S65c + S66 shipped; **S67a shipped frontend-only (NO agent change); S67b (agent vision of the annotated canvas) complete agent-side — `services/vision_client.py` (dedicated Gemini, decoupled from `LLM_CANVAS_PROVIDER`) + `services/vision_query.py` (live-capture-first — Pillow only for a *repeated* `describe` while screen-share is off) + the `request_canvas_capture`/`canvas_capture_result` round-trip + permission fast-path + two-stage `describe` nudge + the deterministic `vision_state` indicator + PLAYBOOK/tool-description broadening. End-to-end still needs three cross-repo pieces: the frontend capture handler (B1), the frontend `vision_state` indicator, and the backend Redis ingest.** The classic TTS service is a `CachedFirstTTSService` (cache hit → raw PCM in the identical `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires; miss → live Cartesia). `generate_quiz_from_knowledge`'s core is the factored `run_quiz_generation` coroutine (shared by the LLM tool + the manual `request_quiz` trigger); inbound `request_narrate` / `request_quiz` branches sit alongside the canvas dispatch in `on_app_message`; `script_complete` carries `trigger: 'auto' | 'manual'`. **S66** made scene-change refresh fast: **lazy vision** (`VISION_REFRESH_MODE=lazy` default — render the Pillow frame only on demand), **flow-knowledge reuse** across scene changes, and **by-`sceneId` snapshot fetch** off `canvas.sceneChanged` (cursor-independent; cursor fallback retained).
+> **Status:** S64c–e + S65 + S65b + S65c + S66 + **S67b + S67c** shipped; **S68 (knowledge-aware Generate Scene) is next.** **S67b** added agent vision of the live canvas: `services/vision_client.py` (dedicated `gemini-3.5-flash` multimodal client, decoupled from `LLM_CANVAS_PROVIDER`, graceful stub when `GOOGLE_AI_API_KEY` is unset), the `request_canvas_capture` round-trip (sibling `asyncio.Future` registry; `canvas_capture_result` handled in the non-canvas `on_app_message` branch), `api_client.get_vision_capture()` (fetch the shell-uploaded JPEG from the backend `vision-capture` ingest — the 4 KB Daily limit forbids the image on the data channel), and the `get_vision_image()` rework (capture-first → Pillow fallback with a blind-spot flag); the vision reasoning is returned **in-band as the `canvas_analyze` tool result** (not an out-of-band developer message). **S67c** unified canvas-interaction: **`canvas_highlight` is RETIRED**, replaced by **`canvas_annotate`** which draws on the **same S67a shell overlay** (non-canvas `agent_annotate` round-trip, not the Canvas Protocol), the `vision_client` gained a **`locate`** mode (normalized bbox for described targets), and the in-iframe highlight path is gone (Canvas-Protocol manifest reduced to **v0.2**). The classic TTS service is a `CachedFirstTTSService` (cache hit → raw PCM in the identical `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires; miss → live Cartesia). `generate_quiz_from_knowledge`'s core is the factored `run_quiz_generation` coroutine; inbound `request_narrate` / `request_quiz` / `canvas_capture_result` / `agent_annotate_result` branches sit alongside the canvas dispatch in `on_app_message`; `script_complete` carries `trigger: 'auto' | 'manual'`. **S66** made scene-change refresh fast: **lazy vision** (`VISION_REFRESH_MODE=lazy` default), **flow-knowledge reuse**, and **by-`sceneId` snapshot fetch** off `canvas.sceneChanged` (cursor-independent; cursor fallback retained). **LLM provider:** the conversational LLM now **defaults to Groq** (`GroqLLMService`, OpenAI-compatible, model `openai/gpt-oss-120b`); `openai`/`anthropic`/`gemini` stay selectable via `LLM_CANVAS_PROVIDER`. ⚠️ `gpt-oss-120b` is **text-only**, so the S46 scene-image-in-main-LLM-context injection is **gated off** for Groq (`MAIN_LLM_SUPPORTS_VISION`); visual Q&A still runs via the decoupled S67b Gemini path (see *LLM provider selection*).
 > **Repo:** `pipecat-agent/` (alongside `human-virtual-backend/` and `human-virtual-frontend/`).
 
 ---
@@ -11,9 +11,9 @@
 The Pipecat agent runs the avatar's **conversation pipeline**: STT → LLM → TTS → audio out, with optional vision and canvas tool calls. It connects to a Live Room over WebRTC and:
 
 1. Listens to the visitor's microphone (Deepgram STT).
-2. Calls an LLM (OpenAI / Anthropic / Gemini, selected at boot via `LLM_CANVAS_PROVIDER`) with a system prompt assembled from the Live Room's persona, knowledge (aggregated across the whole flow), current scene instruction, current scene's elements (referenced by short aliases), and the active Canvas Page's manifest.
+2. Calls an LLM (**Groq** (default) / OpenAI / Anthropic / Gemini, selected at boot via `LLM_CANVAS_PROVIDER`) with a system prompt assembled from the Live Room's persona, knowledge (aggregated across the whole flow), current scene instruction, current scene's elements (referenced by short aliases), and the active Canvas Page's manifest.
 3. Emits TTS audio (Cartesia, now via `CachedFirstTTSService`) plus avatar lip-sync data (SoulX-Flashtalk for "talking" display mode).
-4. Calls **canvas tools** via the generic 5-tool protocol surface (`canvas_analyze`, `canvas_highlight`, `canvas_control`, `canvas_action`, `canvas_set_page` — **underscored, not dotted**).
+4. Calls **canvas tools** via the generic 5-tool surface (`canvas_analyze`, `canvas_annotate`, `canvas_control`, `canvas_action`, `canvas_set_page` — **underscored, not dotted**). *(S67c: `canvas_annotate` replaced the retired `canvas_highlight`; unlike the others it does NOT emit a `canvas.*` command — it drives the shell annotation overlay via the non-canvas `agent_annotate` round-trip.)*
 5. (S46+) Calls **vision** by adding a snapshot image to the LLM's context.
 6. (S49 + S65) Plays the scene's script on entry. **S65** added per-segment script-avatar voice switching, a localized post-script invitation, and `{type:'script_complete'}` carrying `sceneIndex`/`hadScript`. **S65b** added the cached-audio fast path through the same narrator without changing the control flow.
 
@@ -27,11 +27,11 @@ The Pipecat agent runs the avatar's **conversation pipeline**: STT → LLM → T
 | Transport (prod) | DailyTransport (Daily.co WebRTC) |
 | Transport (local) | SmallWebRTCTransport |
 | Deployment (prod) | Pipecat Cloud |
-| LLM default | OpenAI GPT (via `LLM_CANVAS_PROVIDER=openai`) |
-| LLM alt | Anthropic Claude, Google Gemini (extras must be installed) |
-| LLM selection | `LLM_CANVAS_PROVIDER` env var, validated at boot |
+| LLM default | **Groq** `GroqLLMService` — OpenAI-compatible; model `openai/gpt-oss-120b` (via `GROQ_MODEL`). ⚠️ text-only — in-context image injection gated off (`MAIN_LLM_SUPPORTS_VISION`) |
+| LLM alt | OpenAI GPT (extra already installed), Anthropic Claude / Google Gemini (extras must be installed) |
+| LLM selection | `LLM_CANVAS_PROVIDER` env var — `groq`/`openai`/`anthropic`/`gemini`, validated at boot |
 | STT | Deepgram |
-| TTS (classic) | **`CachedFirstTTSService`** *(S65b)* — composes `CartesiaTTSService`; cache-first, live-fallback |
+| TTS (classic) | **`CachedFirstTTSService`** *(S65b)* — composes `CartesiaTTSService`; cache-first, live-fallback; runs **`MarkdownTextFilter`** to strip stray Markdown before synthesis (#2 — plain-speech, audio-side) |
 | Lip-sync (talking) | SoulX-Flashtalk (S48 — relay pipeline; **S65b cache does NOT apply** — relay renders its own audio) |
 
 ---
@@ -50,22 +50,21 @@ pipecat-agent/
   narration.py                      # S65 — narrate_scene_script: per-segment voice switch + invitation + script_complete
                                     #   S65b — _prefetch_cached_audio + per-segment prime_cached(...) before each speak
   context/
-    prompt_builder.py               # render_canvas_page_section
+    prompt_builder.py               # render_canvas_page_section + render_agent_playbook_section + render_voice_output_style_section
     canvas_manifest.py              # CanvasManifestRegistry
   tools/
-    canvas_protocol_tools.py        # 5 generic protocol tools + dispatch_canvas_command; SCENE_NAV_VERBS exemption
+    canvas_protocol_tools.py        # 5 generic tools (canvas_annotate replaced canvas_highlight in S67c) + dispatch_canvas_command; SCENE_NAV_VERBS exemption
     quiz_generation.py              # S64e — generate_quiz_from_knowledge tool + bundled set_page
   services/
-    cached_first_tts.py             # S65b — CachedFirstTTSService
-    vision_client.py                # S67b — dedicated Gemini multimodal client + derive_vision_mode (decoupled from LLM_CANVAS_PROVIDER)
-    vision_query.py                 # S67b — capture-first/Pillow-fallback orchestration core (run_vision_query, injected deps; testable)
+    cached_first_tts.py             # S65b — CachedFirstTTSService (this session)
     eager_dispatch/                 # Per-provider streaming hooks (S64c) — constructed, not wired into the streaming loop
       __init__.py
       anthropic_adapter.py
-      openai_adapter.py
+      openai_adapter.py             # also reused by the groq branch (Groq is OpenAI-compatible)
       gemini_adapter.py
   tests/
-    test_canvas_highlight_validation.py
+    test_canvas_annotate.py
+    test_canvas_vision.py
     test_eager_dispatch.py
     test_link_narration_directive.py
     test_quiz_generation.py
@@ -115,9 +114,11 @@ When the LLM emits a tool call, Pipecat's function-call aggregator invokes the r
 The current live prompt is assembled as a **concatenation**:
 
 ```
-system_prompt = build_system_prompt(room_id, …)             # persona.py — Strategy 1
-              + "\n\n"
-              + render_canvas_page_section(manifest)        # context/prompt_builder.py
+system_prompt = _assemble_full_prompt(base, manifest)    # bot.py — "\n\n".join of:
+  build_system_prompt(room_id, …)            # persona.py — Strategy 1 (base + S65 SCRIPT directive)
+  render_canvas_page_section(manifest)       # context/prompt_builder.py — active Page verbs
+  render_agent_playbook_section()            # quiz + vision/annotation sequences
+  render_voice_output_style_section()        # VOICE OUTPUT — STRICT (plain speech; appended last)
 ```
 
 Rebuilt at three points: **session start**, **scene change** (via `refresh_agent_for_current_scene`), and **manifest registration** (`canvas.register` branch in `on_app_message`).
@@ -133,29 +134,37 @@ Strategy 1 vs Strategy 2 (in `persona.build_system_prompt`):
 
 LANGUAGE on both ends. PERSONA, AUDIENCE, KNOWLEDGE between. The S64c CANVAS PAGE section sits **outside** the language sandwich (post-hoc append). The S65 SCRIPT directive sits inside the body, before the closing LANGUAGE reminder.
 
+### Voice output style directive (plain speech — Groq/gpt-oss)
+
+`render_voice_output_style_section()` (`context/prompt_builder.py`) appends a blunt **`## VOICE OUTPUT — STRICT`** block as the **last** section of every assembled prompt (recency), via `_assemble_full_prompt` — so it covers **both** pipelines at all three rebuild points. The rule: plain spoken words only — **no Markdown** (`**`/`*`/backticks/`#`/bullets/numbered lists), **no emojis, no ellipses** (`…`/`...`), complete sentences.
+
+**Why:** `gpt-oss-120b` (the default Groq model) is markdown-happy and, on chatty turns, can trail into `…` filler — which surfaced as garbled captions in the wild (`**… **… Oops! Looks …`). This is **mitigation #1**: it curbs both at the **source**, which is what cleans the **caption** — the transcript is forwarded **upstream** of the TTS-side filter, so a TTS filter alone would *not* fix the caption. It pairs with **mitigation #2**, the `MarkdownTextFilter` on the classic TTS (audio-only safety net — see Stack). The relay (`talking`) pipeline has no TTS filter, so there it relies on this directive alone. Guarded by `test_voice_output_style.py`.
+
 ---
 
 ## Tool naming — underscored, not dotted
 
-The 5 generic protocol tools register with the LLM as:
+The 5 generic tools register with the LLM as:
 
 | LLM-facing name | Wire-format `tool` field |
 |---|---|
 | `canvas_analyze` | `analyze` |
-| `canvas_highlight` | `highlight` |
 | `canvas_control` | `control` |
 | `canvas_action` | `action` |
 | `canvas_set_page` | `set_page` |
+| `canvas_annotate` | *(none — non-canvas `agent_annotate`)* |
+
+*(S67c: `canvas_highlight`/`highlight` was retired. `canvas_annotate` is the fifth tool but is **not** a Canvas-Protocol verb — it emits a non-canvas `agent_annotate` message to the shell overlay, off `DailyRelay`. The four real protocol tools still map to dotted wire verbs.)*
 
 OpenAI and Anthropic both validate tool names against `^[a-zA-Z0-9_-]+$` — `.` is rejected. Daily wire-format message `type` fields keep their dots (`canvas.command`, `canvas.sceneChanged`, etc.) — those don't go to the LLM.
 
 ---
 
-## Canvas tools — the 5 generic protocol tools + `generate_quiz_from_knowledge`
+## Canvas tools — 4 protocol tools + `canvas_annotate` + `generate_quiz_from_knowledge`
 
-`tools/canvas_protocol_tools.py` registers exactly 5 generic canvas tools. `tools/quiz_generation.py` adds a sixth non-canvas tool — `generate_quiz_from_knowledge` — bundled with `set_page` internally.
+`tools/canvas_protocol_tools.py` registers 5 generic canvas tools. **Four** of them (`canvas_analyze`, `canvas_control`, `canvas_action`, `canvas_set_page`) are true Canvas-Protocol tools: each translates aliases → UUIDs, validates against the active Page's manifest, builds a `canvas.command` with a fresh `commandId`, awaits the `commandResult` future over `DailyRelay`. **The fifth, `canvas_annotate` (S67c), is different** — it does NOT touch the protocol/relay; it resolves a target to normalized coords and emits a non-canvas `agent_annotate` message that the shell applies to the S67a annotation overlay (see the S67c section below). `tools/quiz_generation.py` adds the non-canvas `generate_quiz_from_knowledge` (bundled with `set_page` internally).
 
-Each canvas handler logs entry, translates aliases to UUIDs, validates against the active Page's manifest (with the `SCENE_NAV_VERBS` exemption), builds the wire payload with a fresh `commandId`, registers a pending future, sends the Daily app-message, awaits the future (6 s default timeout), and returns to the LLM. Errors are returned as tool results (`{error, message, details}`), not raised — a single failed call doesn't break the turn.
+Each *protocol* canvas handler logs entry, translates aliases to UUIDs, validates against the active Page's manifest (with the `SCENE_NAV_VERBS` exemption), builds the wire payload with a fresh `commandId`, registers a pending future, sends the Daily app-message, awaits the future (6 s default timeout), and returns to the LLM. Errors are returned as tool results (`{error, message, details}`), not raised — a single failed call doesn't break the turn.
 
 **`canvas_action` verb arg shapes**, **`canvas_set_page` allowlist** (`{composition, youtube, quiz}`), the **all-or-nothing override semantics** (empty `pageInit` = restore snapshot for both pageType and init), and the **scene-nav exemption** (`next_scene`/`previous_scene`/`goto_scene` bypass the per-Page manifest validator because they're shell-level) are all unchanged from S64e. See the Quiz section below for the bundling rationale.
 
@@ -288,7 +297,19 @@ There's no automated test that asserts the two repos agree — the gate is conve
 
 ## LLM provider selection
 
-`LLM_CANVAS_PROVIDER` env var selects the main LLM at boot. `bot.py:_build_llm_and_eager_hook` branches with **lazy imports** so only the selected provider's SDK needs to be installed. Read once at boot and fixed for the session — no mid-session switching.
+`LLM_CANVAS_PROVIDER` env var selects the main LLM at boot — one of `{groq, openai, anthropic, gemini}`, validated in `config.py`. `bot.py:_build_llm_and_eager_hook` branches with **lazy imports** so only the selected provider's SDK needs to be installed. Read once at boot and fixed for the session — no mid-session switching.
+
+**Default is `groq`** — `GroqLLMService(model=GROQ_MODEL)`, `GROQ_MODEL` default `openai/gpt-oss-120b`. Groq subclasses `OpenAILLMService` and speaks the OpenAI-compatible wire format, so:
+
+- It takes the system prompt via `GroqLLMService.Settings(model=…, system_instruction=…)` — same shape as the OpenAI branch.
+- It **reuses `OpenAIEagerHook`** (no `groq_adapter.py`) — the OpenAI chunk-shape parser handles Groq's streamed tool calls verbatim.
+- Import is `from pipecat.services.groq.llm import GroqLLMService` (the `.llm` submodule; the package `__init__` is a deprecation proxy). **Extra gotcha:** importing it runs the package `__init__`, which eagerly pulls `groq/tts.py` → needs the native `groq` SDK. That SDK ships via the **`pipecat-ai[groq]`** extra in `pyproject.toml`. Both `groq` and `openai` extras are installed, so flipping `groq`↔`openai` needs no reinstall; `anthropic`/`gemini` still need their own extras.
+
+Per-provider model env vars: `GROQ_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL` (OpenAI uses `LLM_MODEL`).
+
+> **Model-id note:** Groq's catalog lists the 120B GPT-OSS model as **`openai/gpt-oss-120b`** (the bare `gpt-oss-120b` 404s). Override via `GROQ_MODEL`.
+
+> **⚠️ `gpt-oss-120b` is text-only.** Verified: Groq returns `400 — messages[].content must be a string` when sent an OpenAI `image_url` content block. The agent's **S46 vision path injects a scene image into the main-LLM context at session start** (`build_vision_message` → `initial_messages` in `run_bot_classic` / `run_bot_relay`; also on every scene change in `VISION_REFRESH_MODE=eager`), so with the default Groq provider that **first turn 400s whenever a scene image is present**. The decoupled **S67b** vision path is unaffected (it returns Gemini's *text* reasoning as the `canvas_analyze` tool result, never a raw image). **This injection is gated by `MAIN_LLM_SUPPORTS_VISION`** (`config._resolve_main_llm_vision`): default **False** for `groq` — so `build_vision_message` is skipped at session start and in `eager` refresh (both `run_bot_classic` and `run_bot_relay` log the skip) — and **True** for openai/anthropic/gemini. To run Groq *with* in-context vision, point `GROQ_MODEL` at a multimodal Groq model and set `MAIN_LLM_SUPPORTS_VISION=true`. See **Vision** below.
 
 ---
 
@@ -341,8 +362,6 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'speaking_state', isSpeaking}`, `{type: 'llm_thinking', thinking}` — UI cues.
 - **`{type: 'script_complete', sceneIndex, hadScript, trigger}`** *(S65; `trigger` added S65c)* — emitted after the scene's scripts finish; the shell's auto-advance handler advances only when `trigger === 'auto'`.
 - **`{type: 'quiz_generation_state', state, error?}`** *(S65c)* — `state ∈ {generating, ready, error}`. Emitted by the manual `request_quiz` path (via `run_quiz_generation`'s `on_state` hook) so the shell's Quiz button can show a spinner / error. The LLM-tool quiz path does **not** emit these (no button to update).
-- **`{type: 'request_canvas_capture', captureId, hint, maxDim}`** *(S67b)* — asks the visitor's shell to screenshot the live canvas (scene + S67a annotations). `maxDim` is advisory (`VISION_MAX_DIM`); the shell owns the encode. The image does **not** ride Daily (4 KB limit) — the shell uploads JPEG bytes to the backend Redis ingest and replies with `canvas_capture_result` carrying only metadata.
-- **`{type: 'vision_state', state}`** *(S67b)* — `state ∈ {analyzing, idle}`. **Deterministic** signal bracketing the Gemini `analyze_image` call (emitted via `run_vision_query`'s `on_vision_state` hook), so the shell can show a "looking at your screen…" indicator **only while the model is actually running** — `analyzing` before, `idle` after (try/finally, always clears). The fast nudge / retry paths (no Gemini call) **never** emit it, so the indicator can't flash without a real analyze. Session-level (handle in the shell's general handler, like `quiz_generation_state` — not `DailyRelay`).
 - `{type: 'avatar_relay.*', …}` (relay pipeline only) — text/turn protocol for SoulX.
 
 **Incoming (frontend → agent):**
@@ -353,9 +372,8 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'canvas.commandResult', commandId, result}` / `{type: 'canvas.commandError', commandId, error}` → complete the awaiting Future.
 - **`{type: 'request_narrate'}`** *(S65c)* → `narrate_scene_script(force=True, trigger='manual')` — re-narrates the current scene's script without auto-advancing.
 - **`{type: 'request_quiz', count?, language?}`** *(S65c)* → `run_quiz_generation(...)` with the `quiz_generation_state` emitter. Silently ignored if the agent isn't ready yet (no `session_context`).
-- **`{type: 'canvas_capture_result', captureId, status, w?, h?, error?}`** *(S67b)* → resolves the `asyncio.Future` opened by `request_canvas_capture`, keyed by `captureId` in the sibling `_pending_captures` dict (NOT a canvas commandId). `status ∈ {ready, error, permission_denied}`. Carries metadata only — the JPEG bytes are fetched separately via `api_client.get_vision_capture(slug, captureId)`.
 
-**Routing rule (S65c + S67b, important):** the `request_narrate` / `request_quiz` / `canvas_capture_result` branches are **early-return branches in `on_app_message`, alongside but BEFORE the `canvas.*` dispatch** — never inside the canvas/relay path. They're session-level messages, not canvas commands (mirrors the frontend keeping them out of `DailyRelay`). They piggyback on the existing defensive `json.loads` (below).
+**S65c routing rule (important):** the two `request_*` branches are **early-return branches in `on_app_message`, alongside but BEFORE the `canvas.*` dispatch** — never inside the canvas/relay path. They're session-level requests, not canvas commands (mirrors the frontend keeping them out of `DailyRelay`). They piggyback on the existing defensive `json.loads` (below).
 
 Defensive JSON parsing in `on_app_message`: if Daily delivers the payload as a string (varies by SDK version), parse before the `isinstance(dict)` check. *(S64d hardening — still in place.)*
 
@@ -379,21 +397,15 @@ The snapshot includes:
 
 ---
 
-## Vision (S46 → S67b)
+## Vision (S46, S66-lazy)
 
-When the visitor asks about the screen or refers to something they've drawn / pointed at / written, `canvas_analyze` routes through `_ensure_vision_for_active_scene(question)` → `services/vision_query.run_vision_query(...)` (S67b). It reasons over what the visitor actually sees with the **dedicated Gemini `vision_client`** (decoupled from `LLM_CANVAS_PROVIDER`) and injects the result as a `[vision: …]` developer message. The conversational LLM no longer does the pixel reasoning — it receives `vision_client`'s **text**. Mode (`point | assess | describe`) is derived from the utterance; `assess` grounds on the scene's expected answer, fetched in parallel with the capture (A-AG-5).
+When the visitor asks "what's on screen?", the agent fetches `/scene-snapshot/image` (a Pillow-rendered base64 PNG) and adds it as a user message. The main LLM does the visual reasoning.
 
-**Live-capture-first — Pillow is NEVER used while screen-share is on.** The capture `status` *is* the per-request permission signal (`ready` = screen-share on; a permission error = off), so `run_vision_query` decides without any session flag:
+**(S66) `VISION_REFRESH_MODE=lazy|eager` (default `lazy`).** In `lazy` mode the Pillow frame is **not** rendered on every scene change — `refresh_agent_for_current_scene` marks it stale, and `_ensure_vision_frame()` fetches it on demand (a visual question / the first `canvas_analyze` of a scene), caching per scene id. This removes a backend image-render from the hot path of every transition — the biggest agent-side `T_agent` win. `eager` restores per-change rendering (escape hatch).
 
-- **`ready` + bytes** → reason over the **live capture** (annotations and all). The only path while screen-share is on; Pillow is never substituted. A fast transient miss (`ready` but bytes gone, or a non-permission error) **retries the capture once**; a timeout (already waited the full budget) does not.
-- **Live capture fails with screen-share on** (timeout, or both attempts missed) → a **`_CAPTURE_RETRY_NOTE`** ("couldn't grab your screen, try again") — **never** the annotation-less Pillow scene.
-- **Permission denied** (screen-share off) is the **only** place Pillow lives. `point`/`assess` → `_SHARE_SCREEN_NOTE` (ask to click the **"Let the Assistant see your screen"** button; never Pillow). `describe` is **two-stage**: the **first** describe-while-off → `_DESCRIBE_SHARE_NUDGE_NOTE` (ask to click the same button, **no Pillow yet**); a **repeated** describe while still off → the base-scene **Pillow PNG** (`_fetch_pillow`) → `vision_client` + blind-spot note. The describe-nudge flag lives on `SessionContext.describe_share_nudged` (set on the first nudge) and **resets whenever a capture comes back `ready`** (screen-share back on), so each off-period asks once before falling back. `run_vision_query` takes `session_context` (and derives slug + scene_id from it).
+V2.14 documented Vision as a separately-hardpinned OpenAI service for quality invariance under `LLM_CANVAS_PROVIDER` swaps, but **that separation isn't implemented yet** (the S46 in-context-image path uses the main LLM).
 
-`get_vision_image` (the old "live-or-Pillow" combiner) was split into `_fetch_live_bytes` (live only, never falls back) and `_fetch_pillow` (base scene only).
-
-**`VISION_REFRESH_MODE=lazy|eager` (default `lazy`, S66).** In `lazy` the Pillow frame isn't rendered on every scene change — `refresh_agent_for_current_scene` marks it stale. **Exception:** `eager` still pre-loads a Pillow image into the *main* LLM context on scene change (vestigial after S67b; the default `lazy` does not, and S67b's per-question vision path makes it redundant).
-
-> **The S66 `VisionFrameTracker` is now write-only.** `refresh_agent_for_current_scene` still writes it (eager pre-load / lazy invalidate), but the vision path no longer reads it — S67b captures fresh per question because annotations change *within* a scene (A-AG-3). `vision_refresh.ensure_vision_frame_for_scene` has no runtime caller (tests only). Both the tracker and that function are removable in a future cleanup.
+> **⚠️ Text-only main LLM (default Groq).** The S46 path adds the scene image to the **main LLM's** context via `build_vision_message` (session start + `eager` mode). `gpt-oss-120b` is text-only and **400s on image content** (`content must be a string`), so this injection is **gated off** for text-only main LLMs via `MAIN_LLM_SUPPORTS_VISION` (default False for `groq`) — see *LLM provider selection*. The **S67b** capture→Gemini path is unaffected: it returns Gemini's *text* reasoning as the `canvas_analyze` tool result, never a raw image, so it works under any main LLM.
 
 ---
 
@@ -410,14 +422,17 @@ uv run pytest -q
 `.env`:
 
 ```
-OPENAI_API_KEY=...                # main LLM (default)
+GROQ_API_KEY=...                  # main LLM — DEFAULT provider (GroqLLMService)
+GROQ_MODEL=openai/gpt-oss-120b            # Groq catalog id (bare gpt-oss-120b 404s); text-only
+OPENAI_API_KEY=...                # main LLM when LLM_CANVAS_PROVIDER=openai
 ANTHROPIC_API_KEY=...             # main LLM when LLM_CANVAS_PROVIDER=anthropic
-GOOGLE_AI_API_KEY=...             # main LLM when LLM_CANVAS_PROVIDER=gemini; ALSO S67b vision (always — unset ⇒ vision stubs)
+GOOGLE_AI_API_KEY=...             # S67b vision (always, decoupled); main LLM when LLM_CANVAS_PROVIDER=gemini
 DEEPGRAM_API_KEY=...
 CARTESIA_API_KEY=...
 DAILY_API_KEY=...
 HV_API_URL=http://localhost:3001/api/v1   # backend; passed through runner_args.body in prod
-LLM_CANVAS_PROVIDER=openai
+LLM_CANVAS_PROVIDER=groq                  # groq (default) | openai | anthropic | gemini
+# MAIN_LLM_SUPPORTS_VISION=true            # opt in only if GROQ_MODEL is multimodal (default: off for groq)
 
 # --- S65b — must match backend exactly ---
 NARRATION_CACHE_ENABLED=true
@@ -428,11 +443,6 @@ NARRATION_AUDIO_NUM_CHANNELS=1
 
 # --- S66 ---
 VISION_REFRESH_MODE=lazy                  # lazy (default) | eager
-
-# --- S67b — agent vision of the annotated canvas ---
-VISION_MODEL=gemini-3.5-flash             # dedicated vision model; decoupled from LLM_CANVAS_PROVIDER
-VISION_CAPTURE_TIMEOUT_MS=4000            # capture round-trip ceiling
-VISION_MAX_DIM=1280                       # advisory maxDim sent to the shell (shell owns encode)
 ```
 
 For Pipecat Cloud testing where the container can't reach `localhost`, point `HV_API_URL` at a publicly-accessible URL.
@@ -443,7 +453,7 @@ For Pipecat Cloud testing where the container can't reach `localhost`, point `HV
 
 Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend's live-room start endpoint creates a Daily room and registers the Pipecat Cloud agent; the agent boots, reads room metadata, fetches the snapshot, joins via DailyTransport.
 
-`LLM_CANVAS_PROVIDER` and the **`NARRATION_*` constants** are set as Pipecat Cloud env vars. Changing the `NARRATION_*` values requires coordinated redeploy with the backend.
+`LLM_CANVAS_PROVIDER` (default `groq`), the selected provider's key (**`GROQ_API_KEY`** for the default), **`GROQ_MODEL`**, and the **`NARRATION_*` constants** are set as Pipecat Cloud env vars. Changing the `NARRATION_*` values requires coordinated redeploy with the backend.
 
 **Dockerfile gotcha:** the build uses `pip install --no-cache-dir .` against `pyproject.toml`, but `packages = []` / `py-modules = []` — install pulls only dependencies. Agent code reaches `/app/` exclusively via explicit `COPY` lines. Adding a new top-level directory requires a matching `COPY` line. `services/cached_first_tts.py` lives under the existing `COPY services services`.
 
@@ -455,7 +465,7 @@ Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend'
 - **Tool names must satisfy `^[a-zA-Z0-9_-]+$`.** Don't reintroduce dots. Daily wire-format `type` may use dots.
 - **Don't add eager-dispatch entries for verbs with required args.**
 - **Don't modify `tools/canvas_protocol_tools.py` for new Page types.** The 5 generic tools are page-agnostic; new Page types are accommodated through their manifest.
-- **Don't add new Daily message types without coordinating with the frontend.** `DailyRelay` is the sole consumer/producer of `canvas.*` messages; non-canvas messages (`script_complete`, `request_*` triggers, S67b `request_canvas_capture` / `canvas_capture_result`) belong in the shell's general handler.
+- **Don't add new Daily message types without coordinating with the frontend.** `DailyRelay` is the sole consumer/producer of `canvas.*` messages; non-canvas messages (`script_complete`, future S65c `request_*` triggers) belong in the shell's general handler.
 - **Don't call `api_navigate` from agent-side scene-change handlers.** The frontend's `navigateToIndex` already advances the cursor.
 - **Don't add `__init__.py` to `tools/`, `context/`, `services/`** unless you also update the Dockerfile (Python 3.12 implicit namespace packages).
 - **Don't ask the LLM to copy large structured blobs between tool calls.** Bundle the side effect (`generate_quiz_from_knowledge` is canonical).
@@ -464,14 +474,11 @@ Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend'
 - **`CachedFirstTTSService` must emit the canonical TTS frame envelope on hits.** Never `OutputAudioRawFrame`. The guard test (`test_hit_never_emits_output_audio_raw_frame`) is non-negotiable — the `NarrationCompletionGate` fix depends on it.
 - **`NARRATION_*` constants are paired with the backend.** Don't change one without the other. Use `NARRATION_CACHE_SCHEMA_VERSION` (bumped on the backend) if you need a one-way invalidation.
 - **On a cache hit, don't call `set_cartesia_voice`.** The voice is baked into the bytes; the call is wasted control traffic.
-- **Vision is a dedicated Gemini path, decoupled from `LLM_CANVAS_PROVIDER` (S67b).** Capture-first AND Pillow-fallback bytes both go to `services/vision_client.py`; the conversational LLM gets `vision_client`'s **text**, not an image. Don't route vision back through the main LLM, and don't couple `VISION_MODEL` to the conversational provider.
-- **`vision_client` uses `thinking_level`, not `thinking_budget`.** gemini-3.5-flash is a 3.x model; `ThinkingConfig(thinking_level="low")`. Setting both errors. Use the async surface `client.aio.models.generate_content(...)` — the sync call blocks the pipeline loop.
-- **The capture image never rides Daily.** 4 KB `sendAppMessage` limit; a JPEG is 30–300+ KB. The shell uploads to the backend Redis ingest; the agent fetches via `get_vision_capture`. `request_canvas_capture`/`canvas_capture_result` carry metadata only, keyed by `captureId` in a sibling registry (never collide with canvas commandIds).
-- **Never let the agent claim to see annotations on the Pillow fallback (S67b V7).** `run_vision_query` appends a `[vision note: …]` blind-spot/unavailable note and the PLAYBOOK forbids fabricating drawings; keep both.
+- **Keep agent output plain-spoken (Groq/gpt-oss).** The reply is TTS'd *and* shown as a live caption. The `VOICE OUTPUT — STRICT` prompt directive (`render_voice_output_style_section`, appended by `_assemble_full_prompt`) forbids Markdown / emojis / ellipses; the classic TTS also runs `MarkdownTextFilter`. **The directive — not the filter — is what keeps the caption clean**, because the transcript forwarder sits *upstream* of the TTS filter. The relay (`talking`) pipeline has no TTS filter and relies on the directive alone.
 
 ---
 
-## Historical: S66 complete (Flow Scene-Switching Performance — agent hot-path cuts)
+## Recent: S66 complete (Flow Scene-Switching Performance — agent hot-path cuts)
 
 S66 cut agent-side scene-change latency (`T_agent`) so transitions land under 1 s. **No Canvas Protocol contract change.** Detail in "Scene-change refresh", "Live Room snapshot consumer", and "Vision" above. Summary:
 
@@ -565,96 +572,80 @@ Frontend shipped the YouTube Canvas Page; **Pipecat required zero changes.** Whe
 
 ---
 
-## Recent: S67a (Live Room Annotation Tools) — zero agent code
+## Recent: S67b ✅ — Agent Vision of the Annotated Canvas
 
-S67a added pen/highlight/text/eraser annotation tools to the live-room **frontend** shell (a shell-owned overlay above the iframe + a right-edge rail). Annotations are **temporary, session-only, never persisted**, and **never sent to the agent** — no Daily message, no canvas-protocol traffic, no snapshot field. The agent was **not touched**. Recorded here only for phase completeness.
-
-> The annotations matter to the agent **only via S67b**, and the mechanism is deliberately **pixels, not vector data**: the agent never learns about strokes/text boxes as structured data — it asks the shell for a screenshot (which already has the annotations burned in) and reasons over the image.
-
----
-
-## Recent: S67b complete (agent-side — Agent Vision of the Annotated Canvas)
-
-S67b is the **big agent session of Phase 9j** and the consumer of S67a. It gives the agent eyes on **what the visitor actually sees** — the live scene plus the S67a annotations in real pixels — for visual Q&A, "what am I pointing at?", and fill-in-the-blank answer assessment. **Agent-side complete** — B9–B16 + PLAYBOOK, plus the live-testing refinements (permission fast-path, live-capture-first, the two-stage `describe` nudge, and the deterministic `vision_state` indicator). **The end-to-end slice still needs three cross-repo pieces: the frontend capture handler (B1), the frontend `vision_state` indicator, and the backend Redis ingest.** The `## Vision (S46 → S67b)` and `## Daily app-messages` sections above describe the runtime behavior; this section is the design + as-built record.
-
-**Core architecture (read first):** the agent is a server-side Pipecat process with **no DOM**, so it **cannot call `getDisplayMedia` itself**. Capture happens in the **visitor's browser** (the shell), triggered by the agent over a **non-canvas Daily round-trip** — the only way to get the visitor's true client-side pixels. **The image does NOT travel over Daily** — Daily's `sendAppMessage` enforces a **4 KB limit** and a JPEG screenshot is tens of KB, so the shell uploads the bytes to a tiny **backend Redis ingest** and the agent fetches them from there (the Daily messages carry only `{captureId, status, w, h}`):
+The agent has eyes on **what the visitor actually sees** — the live scene plus the S67a annotations in real pixels — for visual Q&A, "what am I pointing at?", and fill-in-the-blank assessment. The agent has **no DOM**, so it **cannot call `getDisplayMedia`**; capture happens in the **visitor's browser** (the shell), triggered over a **non-canvas Daily round-trip**. **The image does NOT travel over Daily** — `sendAppMessage` caps at **4 KB**, so the shell uploads the JPEG to a tiny **backend Redis ingest** and the agent fetches it (the Daily messages carry only `{captureId, status, w, h}`):
 
 ```
 agent: request_canvas_capture(hint)  ──Daily(<4KB)──▶  {type:'request_canvas_capture', captureId, hint}
         │  (general non-canvas handler in the shell — NOT DailyRelay)
-        │  shell runs Screen Capture API → grabFrame → downscale → JPEG (Blob)
+        │  shell: Screen Capture API → grabFrame → downscale → JPEG (Blob)
         │  shell ──HTTPS POST raw bytes──▶ backend Redis  vision:capture:{slug}:{captureId}  (TTL 60s)
         ▼
 shell: {type:'canvas_capture_result', captureId, status:'ready'|'error', w, h}  ──Daily(<4KB)──▶  agent
-        │  resolve the awaiting asyncio.Future by captureId (sibling of PendingCommandRegistry)
+        │  resolve the awaiting asyncio.Future by captureId (sibling registry _pending_captures)
         ▼
 agent: api_client.get_vision_capture(slug, captureId)  ──HTTPS GET──▶ bytes (delete-on-read)
         ▼
 agent: vision_client.analyze_image(image_bytes, mode, scene_context) → reasoning
+        ▼
+agent: handle_analyze RETURNS the reasoning as the canvas_analyze TOOL RESULT (in-band):
+        {answer:"[vision: …] …", page_state:<iframe analyze state>}   ← NOT an out-of-band developer message
 ```
 
-> **Why the backend hop:** the 4 KB Daily limit forbids sending the screenshot over the data channel, so it transits a short-TTL no-store backend relay (two endpoints; Redis only; no DB, no R2). This is the one change from the V2.17 sketch, which had assumed the image could ride Daily / the backend was optional. The image still goes **agent-direct to Gemini** — the backend only relays bytes.
+- **`services/vision_client.py`** — dedicated Gemini multimodal client (lazy Google-SDK import). `VISION_MODEL` env, default **`gemini-3.5-flash`**; **decoupled from `LLM_CANVAS_PROVIDER`**; stubs gracefully when `GOOGLE_AI_API_KEY` is unset. `analyze_image(image_bytes, mode, scene_context)` with modes `point | assess | describe`; **`locate` added in S67c** (below).
+- **Capture round-trip** — `request_canvas_capture(hint)` emits the non-canvas request with a fresh `captureId`, registers an `asyncio.Future` in `_pending_captures`, awaits `canvas_capture_result` (timeout `VISION_CAPTURE_TIMEOUT_MS` ~4000); the result carries `status`/`w`/`h` only — **not the image**. Handled in an early-return `on_app_message` branch (before the canvas dispatch), never via the relay.
+- **`api_client.get_vision_capture(slug, captureId)`** — HTTPS GET of the shell-uploaded JPEG from the backend ingest (backend deletes on read).
+- **Vision delivery (in-band)** — the orchestration (`run_vision_query`, wired through `ensure_vision`) does capture-first → on `ready` fetch bytes → `vision_client`; on timeout/error/permission-denied → **Pillow base-scene fallback** + a blind-spot flag so the reply admits it can't see drawings. It **RETURNS** the reasoning text; `handle_analyze` folds it into the **`canvas_analyze` TOOL RESULT** (`{answer, page_state}`) — **NOT** an out-of-band `developer` message (the old `context.add_message` path raced the function-call re-run; see the in-band lesson below).
+- **Config** — `VISION_MODEL`, `VISION_CAPTURE_TIMEOUT_MS`, advisory `VISION_MAX_DIM`/`VISION_JPEG_QUALITY`. **Dockerfile** unchanged (`COPY services services`); the Google SDK is a base dep regardless of `LLM_CANVAS_PROVIDER`.
 
-**Design (locked decisions — all implemented agent-side; per-item as-built notes in "As built" below):**
+---
 
-- **`services/vision_client.py`** — a **dedicated Gemini multimodal client** (lazy Google-SDK import, mirroring `_build_llm_and_eager_hook`). `VISION_MODEL` env, default **`gemini-3.5-flash`** (stable, multimodal image input, 1M-token context). **Decoupled from `LLM_CANVAS_PROVIDER`** — vision is fast Gemini regardless of the conversational LLM. **Stub/degrade gracefully when `GOOGLE_AI_API_KEY` is unset** (every external service degrades — project principle).
-- **Capture round-trip** — `request_canvas_capture(hint)` emits the non-canvas Daily request with a fresh `captureId`, registers an `asyncio.Future` (sibling of `PendingCommandRegistry`, keyed by `captureId`), awaits `canvas_capture_result` (timeout `VISION_CAPTURE_TIMEOUT_MS` ~4000). The result carries `status`/`w`/`h` only — **not the image**. Handle it in an **early-return `on_app_message` branch alongside `request_narrate`/`request_quiz`, BEFORE the canvas dispatch** — never via the relay (same discipline that keeps `script_complete`/`request_*` off `DailyRelay`). Rides the existing defensive `json.loads`.
-- **`api_client.get_vision_capture(slug, captureId)`** — fetches the JPEG bytes the shell uploaded to the backend ingest (HTTPS GET, public base URL like `get_scene_snapshot_image`; backend deletes on read).
-- **Vision entry-point rework** — `_ensure_vision_frame()` (or a new `get_vision_image()`) becomes: → `request_canvas_capture()`; on `status:'ready'` → `api_client.get_vision_capture()` → bytes → `vision_client`; *on timeout/error/permission-denied* → **fall back to the existing `get_scene_snapshot_image()` Pillow PNG** and set a flag so the reply notes the annotation blind spot ("I can describe the scene but can't see your drawings unless you let me view your screen"). The visual-question / first-`canvas_analyze` path routes through this. **(Evolved in live testing — see "As built": the final rule is live-capture-first; Pillow is used ONLY for a *repeated* `describe` while screen-share is off, and timeouts/errors retry once then a try-again note rather than Pillow.)**
-- **Reasoning modes (V6)** — derive `mode` (`point | assess | describe`) from the utterance; for `assess`, pass the scene's expected answer/knowledge (already in the snapshot — `scripts`/`knowledge`) as `scene_context` so Gemini grounds the correctness judgment.
-- **PLAYBOOK directive** — when a visitor refers to something they've drawn/pointed at/written, invoke the vision path; on the Pillow fallback, never claim to see annotations.
-- **Config** — `VISION_MODEL` (default `gemini-3.5-flash`), `VISION_CAPTURE_TIMEOUT_MS` (~4000), advisory `VISION_MAX_DIM`/`VISION_JPEG_QUALITY` (the shell owns encode; the agent may request a maxDim in the `hint`).
-- **Dockerfile** — `services/vision_client.py` is reached via the existing `COPY services services` (no new top-level dir). Ensure the Google SDK is a dependency even when `LLM_CANVAS_PROVIDER` isn't Gemini.
-- **Speed (V8)** — kick the capture request off in parallel with prompt/context assembly; persistent client stream means no per-question permission prompt; downscale-before-encode + JPEG q≈0.7 keep the payload tiny; `gemini-3.5-flash` is the low-latency model. Target end-to-end < ~1.5–2 s on a warm stream; baseline into `docs/benchmarks/canvas_vision_<date>.md`.
-- **Tests (~6–8)** in `tests/test_canvas_vision.py`: round-trip resolves the future by `captureId`; timeout → Pillow fallback + blind-spot flag; `permission_denied` → fallback; `assess` passes scene answer into the prompt; `vision_client` stub path with the key unset; `canvas_capture_result` handled in the non-canvas branch (never via the relay). Existing S65/S65b/S65c/S66 tests pass unchanged.
+## Recent: S67c ✅ — Canvas-Interaction unified onto the New Annotation Tools
 
-### As built (final — including live-testing refinements)
+The agent's canvas-interaction **no longer renders inside the iframe**. The Old `canvas_highlight` tool is **retired**; the agent now draws on the **same S67a shell overlay** the visitor uses and S67b sees — one annotation system, not two.
 
-**Deviations from the V2.17 sketch.**
-- **Orchestration extracted to `services/vision_query.py`** (the sketch kept it inline). `run_vision_query(...)` is a dependency-injected core (mirrors `run_quiz_generation`); the bot.py `_ensure_vision_for_active_scene(question)` closure is a 1-line adapter. Extracted so the capture / fallback / assess / nudge logic is unit-testable (bot.py needs the full pipecat stack to import).
-- **The vision result is injected as a `[vision: …]` developer message** (same `context.add_message` mechanism the old Pillow path used); the frontend `analyze` dispatch (semantic state) still runs. `ensure_vision`'s `CanvasToolContext` type is `Callable[[str], …]` (passes the visitor's `question` for mode derivation).
-- **`thinking_level`, not `thinking_budget`** — gemini-3.5-flash is 3.x. `vision_client` uses the **async** `client.aio.models.generate_content(...)` with `Part.from_bytes` + `ThinkingConfig(thinking_level="low")`, validated against the installed **google-genai 1.75.0**. Exports `derive_vision_mode(utterance)`.
-- **`google-genai>=1.68.0,<2` is a BASE dep** (not `pipecat-ai[google]`); resolved to 1.75.0. `vision_query.py` + `vision_client.py` ride the existing `COPY services services` — no Dockerfile change.
+**`canvas_annotate` (replaces `canvas_highlight`).** LLM-facing params: `op ∈ {circle, arrow, shape, highlight, text, erase}`; `target ∈ {element:<alias>} | {region:{x,y,w,h}} | {describe:<text>}` (required unless `op=erase`); `shape` (when `op=shape`); `text` (when `op=text`). The handler resolves the target → **normalized 0..1 coords** (C2), builds op(s), and emits a non-canvas `agent_annotate` — it does **not** go through the Canvas Protocol / `DailyRelay`.
 
-**Refinements after the initial close-out (driven by live testing).** The entry-point / fallback logic evolved well past the sketch's "fall back to Pillow on any failure":
-- **Live-capture-first.** When screen-share is on (`status: ready`) the agent ALWAYS reasons over the live capture; **Pillow is never substituted**. `get_vision_image` was split into `_fetch_live_bytes` (live only) + `_fetch_pillow` (base scene only). A fast transient miss (ready-but-no-bytes / non-permission error) **retries the capture once**; a timeout does not (already waited the budget) → `_CAPTURE_RETRY_NOTE`.
-- **Permission fast-path.** `point`/`assess` + permission denial → `_SHARE_SCREEN_NOTE` (ask to click the button; no Pillow, no Gemini).
-- **Two-stage `describe` nudge.** First `describe` while screen-share is OFF → `_DESCRIBE_SHARE_NUDGE_NOTE` (ask to click **"Let the Assistant see your screen"** — `_SHARE_SCREEN_BUTTON`, named verbatim; **no Pillow yet**); a *repeated* `describe` while still off → base-scene Pillow + blind-spot note. Tracked by `SessionContext.describe_share_nudged`, **reset whenever a capture comes back `ready`** (one nudge per off-period). `run_vision_query` takes `session_context` (derives slug + scene_id + the nudge flag).
-- **Prompt broadening so describe questions actually reach vision.** Live testing showed the LLM answered "what's on screen?" from its prompt context and **never called `canvas_analyze`** → the vision path (and the nudge) never ran. Fix: the `canvas_analyze` tool description dropped the "cannot determine from existing context" escape hatch, and the PLAYBOOK directive now leads with "the live screen is NOT in your text context" + plain-describe examples. (Prompt-level ⇒ probabilistic, not a hard guarantee.)
-- **`vision_state` indicator (V8 — latency UX).** A **deterministic** `{type:'vision_state', state:'analyzing'|'idle'}` Daily message brackets the Gemini `analyze_image` call (via `run_vision_query`'s `on_vision_state` hook), so the shell can show a "looking at your screen…" cue ONLY while the model runs — never on the fast nudge/retry paths. `try/finally` guarantees `idle`. Chosen over a verbal acknowledgement ("too much verbal").
-- **Observability.** `request_canvas_capture` and the `canvas_capture_result` branch log capture id / status / future-found, so the round-trip is debuggable in Pipecat Cloud logs (added after a live test couldn't tell whether the reply reached `on_app_message`).
+```
+canvas_annotate(op, target, …)
+   ▼  target resolution (agent-side):
+     {element:'title'} → _element_box_from_snapshot(alias)   # snapshot 1280×720 geometry ÷ (1280,720)
+     {describe:'the actor'} → get_vision_image('locate') bytes → vision_client.locate() → {x,y,w,h}
+     {region:{…}} → passthrough
+   ▼  send_non_canvas({type:'agent_annotate', annotateId, ops:[{op, box, …}]})   # general handler, NOT relay
+   ▼  await agent_annotate_result {annotateId, ok} in _pending_annotates  (timeout AGENT_ANNOTATE_TIMEOUT_MS ~2000 → best-effort ok)
+   ▼  tool result: "Drew circle on the canvas." / "Couldn't locate that on screen…"
+```
 
-**Tests** — `tests/test_canvas_vision.py` is now **26 tests** (**211 total**, + 1 deselected `live` real-Gemini test): round-trip resolve / timeout / stale; `_fetch_live_bytes` & `_fetch_pillow`; live-first never-touches-Pillow, ready-no-bytes-retries, timeout-no-retry, error-retries; assess scene-context; client-degrade → unavailable; permission fast-path (point); two-stage describe (first-nudge / repeat-Pillow / **reset-on-ready**); `_is_permission_error`; **`vision_state` brackets-Gemini / no-flash-on-fast-path / clears-on-degrade**; `VisionClient` stub + no-SDK-touch; `canvas_capture_result` routed-before-dispatch (real-source guard + a contract-mirror, since the bot.py closures aren't importable). `ruff check . && pytest` green (B16 added a `[tool.ruff]` per-file-ignore for bot.py's intentional `E402`).
+- **`vision_client.locate(image_bytes, description)`** — returns a normalized `{x,y,w,h}` for a described target (Gemini object localization; parses `[ymin,xmin,ymax,xmax]`/1000 → 0..1), or `None` on a miss → the handler asks the visitor to point/clarify. Stub-degrades when the key is unset. This is what makes "circle the actor" work on a YouTube/arbitrary scene with no element geometry.
+- **`_pending_annotates`** — sibling `asyncio.Future` registry (keyed by `annotateId`), mirroring `_pending_captures`. **`agent_annotate_result`** is resolved in an early-return `on_app_message` branch (alongside `canvas_capture_result`, before the canvas dispatch).
+- **Element targets** resolve agent-side from the snapshot's 1280×720 element geometry (composition); the shell is a pure renderer of normalized ops.
+- **Removed:** the `canvas_highlight` tool + handler, its PLAYBOOK guidance, the highlight verb from the manifest expectations, and the highlight validation tests. **Canvas-Protocol manifest reduced to v0.2** (envelope/handshake unchanged).
+- **Tests** in `tests/test_canvas_annotate.py`: element target → resolved bbox → `agent_annotate` emitted; `describe` → `vision_client.locate` → coords; `region` passthrough; ack resolves / timeout → best-effort ok; `erase`; `locate` stub when key unset; `agent_annotate_result` handled in the non-canvas branch; **regression: `canvas_highlight` is no longer registered**.
 
-**Latency (V8)** — `docs/benchmarks/canvas_vision_2026-06-04.md`. The path has **two sequential LLM calls** (Gemini vision + the conversational TTS-LLM that speaks the answer, since `analyze_image` is non-streamed) + the capture round-trip → ~1.3 s best / ~2.4 s worst; the < 1.5–2 s target is **tight, not guaranteed**. The `vision_state` indicator masks the Gemini window in the UI; the deferred hard win is streaming the vision answer straight to TTS to drop the 2nd LLM turn.
+> **Lessons / invariants (S67b + S67c):**
+> 1. **Vision is decoupled from the main LLM.** `gemini-3.5-flash` runs vision (`analyze_image` + `locate`) regardless of `LLM_CANVAS_PROVIDER`; the Google SDK is a base dep.
+> 2. **The image never rides Daily** (4 KB). Capture transits the backend `vision-capture` ingest; only `{captureId,status,w,h}` goes over the data channel.
+> 3. **`canvas_annotate` is NOT a Canvas-Protocol tool.** It resolves coords agent-side and drives the shell overlay via non-canvas `agent_annotate` — `DailyRelay` stays `canvas.*`-only. Don't route it through the relay.
+> 4. **Pixels are ground truth; geometry is convenience.** Element targets use snapshot geometry (deterministic, composition); described targets use vision `locate` (works anywhere). Same op stream either way; agent marks land on the same overlay and are re-seen by the next capture.
+> 5. **Best-effort ack.** A missing `agent_annotate_result` within the timeout is treated as success; only an explicit `{ok:false}` reports a problem to the LLM.
+> 6. **Vision is delivered IN-BAND as the `canvas_analyze` tool result** (`{answer, page_state}`), not an out-of-band `developer` message. The old out-of-band `context.add_message` injection raced the function-call re-run (pipecat seeds an `IN_PROGRESS` tool placeholder, and the spoken reply was sometimes generated before the developer message landed) → intermittent "I can't see" replies despite an accurate `[vision: …]` in the logs. Returning the reasoning as the tool result guarantees it's in the re-run context: `ensure_vision` returns the text and `handle_analyze` folds it via `_merge_analyze_result` (vision leads as `answer`; the iframe page state rides along as `page_state`). Guarded by `test_canvas_analyze_vision_result.py`.
 
-**Lessons (READ BEFORE TOUCHING).**
-1. **Vision is dedicated Gemini, decoupled from `LLM_CANVAS_PROVIDER`** — text out, not image. `eager` mode still pre-loads a Pillow image into the main context — vestigial.
-2. **Pillow is used in exactly ONE place:** a `describe` question's *repeat* ask while screen-share is OFF. Screen-share on ⇒ never Pillow. Don't reintroduce a blanket fallback.
-3. **`GOOGLE_AI_API_KEY` must be set on the DEPLOYED agent**, not just locally — else every capture stubs to `VISION_UNAVAILABLE` and the agent silently degrades. (Cost a live debugging session.)
-4. **The LLM must choose to call `canvas_analyze`** for the vision path (and the nudge) to run at all — a prompt concern, inherently probabilistic. If it regresses, the deterministic fallback is to detect screen/visual utterances and force the path.
-5. **The feature depends on the frontend actually granting `getDisplayMedia`.** Until it does, captures return `permission_required` and the agent can only nudge / show the base scene.
-6. The S66 `VisionFrameTracker` is write-only post-S67b; `vision_refresh.ensure_vision_frame_for_scene` has no runtime caller. Removable later.
-7. Capture bytes never ride Daily (4 KB) — backend Redis hop is mandatory. `request_canvas_capture` / `canvas_capture_result` / `vision_state` are session-level (early-return before the canvas dispatch / general handler), keyed by `captureId` in a sibling `_pending_captures` registry; session-end drains it.
-8. **The agent names the "Let the Assistant see your screen" button verbatim** (`_SHARE_SCREEN_BUTTON` in `vision_query.py`). If the shell's label changes, update that constant or the agent points at a button that doesn't exist.
+---
 
-**Cross-repo remainder (NOT agent-side — required for the slice to work end-to-end).**
-- **Frontend B1 — capture handler.** The shell's `request_canvas_capture` handler (general non-`DailyRelay`): Screen Capture API → grab → downscale (honor `maxDim`) → JPEG → POST to the backend ingest → reply `canvas_capture_result {status, w, h}`. **Must actually obtain + hold the `getDisplayMedia` grant**, and send a permission error (something containing `permission`) on denial — the agent keys the nudge / fast-path off that.
-- **Frontend — `vision_state` indicator.** Show "looking at your screen…" on `state:'analyzing'`, hide on `'idle'`, with a ~8 s safety auto-hide (Daily is best-effort).
-- **Backend — Redis ingest.** Two endpoints: POST upload (`vision:capture:{slug}:{captureId}`, TTL ~60 s) + GET delete-on-read at `/live-rooms/by-slug/{slug}/vision-capture/{captureId}`.
+## Coming next — S68 (Knowledge-Aware Generate Scene)
 
-After S67b: **S68 (Knowledge-Aware Generate Scene)** — the former S67, unchanged in scope; agent involvement minimal (generation is a studio/backend feature). Then MCP (S69–70), video export (S71), deployment + launch (S72–76).
+S68 generates a scene's layout + script from a prompt using Scene/Flow Knowledge (S54–56 RAG), targeting `canvas_page_type='composition'`. **Agent involvement is minimal** — generation is a studio/backend feature, not a live-room one. Generated scenes inherit narration (S65), fast switching (S66), and the full visual-interaction stack (S67a/b/c) automatically, since those are shell/agent features keyed off the snapshot, not the page generator. After S68: MCP (S69–70), video export (S71), deployment + launch (S72–76).
 
 ---
 
 ## Out of scope
 
 - Mid-session provider switching (`LLM_CANVAS_PROVIDER` fixed at boot).
-- Natural-language highlight targets.
 - Persistent iframe shell (per-scene unmount + keyed remount is current; S66's optional prewarm double-buffer was **deferred to S74** — Blocks 1–5 hit the < 1 s target without it).
 - A/B testing infrastructure for comparing providers in production.
-- **Streaming the vision answer directly to TTS** to skip the 2nd conversational-LLM turn for pure visual questions (the S67b latency lever — deferred; today's design routes the vision text back through the conversational LLM for persona/voice consistency). *(Vision provider separation itself is now DONE — S67b's `vision_client` is dedicated Gemini, decoupled from `LLM_CANVAS_PROVIDER`.)*
-- Eager-dispatch-to-Pipecat-streaming-loop wiring (hooks constructed; never invoked; tracked for S74).
+- Eager-dispatch-to-Pipecat-streaming-loop wiring (hooks constructed; never invoked; tracked for S75).
 - **Caching narration audio for the relay (`talking`) pipeline.** SoulX renders its own audio — `CachedFirstTTSService` is only in the classic pipeline. Per-script-avatar voice in relay is the same v0.2 punt.
 - **Caching fallback (room-primary-voiced) segments.** Room-dependent → requires room-scoped keys → v2.
 - **Cache warming on publish, edge/multi-region warming, Opus/OGG encoding to cut R2 size.** All v2 considerations.

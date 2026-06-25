@@ -272,13 +272,14 @@ class CanvasToolContext:
     # aliases_out parameter.
     element_alias_map: dict[str, str] = field(default_factory=dict)
     command_timeout_s: float = 6.0
-    # S66 Block 5a — lazy vision frame. When wired, handle_analyze calls
-    # this before dispatching `analyze` so the LLM has a fresh scene
-    # image in context for the active scene. None ⇒ no-op (legacy eager
-    # behavior, where bot.py refreshes the vision frame on every scene
-    # change). bot.py constructs the closure that bridges this to
-    # vision_refresh.ensure_vision_frame_for_scene.
-    ensure_vision: Optional[Callable[[str], Awaitable[None]]] = None
+    # S66 Block 5a / S67b — lazy vision. handle_analyze calls this before
+    # dispatching `analyze`; the closure runs the vision query and RETURNS the
+    # vision answer text (or None). handle_analyze folds that text into the
+    # canvas_analyze TOOL RESULT (in-band) — previously it was injected
+    # out-of-band via context.add_message, which raced the function-call re-run
+    # and intermittently left the spoken reply without the vision answer.
+    # None ⇒ no vision this turn. bot.py constructs the closure (run_bot_*).
+    ensure_vision: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
 
 
 async def dispatch_canvas_command(
@@ -327,6 +328,22 @@ async def dispatch_canvas_command(
         )
 
 
+def _merge_analyze_result(vision_answer: Optional[str], page_state):
+    """Fold the vision answer into the canvas_analyze tool result (in-band).
+
+    S67b fix: the vision answer is the authoritative answer for visual questions
+    ("what's on screen / what did I circle"), so it leads as ``answer``; the
+    iframe page semantic state rides along as ``page_state`` for page-state
+    questions (quiz / youtube). Either may be absent — with no vision answer this
+    returns the page state unchanged (legacy behavior).
+    """
+    if vision_answer is not None and page_state is not None:
+        return {"answer": vision_answer, "page_state": page_state}
+    if vision_answer is not None:
+        return {"answer": vision_answer}
+    return page_state
+
+
 def make_handlers(ctx: CanvasToolContext):
     """Build {tool_name: async_handler} for Pipecat's function-calling system.
     Each handler validates against the manifest, sends the Daily message, awaits
@@ -361,22 +378,33 @@ def make_handlers(ctx: CanvasToolContext):
         args = params.arguments or {}
         question = args.get("question", "")
         logger.info(f"[CANVAS_ANALYZE] called: question={question!r}")
-        # S66 Block 5a — lazy vision frame. Fetch and add the current
-        # scene's image to context if it isn't already loaded. Failures
-        # are logged but don't fail the analyze call — the iframe's
-        # semantic state alone still answers most questions.
+        # S67b fix — run vision and CAPTURE its answer to fold into the tool
+        # result below (in-band). Previously the vision answer was injected
+        # out-of-band via context.add_message (a separate developer message),
+        # which raced the function-call re-run: the spoken reply was sometimes
+        # generated from only the iframe page-state result and said "I can't
+        # see" even though vision succeeded. Failures are logged, not fatal.
+        vision_answer = None
         if ctx.ensure_vision is not None:
             try:
-                # S67b — pass the visitor's question so the vision path can
-                # derive its mode (point / assess / describe) from the utterance.
-                await ctx.ensure_vision(question)
+                # Pass the visitor's question so the vision path can derive its
+                # mode (point / assess / describe) from the utterance.
+                vision_answer = await ctx.ensure_vision(question)
             except Exception as exc:
                 logger.warning(f"[CANVAS_ANALYZE] ensure_vision failed: {exc!r}")
+        # Dispatch the iframe page-state analyze, but don't let its failure drop
+        # the vision answer — for visual questions, vision IS the answer.
+        page_state = None
         try:
-            result = await _dispatch("analyze", {"question": question, "options": args.get("options", {})})
-            await params.result_callback(result)
+            page_state = await _dispatch("analyze", {"question": question, "options": args.get("options", {})})
         except CanvasCommandError as exc:
-            await _emit_error(params, exc, "CANVAS_ANALYZE")
+            if vision_answer is None:
+                await _emit_error(params, exc, "CANVAS_ANALYZE")
+                return
+            logger.warning(
+                f"[CANVAS_ANALYZE] page-state analyze failed; returning vision answer only: {exc!r}"
+            )
+        await params.result_callback(_merge_analyze_result(vision_answer, page_state))
 
     async def handle_control(params: FunctionCallParams):
         args = params.arguments or {}

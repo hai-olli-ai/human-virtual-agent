@@ -162,6 +162,33 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
 # satisfy ^[a-zA-Z0-9_-]+$" applies here too — dotted forms would steer
 # the model toward calls that 400 at the provider boundary.
 
+def render_voice_output_style_section() -> str:
+    """VOICE OUTPUT STYLE — hard formatting constraint for TTS + caption.
+
+    The reply is sent verbatim to the TTS engine and shown as a live caption,
+    so any Markdown the model emits (gpt-oss is markdown-happy) surfaces as
+    spoken/printed noise — literal ``**``, stray symbols, trailing ``…``
+    filler. This blunt directive keeps output to plain spoken words. It pairs
+    with the TTS-side ``MarkdownTextFilter`` (the audio safety net), but the
+    directive is what also keeps the CAPTION clean, since the transcript is
+    forwarded upstream of the TTS filter.
+    """
+    return (
+        "## VOICE OUTPUT — STRICT\n"
+        "Your reply is read aloud by a text-to-speech engine and shown as a live "
+        "caption, word for word. Output ONLY plain spoken words:\n"
+        "- NO Markdown or formatting characters of any kind — no asterisks "
+        "(`*`, `**`), underscores, backticks, pound/hash signs, bullet points, or "
+        "numbered-list markers.\n"
+        "- NO emojis, and NO ellipses (\"…\" or \"...\"). Never trail off — finish "
+        "every sentence you start.\n"
+        "- Speak the way a person talks: short, complete sentences. To emphasize a "
+        "word, just say it plainly — never wrap it in symbols.\n"
+        "- If you have little to say, say one short natural sentence — never emit "
+        "placeholder dots, asterisks, or symbols."
+    )
+
+
 def render_agent_playbook_section() -> str:
     """AGENT PLAYBOOK — situational sequences the agent should follow.
 
