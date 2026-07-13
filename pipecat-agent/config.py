@@ -14,7 +14,6 @@ CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 
 # Human Virtual API
 HV_API_URL = os.getenv("HV_API_URL", "http://localhost:3001/api/v1")
-HV_API_TOKEN = os.getenv("HV_API_TOKEN", "")
 
 # Daily (managed by Pipecat Cloud, but useful for local Daily testing)
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")

@@ -20,6 +20,7 @@ dependency closure), so each async test goes through ``asyncio.run``.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import api_client
@@ -41,9 +42,17 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    """Minimal httpx.AsyncClient stand-in that records ``.get`` calls."""
+    """Minimal httpx.AsyncClient stand-in that records ``.get`` calls.
+
+    P3 (2026-07-13) — api_client now routes every call through a shared
+    module-level client (``get_shared_client``), which checks
+    ``is_closed`` before reuse; the fake mirrors that attribute and the
+    harness below resets the module global so each test gets a fresh
+    fake (and no fake leaks into other test files' real calls).
+    """
 
     last_calls: list[tuple] = []
+    is_closed = False
 
     def __init__(self, *args, **kwargs):
         self.init_kwargs = kwargs
@@ -66,8 +75,18 @@ class _FakeAsyncClient:
         )
 
 
-def _reset_fake_client():
+@contextmanager
+def _patched_client():
+    """Patch httpx.AsyncClient AND reset the shared-client global, both
+    before (so the fake is actually constructed) and after (so the fake
+    instance can't leak into other tests' real backend calls)."""
     _FakeAsyncClient.last_calls = []
+    api_client._shared_client = None
+    with patch.object(api_client.httpx, "AsyncClient", _FakeAsyncClient):
+        try:
+            yield
+        finally:
+            api_client._shared_client = None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -76,8 +95,7 @@ def _reset_fake_client():
 
 
 def test_snapshot_without_scene_id_omits_param():
-    _reset_fake_client()
-    with patch.object(api_client.httpx, "AsyncClient", _FakeAsyncClient):
+    with _patched_client():
         _run(api_client.get_scene_snapshot("room-1", api_url="http://x/api"))
     assert _FakeAsyncClient.last_calls, "get was not called"
     _, params = _FakeAsyncClient.last_calls[-1]
@@ -85,8 +103,7 @@ def test_snapshot_without_scene_id_omits_param():
 
 
 def test_snapshot_with_scene_id_includes_param():
-    _reset_fake_client()
-    with patch.object(api_client.httpx, "AsyncClient", _FakeAsyncClient):
+    with _patched_client():
         _run(
             api_client.get_scene_snapshot(
                 "room-1", api_url="http://x/api", scene_id="scene-abc"
@@ -104,8 +121,7 @@ def test_snapshot_with_none_scene_id_treated_as_omitted():
     — the bot.py call sites pass ``scene_id=target_scene_id or None``
     so a falsy broadcast scene_id must not surface as an empty-string
     query param."""
-    _reset_fake_client()
-    with patch.object(api_client.httpx, "AsyncClient", _FakeAsyncClient):
+    with _patched_client():
         _run(
             api_client.get_scene_snapshot(
                 "room-1", api_url="http://x/api", scene_id=None
@@ -116,8 +132,7 @@ def test_snapshot_with_none_scene_id_treated_as_omitted():
 
 
 def test_snapshot_with_empty_string_scene_id_treated_as_omitted():
-    _reset_fake_client()
-    with patch.object(api_client.httpx, "AsyncClient", _FakeAsyncClient):
+    with _patched_client():
         _run(
             api_client.get_scene_snapshot(
                 "room-1", api_url="http://x/api", scene_id=""

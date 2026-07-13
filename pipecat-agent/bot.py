@@ -760,6 +760,38 @@ async def run_bot_classic(
     # refresh) so the FLOW block is rendered once per knowledge content
     # hash. SCENE-scope is always rebuilt (varies per navigation).
     flow_knowledge_cache = FlowKnowledgeCache()
+
+    # ── Session-start backend reads (P3 2026-07-13) ──
+    # Snapshot + avatar-config + scene-image are independent — fetch them
+    # CONCURRENTLY, then thread the snapshot into build_system_prompt
+    # (which used to fetch its own copy, and a fourth fetch below pulled
+    # the same snapshot AGAIN for scripts). 5 serial round trips → one
+    # gather + the persona fetch.
+    scene_snapshot = None
+    avatar_config = None
+    scene_image_b64 = None
+    if room_id:
+        from api_client import get_avatar_config, get_scene_image_base64, get_scene_snapshot
+
+        scene_snapshot, avatar_config, scene_image_b64 = await asyncio.gather(
+            get_scene_snapshot(room_id, api_url),
+            get_avatar_config(room_id, api_url),
+            get_scene_image_base64(room_id, api_url),
+        )
+        if avatar_config:
+            logger.info(f"Avatar config: name={avatar_config.get('name')}, voiceModelId={avatar_config.get('voiceModelId')}")
+        else:
+            logger.info("No avatar config available — using default voice")
+        if scene_image_b64:
+            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
+        else:
+            logger.info("No scene image available; vision disabled for this session")
+        if scene_snapshot:
+            scripts_len = len(
+                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
+            )
+            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
+
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
@@ -767,42 +799,9 @@ async def run_bot_classic(
         api_url=api_url,
         aliases_out=element_alias_map,
         flow_cache=flow_knowledge_cache,
+        snapshot=scene_snapshot,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
-
-    # ── Fetch avatar config for TTS voice ──
-    avatar_config = None
-    if room_id:
-        from api_client import get_avatar_config
-        avatar_config = await get_avatar_config(room_id, api_url)
-        if avatar_config:
-            logger.info(f"Avatar config: name={avatar_config.get('name')}, voiceModelId={avatar_config.get('voiceModelId')}")
-        else:
-            logger.info("No avatar config available — using default voice")
-
-    # ── Fetch canvas image for vision ──
-    scene_image_b64 = None
-    if room_id:
-        from api_client import get_scene_image_base64
-        scene_image_b64 = await get_scene_image_base64(room_id, api_url)
-        if scene_image_b64:
-            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
-        else:
-            logger.info("No scene image available; vision disabled for this session")
-
-    # ── Fetch scene snapshot for scripts ──
-    # S65 (Option B) — snapshot is nested under {live_room, flow_state,
-    # current_scene, knowledge, survey}. Pull the per-scene block once
-    # so subsequent reads stay terse.
-    scene_snapshot = None
-    if room_id:
-        from api_client import get_scene_snapshot
-        scene_snapshot = await get_scene_snapshot(room_id, api_url)
-        if scene_snapshot:
-            scripts_len = len(
-                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
-            )
-            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
 
     # ── Canvas Protocol substrate (S64c) ──
     # Manifest + pending command registries are per-session; an instance pair
@@ -1064,6 +1063,12 @@ async def run_bot_classic(
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
+    # P3 (2026-07-13) — single-slot handle for the backgrounded
+    # scene-change narration (see the narration tail of the refresh
+    # closure below). A new scene change cancels the previous scene's
+    # narration task before starting its own.
+    scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
+
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
     # visitor-initiated scene navigation. The frontend's navigateToIndex
@@ -1074,10 +1079,10 @@ async def run_bot_classic(
     #   1. Rebuilds the system prompt (so CANVAS ELEMENTS + ids and
     #      knowledge.flow reflect the new scene).
     #   2. Refreshes the vision frame.
-    # No verb-specific logic and no api_navigate call — the frontend has
-    # already advanced the backend cursor by the time this fires, so
-    # build_system_prompt's internal /scene-snapshot fetch returns the
-    # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
+    # No verb-specific logic and no api_navigate call. Since P2
+    # (2026-07-13) the frontend advances the backend cursor in the
+    # BACKGROUND, so this closure must NOT rely on the cursor — every
+    # fetch here targets the broadcast sceneId explicitly. aliases_out updates canvas_ctx.element_alias_map
     # in place so the next canvas_annotate / canvas_action resolves
     # aliases against the new scene's elements.
     async def refresh_agent_for_current_scene(
@@ -1108,12 +1113,24 @@ async def run_bot_classic(
         # via the legacy ``scene_id=`` kwarg below — it is NOT forwarded
         # to the snapshot fetch. When the broadcast lacks sceneId
         # (target_scene_id is None) we fall through to a cursor-based
-        # fetch, which is also correct.
+        # fetch — correct only eventually: since P2 the shell advances
+        # the cursor with a background goto it does not await, so a
+        # cursor read can trail the visual by one scene until it lands.
+        # P3 (2026-07-13) — the post-nav snapshot is fetched ONCE here
+        # and threaded into build_system_prompt (which used to fetch an
+        # identical copy internally — the redundant fetch #2 on every
+        # scene change).
+        from api_client import get_scene_image_base64, get_scene_snapshot
+
+        fresh_snapshot = await get_scene_snapshot(
+            room_id, api_url, scene_id=target_scene_id or None
+        )
         new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
             flow_cache=flow_knowledge_cache,
             snapshot_scene_id=target_scene_id or None,
+            snapshot=fresh_snapshot,
         )
         # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
         # the section is dropped on every navigation and the LLM loses its
@@ -1130,17 +1147,8 @@ async def run_bot_classic(
 
         # S64e — refresh session_context.current_scene_id from the
         # post-nav snapshot so generate_quiz_from_knowledge targets the
-        # scene the visitor is actually looking at. The snapshot was
-        # fetched inside build_system_prompt; we re-fetch here (cheap,
-        # cached on the backend) rather than threading the snapshot
-        # through every prompt-builder caller.
+        # scene the visitor is actually looking at.
         # S65 (Option B) — scene_id nested under current_scene.
-        from api_client import get_scene_snapshot, get_scene_image_base64
-        # S66 Block 5c — second fetch also takes the broadcast scene_id
-        # so both refresh paths agree on which scene is "current".
-        fresh_snapshot = await get_scene_snapshot(
-            room_id, api_url, scene_id=target_scene_id or None
-        )
         fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
         if fresh_snapshot and fresh_cs.get("scene_id"):
             new_scene_id = str(fresh_cs["scene_id"])
@@ -1158,7 +1166,12 @@ async def run_bot_classic(
         # The session-start fetch is unconditional and lives outside this
         # closure — only the per-scene-change refetch is gated.
         if VISION_REFRESH_MODE == "eager" and MAIN_LLM_SUPPORTS_VISION:
-            new_image = await get_scene_image_base64(room_id, api_url)
+            # P3 — render by broadcast scene_id: a cursor-relative render
+            # races the shell's background cursor advance and can return
+            # the OLD scene's image.
+            new_image = await get_scene_image_base64(
+                room_id, api_url, scene_id=target_scene_id or None
+            )
             if new_image:
                 from scene_context import build_vision_message
                 context.add_message(build_vision_message(new_image))
@@ -1205,29 +1218,55 @@ async def run_bot_classic(
         # run_bot_classic scope (defined below; Python closures look up
         # names at call time, so this works even though they appear
         # textually later in the file).
+        #
+        # P3 (2026-07-13) — narration runs as a BACKGROUND task. It was
+        # awaited inline, which held the sceneChanged handler (and with
+        # it the Daily app-message dispatch for this session) hostage
+        # for the full narration duration — tens of seconds for long
+        # scripts. Only the prompt refresh needs to complete inline
+        # (that's the ordering guarantee the on_app_message comment
+        # documents); narration is playback. Single-slot: a newer scene
+        # change cancels the previous scene's narration task, and a
+        # cancelled task deliberately does NOT emit script_complete —
+        # the superseding navigation already moved the shell forward.
         if fresh_snapshot:
             narration_gate.cancel_all("scene_change")
-            try:
-                spoke_script = await run_scene_narration(
-                    fresh_snapshot,
-                    narrator=narrator,
-                    speak_followup=_classic_speak,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[CANVAS SCENECHANGED] narration failed: {!r}", exc
-                )
-                spoke_script = False
-            await output_transport.send_message(
-                OutputTransportMessageFrame(
-                    message=build_script_complete_payload(
-                        fresh_snapshot, spoke_script=spoke_script
+            prev_task = scene_narration_task["task"]
+            if prev_task is not None and not prev_task.done():
+                prev_task.cancel()
+
+            async def _narrate_and_complete(snap: dict) -> None:
+                try:
+                    try:
+                        spoke_script = await run_scene_narration(
+                            snap,
+                            narrator=narrator,
+                            speak_followup=_classic_speak,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[CANVAS SCENECHANGED] narration failed: {!r}", exc
+                        )
+                        spoke_script = False
+                    await output_transport.send_message(
+                        OutputTransportMessageFrame(
+                            message=build_script_complete_payload(
+                                snap, spoke_script=spoke_script
+                            )
+                        )
                     )
-                )
-            )
-            logger.info(
-                "[CANVAS SCENECHANGED] narration complete spoke_script={}",
-                spoke_script,
+                    logger.info(
+                        "[CANVAS SCENECHANGED] narration complete spoke_script={}",
+                        spoke_script,
+                    )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "[CANVAS SCENECHANGED] narration superseded by a newer scene change"
+                    )
+                    raise
+
+            scene_narration_task["task"] = asyncio.create_task(
+                _narrate_and_complete(fresh_snapshot)
             )
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
@@ -1692,6 +1731,11 @@ async def run_bot_classic(
         # TTSStoppedFrame so the disconnect doesn't leave coroutines
         # hung on futures that will never resolve.
         narration_gate.cancel_all("session_end")
+        # P3 — cancel any backgrounded scene narration so it can't emit
+        # script_complete into a torn-down session.
+        _nar_task = scene_narration_task["task"]
+        if _nar_task is not None and not _nar_task.done():
+            _nar_task.cancel()
         await task.cancel()
 
     # ── Run ──
@@ -1732,6 +1776,31 @@ async def run_bot_relay(
     element_alias_map: dict[str, str] = {}
     # S66 Block 5b — see run_bot_classic. One cache per session.
     flow_knowledge_cache = FlowKnowledgeCache()
+
+    # ── Session-start backend reads (P3 2026-07-13) ──
+    # Snapshot + scene-image are independent — fetch them CONCURRENTLY,
+    # then thread the snapshot into build_system_prompt (which used to
+    # fetch its own copy, and a third fetch below pulled the same
+    # snapshot AGAIN for scripts). See run_bot_classic's mirror.
+    scene_snapshot = None
+    scene_image_b64 = None
+    if room_id:
+        from api_client import get_scene_image_base64, get_scene_snapshot
+
+        scene_snapshot, scene_image_b64 = await asyncio.gather(
+            get_scene_snapshot(room_id, api_url),
+            get_scene_image_base64(room_id, api_url),
+        )
+        if scene_image_b64:
+            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
+        else:
+            logger.info("No scene image available; vision disabled for this session")
+        if scene_snapshot:
+            scripts_len = len(
+                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
+            )
+            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
+
     system_prompt = await build_system_prompt(
         room_id=room_id,
         avatar_id=avatar_id,
@@ -1739,30 +1808,9 @@ async def run_bot_relay(
         api_url=api_url,
         aliases_out=element_alias_map,
         flow_cache=flow_knowledge_cache,
+        snapshot=scene_snapshot,
     )
     logger.info(f"System prompt length: {len(system_prompt)} chars")
-
-    # ── Fetch canvas image for vision ──
-    scene_image_b64 = None
-    if room_id:
-        from api_client import get_scene_image_base64
-        scene_image_b64 = await get_scene_image_base64(room_id, api_url)
-        if scene_image_b64:
-            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
-        else:
-            logger.info("No scene image available; vision disabled for this session")
-
-    # ── Fetch scene snapshot for scripts ──
-    # S65 (Option B) — scripts nested under current_scene.
-    scene_snapshot = None
-    if room_id:
-        from api_client import get_scene_snapshot
-        scene_snapshot = await get_scene_snapshot(room_id, api_url)
-        if scene_snapshot:
-            scripts_len = len(
-                ((scene_snapshot.get("current_scene") or {}).get("scripts")) or []
-            )
-            logger.info("Scene snapshot loaded (scripts={})", scripts_len)
 
     # ── Canvas Protocol substrate (S64c) ──
     output_transport = transport.output()
@@ -1983,6 +2031,12 @@ async def run_bot_relay(
 
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
+    # P3 (2026-07-13) — single-slot handle for the backgrounded
+    # scene-change narration (see the narration tail of the refresh
+    # closure below). A new scene change cancels the previous scene's
+    # narration task before starting its own.
+    scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
+
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
     # visitor-initiated scene navigation. The frontend's navigateToIndex
@@ -1993,10 +2047,10 @@ async def run_bot_relay(
     #   1. Rebuilds the system prompt (so CANVAS ELEMENTS + ids and
     #      knowledge.flow reflect the new scene).
     #   2. Refreshes the vision frame.
-    # No verb-specific logic and no api_navigate call — the frontend has
-    # already advanced the backend cursor by the time this fires, so
-    # build_system_prompt's internal /scene-snapshot fetch returns the
-    # post-nav scene. aliases_out updates canvas_ctx.element_alias_map
+    # No verb-specific logic and no api_navigate call. Since P2
+    # (2026-07-13) the frontend advances the backend cursor in the
+    # BACKGROUND, so this closure must NOT rely on the cursor — every
+    # fetch here targets the broadcast sceneId explicitly. aliases_out updates canvas_ctx.element_alias_map
     # in place so the next canvas_annotate / canvas_action resolves
     # aliases against the new scene's elements.
     async def refresh_agent_for_current_scene(
@@ -2027,12 +2081,24 @@ async def run_bot_relay(
         # via the legacy ``scene_id=`` kwarg below — it is NOT forwarded
         # to the snapshot fetch. When the broadcast lacks sceneId
         # (target_scene_id is None) we fall through to a cursor-based
-        # fetch, which is also correct.
+        # fetch — correct only eventually: since P2 the shell advances
+        # the cursor with a background goto it does not await, so a
+        # cursor read can trail the visual by one scene until it lands.
+        # P3 (2026-07-13) — the post-nav snapshot is fetched ONCE here
+        # and threaded into build_system_prompt (which used to fetch an
+        # identical copy internally — the redundant fetch #2 on every
+        # scene change).
+        from api_client import get_scene_image_base64, get_scene_snapshot
+
+        fresh_snapshot = await get_scene_snapshot(
+            room_id, api_url, scene_id=target_scene_id or None
+        )
         new_base = await build_system_prompt(
             room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
             flow_cache=flow_knowledge_cache,
             snapshot_scene_id=target_scene_id or None,
+            snapshot=fresh_snapshot,
         )
         # S64d — preserve CANVAS PAGE section across scene refreshes. Otherwise
         # the section is dropped on every navigation and the LLM loses its
@@ -2049,17 +2115,8 @@ async def run_bot_relay(
 
         # S64e — refresh session_context.current_scene_id from the
         # post-nav snapshot so generate_quiz_from_knowledge targets the
-        # scene the visitor is actually looking at. The snapshot was
-        # fetched inside build_system_prompt; we re-fetch here (cheap,
-        # cached on the backend) rather than threading the snapshot
-        # through every prompt-builder caller.
+        # scene the visitor is actually looking at.
         # S65 (Option B) — scene_id nested under current_scene.
-        from api_client import get_scene_snapshot, get_scene_image_base64
-        # S66 Block 5c — second fetch also takes the broadcast scene_id
-        # so both refresh paths agree on which scene is "current".
-        fresh_snapshot = await get_scene_snapshot(
-            room_id, api_url, scene_id=target_scene_id or None
-        )
         fresh_cs = (fresh_snapshot or {}).get("current_scene") or {}
         if fresh_snapshot and fresh_cs.get("scene_id"):
             new_scene_id = str(fresh_cs["scene_id"])
@@ -2073,7 +2130,12 @@ async def run_bot_relay(
 
         # S66 Block 5a — see run_bot_classic for rationale.
         if VISION_REFRESH_MODE == "eager" and MAIN_LLM_SUPPORTS_VISION:
-            new_image = await get_scene_image_base64(room_id, api_url)
+            # P3 — render by broadcast scene_id: a cursor-relative render
+            # races the shell's background cursor advance and can return
+            # the OLD scene's image.
+            new_image = await get_scene_image_base64(
+                room_id, api_url, scene_id=target_scene_id or None
+            )
             if new_image:
                 from scene_context import build_vision_message
                 context.add_message(build_vision_message(new_image))
@@ -2115,30 +2177,57 @@ async def run_bot_relay(
         # _relay_close_turn resolve from the enclosing run_bot_relay
         # scope (defined below; Python closures look up names at call
         # time, so this works even though they appear textually later).
+        #
+        # P3 (2026-07-13) — narration runs as a BACKGROUND task (see the
+        # classic pipeline's mirror for the full rationale). Single-slot:
+        # a newer scene change cancels the previous scene's narration;
+        # the finally still closes the RELAY_TURN so SoulX never sees a
+        # dangling turn, but a cancelled task does NOT emit
+        # script_complete — the superseding navigation already moved the
+        # shell forward.
         if fresh_snapshot:
-            spoke_script = False
-            try:
-                spoke_script = await run_scene_narration(
-                    fresh_snapshot,
-                    narrator=narrator,
-                    speak_followup=_relay_speak,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[CANVAS SCENECHANGED] narration failed: {!r}", exc
-                )
-            finally:
-                await _relay_close_turn()
-            await output_transport.send_message(
-                OutputTransportMessageFrame(
-                    message=build_script_complete_payload(
-                        fresh_snapshot, spoke_script=spoke_script
+            prev_task = scene_narration_task["task"]
+            if prev_task is not None and not prev_task.done():
+                prev_task.cancel()
+
+            async def _narrate_and_complete(snap: dict) -> None:
+                spoke_script = False
+                try:
+                    try:
+                        spoke_script = await run_scene_narration(
+                            snap,
+                            narrator=narrator,
+                            speak_followup=_relay_speak,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[CANVAS SCENECHANGED] narration failed: {!r}", exc
+                        )
+                    finally:
+                        # Shielded so the RELAY_TURN still closes even when
+                        # this task is cancelled mid-narration (an await in
+                        # a cancelled task would otherwise re-raise before
+                        # the close completes).
+                        await asyncio.shield(_relay_close_turn())
+                    await output_transport.send_message(
+                        OutputTransportMessageFrame(
+                            message=build_script_complete_payload(
+                                snap, spoke_script=spoke_script
+                            )
+                        )
                     )
-                )
-            )
-            logger.info(
-                "[CANVAS SCENECHANGED] narration complete spoke_script={}",
-                spoke_script,
+                    logger.info(
+                        "[CANVAS SCENECHANGED] narration complete spoke_script={}",
+                        spoke_script,
+                    )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "[CANVAS SCENECHANGED] narration superseded by a newer scene change"
+                    )
+                    raise
+
+            scene_narration_task["task"] = asyncio.create_task(
+                _narrate_and_complete(fresh_snapshot)
             )
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
@@ -2442,6 +2531,11 @@ async def run_bot_relay(
             if not _ann_fut.done():
                 _ann_fut.cancel()
         _pending_annotates.clear()
+        # P3 — cancel any backgrounded scene narration so it can't emit
+        # script_complete into a torn-down session.
+        _nar_task = scene_narration_task["task"]
+        if _nar_task is not None and not _nar_task.done():
+            _nar_task.cancel()
         await task.cancel()
 
     # ── Event handlers (complex — participant role detection) ──

@@ -478,6 +478,19 @@ Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend'
 
 ---
 
+## Recent: P3 latency pass (2026-07-13 — cross-repo scene-switch optimization)
+
+Agent half of the P0–P4 latency pass (backend P0/P1, frontend P2, media P4 — see the backend repo's `docs/benchmarks/scene_switch_2026-07-13.md`). Four changes, no contract change:
+
+1. **Shared httpx client** (`api_client.get_shared_client()`): every helper used to build a fresh `AsyncClient` per call, paying TCP+TLS per backend request (4–6 requests per scene change). One lazy module-level client with keep-alive now serves all calls. Tests that patch `httpx.AsyncClient` must also reset `api_client._shared_client` (see `_patched_client()` in `test_sceneid_by_id_fetch.py`).
+2. **Redundant snapshot fetch deleted:** `build_system_prompt` now accepts a pre-fetched `snapshot=` — the refresh closure fetches the post-nav snapshot ONCE and threads it in (it used to be fetched twice per scene change: once inside build_system_prompt, once for session_context). Session start similarly threads its snapshot in (was fetched twice there too).
+3. **Session-start fetches gathered:** snapshot + avatar-config + scene-image run under one `asyncio.gather` instead of serially; inside `build_system_prompt`, snapshot + persona-prompt are also gathered when no snapshot is passed.
+4. **Narration off the hot path:** the scene-change narration (`run_scene_narration` + `script_complete` emission) runs as a single-slot background `asyncio.Task` instead of being awaited inline in the sceneChanged handler — a long script no longer holds app-message processing hostage. A newer scene change cancels the previous narration task; a cancelled task does NOT emit `script_complete` (the superseding nav already moved the shell). Relay: the `RELAY_TURN` close is `asyncio.shield`ed so cancellation can't strand a dangling turn. Both disconnect handlers cancel the slot.
+
+**Deliberately NOT built:** agent-side adjacent-scene prefetch. The backend's warm-on-navigate (P1) pre-builds the k1 snapshot variant + persona for target and target+1, so the agent's by-id fetch is already a Redis hit — an agent prefetch would only add load.
+
+---
+
 ## Recent: S66 complete (Flow Scene-Switching Performance — agent hot-path cuts)
 
 S66 cut agent-side scene-change latency (`T_agent`) so transitions land under 1 s. **No Canvas Protocol contract change.** Detail in "Scene-change refresh", "Live Room snapshot consumer", and "Vision" above. Summary:

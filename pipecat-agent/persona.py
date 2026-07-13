@@ -3,12 +3,13 @@
 Session 45: Uses Session 43's persona-prompt endpoint for the base prompt,
 then enriches with scene snapshot data for instruction + display mode awareness.
 """
+import asyncio
+
 from loguru import logger
 
 from api_client import (
-    get_avatar,
+    get_avatar_config,
     get_persona_prompt,
-    get_scene,
     get_scene_snapshot,
 )
 from flow_knowledge_cache import FlowKnowledgeCache
@@ -84,6 +85,7 @@ async def build_system_prompt(
     aliases_out: dict[str, str] | None = None,
     flow_cache: FlowKnowledgeCache | None = None,
     snapshot_scene_id: str | None = None,
+    snapshot: dict | None = None,
 ) -> str:
     """Build the full system prompt for the voice agent.
 
@@ -114,7 +116,10 @@ async def build_system_prompt(
     3. If everything fails, fall back to DEFAULT_PROMPT.
 
     The snapshot is fetched at most once and reused for the LANGUAGE
-    directive, the AUDIENCE section, and per-strategy enrichment.
+    directive, the AUDIENCE section, and per-strategy enrichment. Pass
+    ``snapshot`` to skip the fetch entirely (P3 2026-07-13 — callers
+    that already hold the post-nav snapshot thread it through instead
+    of paying a duplicate backend round trip).
     """
     # ── Snapshot fetched once; powers LANGUAGE + AUDIENCE + body ──
     # S65 (Option B) — snapshot nested under {live_room, flow_state,
@@ -127,14 +132,29 @@ async def build_system_prompt(
     # scene_id — a hint from whoever started the agent, which for flow
     # rooms can be stale (the room's cursor moves; the body doesn't).
     # ``scene_id`` stays Strategy-2-only (avatar+scene path below).
-    # Backend that doesn't yet honor ``?scene_id=`` degrades to cursor
-    # snapshot (correct anyway: navigateToIndex advanced the cursor
-    # before broadcasting).
-    snapshot: dict | None = None
+    # P3 (2026-07-13) — snapshot and persona-prompt are independent
+    # backend reads; fetch them CONCURRENTLY instead of serially (the
+    # persona fetch used to wait for the snapshot round trip to finish).
+    # The persona fetch targets the SAME scene as the snapshot: the
+    # broadcast scene_id when present, else the (pre-fetched) snapshot's
+    # own scene_id. Cursor-relative persona reads race the shell's
+    # background cursor advance (P2) — the old-scene-prompt bug.
+    persona_prompt: str | None = None
     if room_id:
-        snapshot = await get_scene_snapshot(
-            room_id, api_url, scene_id=snapshot_scene_id or None
-        )
+        if snapshot is None:
+            snapshot, persona_prompt = await asyncio.gather(
+                get_scene_snapshot(room_id, api_url, scene_id=snapshot_scene_id or None),
+                get_persona_prompt(room_id, api_url, scene_id=snapshot_scene_id or None),
+            )
+        else:
+            persona_scene_id = (
+                snapshot_scene_id
+                or ((snapshot.get("current_scene") or {}).get("scene_id"))
+                or None
+            )
+            persona_prompt = await get_persona_prompt(
+                room_id, api_url, scene_id=str(persona_scene_id) if persona_scene_id else None
+            )
 
     live_room_block = (snapshot or {}).get("live_room") or {}
     current_scene_block = (snapshot or {}).get("current_scene") or {}
@@ -155,8 +175,8 @@ async def build_system_prompt(
     body_parts: list[str] = []
 
     # ── Strategy 1: Use persona-prompt endpoint (Session 43) ──
+    # persona_prompt was fetched above (concurrently with the snapshot).
     if room_id:
-        persona_prompt = await get_persona_prompt(room_id, api_url)
         if persona_prompt:
             logger.info(f"Loaded persona prompt from backend for room {room_id}")
             body_parts.append(persona_prompt)
@@ -193,22 +213,23 @@ async def build_system_prompt(
 
             return _wrap_language_sandwich(body_parts, language, audience_section)
 
-    # ── Strategy 2: Build locally from avatar + scene ──
+    # ── Strategy 2: Build locally from public live-room data ──
     logger.info("Building prompt locally (no room_id or persona-prompt unavailable)")
 
-    # Avatar persona
-    if avatar_id:
-        avatar = await get_avatar(avatar_id)
-        if avatar:
-            parts = [f"## Your Identity\nYou are {avatar.get('name', 'an AI assistant')}."]
-            if avatar.get("persona"):
-                parts.append(avatar["persona"])
-            if avatar.get("gender"):
-                parts.append(f"Gender: {avatar['gender']}")
-            body_parts.append("\n".join(parts))
-
-            if avatar.get("knowledge"):
-                body_parts.append(f"## Your Knowledge\n{avatar['knowledge']}")
+    # Avatar identity — via the PUBLIC avatar-config endpoint. The old
+    # path fetched the authenticated /avatars/{id} with a static
+    # HV_API_TOKEN that silently expired 2026-04-04 (every call 401'd);
+    # persona/knowledge depth comes from Strategy 1's persona-prompt —
+    # this last-resort fallback keeps identity only, from data the agent
+    # can actually reach.
+    if room_id:
+        avatar_config = await get_avatar_config(room_id, api_url)
+        if avatar_config and avatar_config.get("name"):
+            body_parts.append(f"## Your Identity\nYou are {avatar_config['name']}.")
+    elif avatar_id:
+        logger.info(
+            "No room_id — avatar identity unavailable via public endpoints; skipping identity section"
+        )
 
     # AUDIENCE — between persona and knowledge/scene (S61)
     if audience_section:
@@ -241,11 +262,11 @@ async def build_system_prompt(
         if scripts_section:
             body_parts.append(scripts_section)
     elif scene_id:
-        scene = await get_scene(scene_id)
-        if scene:
-            body_parts.append(f"## Current Scene: {scene.get('title', 'Untitled')}")
-            if scene.get("instruction"):
-                body_parts.append(f"## Scene Instruction\n{scene['instruction']}")
+        # Pre-2026-07-10 this fetched the authenticated /scenes/{id}
+        # (dead — expired token). There is no public per-scene endpoint
+        # without a room; the snapshot fetched at the top is the only
+        # scene source, and it's None on this branch by construction.
+        logger.info("No snapshot available — scene context skipped in local prompt")
 
     # Guidelines (always included)
     body_parts.append("""## Guidelines

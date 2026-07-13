@@ -2,7 +2,34 @@
 import httpx
 from loguru import logger
 
-from config import HV_API_URL, HV_API_TOKEN
+from config import HV_API_URL
+
+# ── Shared connection pool (P3 2026-07-13) ──
+# Every helper used to construct a fresh AsyncClient per call, paying a
+# new TCP + TLS handshake each time (2-3 extra round trips per backend
+# call — the agent makes 4-6 calls per scene change). One module-level
+# client reuses keep-alive connections across all calls. httpx clients
+# are asyncio-safe for concurrent requests; the pool is lazily created
+# so import stays side-effect free.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def get_shared_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+    return _shared_client
+
+
+async def close_shared_client() -> None:
+    """Optional teardown for tests / graceful shutdown."""
+    global _shared_client
+    if _shared_client is not None and not _shared_client.is_closed:
+        await _shared_client.aclose()
+    _shared_client = None
 
 
 class BackendError(Exception):
@@ -17,38 +44,6 @@ class BackendError(Exception):
     """
 
 
-# ── Authenticated endpoints (existing — for direct avatar/scene fetch) ──
-
-async def get_avatar(avatar_id: str) -> dict | None:
-    """Fetch avatar with persona and knowledge from the API."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{HV_API_URL}/avatars/{avatar_id}",
-                headers={"Authorization": f"Bearer {HV_API_TOKEN}"},
-            )
-            response.raise_for_status()
-            return response.json()
-    except Exception as e:
-        logger.warning(f"Failed to fetch avatar {avatar_id}: {e}")
-        return None
-
-
-async def get_scene(scene_id: str) -> dict | None:
-    """Fetch scene with elements from the API."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{HV_API_URL}/scenes/{scene_id}",
-                headers={"Authorization": f"Bearer {HV_API_TOKEN}"},
-            )
-            response.raise_for_status()
-            return response.json()
-    except Exception as e:
-        logger.warning(f"Failed to fetch scene {scene_id}: {e}")
-        return None
-
-
 # ── Public endpoints (Session 43 — no auth required) ──
 
 async def get_avatar_config(room_id: str, api_url: str | None = None) -> dict | None:
@@ -60,34 +55,48 @@ async def get_avatar_config(room_id: str, api_url: str | None = None) -> dict | 
     """
     base_url = api_url or HV_API_URL
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{base_url}/live-rooms/{room_id}/avatar-config",
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await get_shared_client().get(
+            f"{base_url}/live-rooms/{room_id}/avatar-config",
+        )
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        logger.warning(f"Failed to fetch avatar config for room {room_id}: {e}")
+        logger.warning(f"Failed to fetch avatar config for room {room_id}: {e!r}")
         return None
 
 
-async def get_persona_prompt(room_id: str, api_url: str | None = None) -> str | None:
+async def get_persona_prompt(
+    room_id: str,
+    api_url: str | None = None,
+    scene_id: str | None = None,
+) -> str | None:
     """Fetch the assembled persona system prompt for a live room.
 
     Uses GET /live-rooms/{room_id}/persona-prompt (no auth).
     Returns the full prompt string, or None on failure.
+
+    P3 (2026-07-13) — ``scene_id`` targets the prompt at a specific scene
+    (backend selector added alongside the S66 snapshot ones; cursor-safe).
+    REQUIRED for the scene-change path: the shell advances the server
+    cursor with a background 'goto' POST it does not await, so a
+    cursor-relative persona fetch fired on canvas.sceneChanged can race
+    the cursor commit and build the prompt from the OLD scene. No
+    ``scene_id`` → legacy cursor-relative read (session start).
     """
     base_url = api_url or HV_API_URL
+    params: dict[str, str] = {}
+    if scene_id:
+        params["scene_id"] = scene_id
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{base_url}/live-rooms/{room_id}/persona-prompt",
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data.get("prompt")
+        response = await get_shared_client().get(
+            f"{base_url}/live-rooms/{room_id}/persona-prompt",
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("prompt")
     except Exception as e:
-        logger.warning(f"Failed to fetch persona prompt for room {room_id}: {e}")
+        logger.warning(f"Failed to fetch persona prompt for room {room_id}: {e!r}")
         return None
 
 
@@ -95,6 +104,7 @@ async def get_scene_snapshot(
     room_id: str,
     api_url: str | None = None,
     scene_id: str | None = None,
+    scene_index: int | None = None,
 ) -> dict | None:
     """Fetch the current scene snapshot for a live room.
 
@@ -109,60 +119,75 @@ async def get_scene_snapshot(
     from any scene's knowledge regardless of which scene is current.
 
     S66 Block 5c — when ``scene_id`` is provided, it's passed as
-    ``?scene_id=…`` so the backend (once Block 1 lands) returns the
-    snapshot for THAT scene specifically rather than the room's
-    cursor-current scene. This eliminates the cursor race on
-    canvas.sceneChanged. If the backend doesn't yet honor the param,
-    the response falls back to cursor-based snapshot — which is the
-    correct scene anyway because the cursor was advanced by
-    navigateToIndex BEFORE the broadcast. Graceful degradation by
-    construction; no error path required.
+    ``?scene_id=…`` so the backend returns the snapshot for THAT scene
+    specifically rather than the room's cursor-current scene. This
+    eliminates the cursor race on canvas.sceneChanged. P2 (2026-07-13)
+    made this LOAD-BEARING, not just an optimization: the shell now
+    advances the cursor with a background 'goto' POST it does not
+    await, so at broadcast time the cursor may still point at the OLD
+    scene. A cursor-relative fallback (no scene_id) remains correct
+    only in the eventual-consistency sense — prefer passing the id.
     """
     base_url = api_url or HV_API_URL
     params: dict[str, str] = {"include_all_scene_knowledge": "true"}
     if scene_id:
         params["scene_id"] = scene_id
+    elif scene_index is not None:
+        # P3 (2026-07-13) — by-index selector (S66), cursor-safe like
+        # scene_id. The two are mutually exclusive on the backend;
+        # scene_id wins when both are passed.
+        params["scene_index"] = str(scene_index)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{base_url}/live-rooms/{room_id}/scene-snapshot",
-                params=params,
-            )
-            response.raise_for_status()
-            data = response.json()
-            # S65 (Option B) — snapshot nested under {live_room,
-            # flow_state, current_scene, knowledge, survey}. Defensive
-            # setdefaults so a pre-S65 backend (or a degraded response)
-            # still yields a dict every consumer's `(snapshot.get("X")
-            # or {}).get("Y")` chain can read without KeyError.
-            data.setdefault("live_room", {})
-            data.setdefault("flow_state", {})
-            data.setdefault("current_scene", {})
-            data["current_scene"].setdefault("scripts", [])
-            return data
+        response = await get_shared_client().get(
+            f"{base_url}/live-rooms/{room_id}/scene-snapshot",
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+        # S65 (Option B) — snapshot nested under {live_room,
+        # flow_state, current_scene, knowledge, survey}. Defensive
+        # setdefaults so a pre-S65 backend (or a degraded response)
+        # still yields a dict every consumer's `(snapshot.get("X")
+        # or {}).get("Y")` chain can read without KeyError.
+        data.setdefault("live_room", {})
+        data.setdefault("flow_state", {})
+        data.setdefault("current_scene", {})
+        data["current_scene"].setdefault("scripts", [])
+        return data
     except Exception as e:
-        logger.warning(f"Failed to fetch scene snapshot for room {room_id}: {e}")
+        logger.warning(f"Failed to fetch scene snapshot for room {room_id}: {e!r}")
         return None
 
 
-async def get_scene_image_base64(room_id: str, api_url: str | None = None) -> str | None:
+async def get_scene_image_base64(
+    room_id: str,
+    api_url: str | None = None,
+    scene_id: str | None = None,
+) -> str | None:
     """Fetch the rendered scene canvas as a base64-encoded PNG.
 
     Uses GET /live-rooms/{room_id}/scene-snapshot/image?format=base64 (no auth).
     Returns the base64 string (no data: prefix), or None on failure.
+
+    P3 (2026-07-13) — ``scene_id`` renders THAT scene (S66 selector,
+    cursor-safe). Pass it on scene-change refreshes: the shell's cursor
+    advance is a background POST now, so a cursor-relative render can
+    race it and return the OLD scene's image.
     """
     base_url = api_url or HV_API_URL
+    params: dict[str, str] = {"format": "base64"}
+    if scene_id:
+        params["scene_id"] = scene_id
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{base_url}/live-rooms/{room_id}/scene-snapshot/image",
-                params={"format": "base64"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data.get("image")
+        response = await get_shared_client().get(
+            f"{base_url}/live-rooms/{room_id}/scene-snapshot/image",
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("image")
     except Exception as e:
-        logger.warning(f"Failed to fetch scene image for room {room_id}: {e}")
+        logger.warning(f"Failed to fetch scene image for room {room_id}: {e!r}")
         return None
 
 
@@ -181,15 +206,14 @@ async def get_vision_capture(
     """
     base_url = api_url or HV_API_URL
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{base_url}/live-rooms/by-slug/{slug}/vision-capture/{capture_id}",
-            )
-            response.raise_for_status()
-            return response.content
+        response = await get_shared_client().get(
+            f"{base_url}/live-rooms/by-slug/{slug}/vision-capture/{capture_id}",
+        )
+        response.raise_for_status()
+        return response.content
     except Exception as e:
         logger.warning(
-            f"Failed to fetch vision capture {capture_id} for slug {slug}: {e}"
+            f"Failed to fetch vision capture {capture_id} for slug {slug}: {e!r}"
         )
         return None
 
@@ -219,14 +243,13 @@ async def generate_quiz(
     url = f"{base_url}/live-rooms/by-slug/{slug}/scenes/{scene_id}/generate-quiz"
     payload = {"count": count, "language": language}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json=payload)
-        if response.status_code != 200:
-            detail = response.text[:300]
-            raise BackendError(
-                f"generate_quiz failed: HTTP {response.status_code} {detail}"
-            )
-        return response.json()
+    response = await get_shared_client().post(url, json=payload)
+    if response.status_code != 200:
+        detail = response.text[:300]
+        raise BackendError(
+            f"generate_quiz failed: HTTP {response.status_code} {detail}"
+        )
+    return response.json()
 
 
 async def navigate_scene(
@@ -246,13 +269,12 @@ async def navigate_scene(
         body["target_index"] = target_index
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{base_url}/live-rooms/{room_id}/navigate",
-                json=body,
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await get_shared_client().post(
+            f"{base_url}/live-rooms/{room_id}/navigate",
+            json=body,
+        )
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        logger.warning(f"Failed to navigate room {room_id} ({direction}): {e}")
+        logger.warning(f"Failed to navigate room {room_id} ({direction}): {e!r}")
         return None
