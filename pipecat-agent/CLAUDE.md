@@ -1,7 +1,7 @@
 # pipecat-agent — CLAUDE.md
 
 > Voice agent for **Human Virtual** (hv.ai), built on the **Pipecat Framework**.
-> **Status:** S64c–e + S65 + S65b + S65c + S66 + **S67b + S67c** shipped; **S68 (knowledge-aware Generate Scene) is next.** **S67b** added agent vision of the live canvas: `services/vision_client.py` (dedicated `gemini-3.5-flash` multimodal client, decoupled from `LLM_CANVAS_PROVIDER`, graceful stub when `GOOGLE_AI_API_KEY` is unset), the `request_canvas_capture` round-trip (sibling `asyncio.Future` registry; `canvas_capture_result` handled in the non-canvas `on_app_message` branch), `api_client.get_vision_capture()` (fetch the shell-uploaded JPEG from the backend `vision-capture` ingest — the 4 KB Daily limit forbids the image on the data channel), and the `get_vision_image()` rework (capture-first → Pillow fallback with a blind-spot flag); the vision reasoning is returned **in-band as the `canvas_analyze` tool result** (not an out-of-band developer message). **S67c** unified canvas-interaction: **`canvas_highlight` is RETIRED**, replaced by **`canvas_annotate`** which draws on the **same S67a shell overlay** (non-canvas `agent_annotate` round-trip, not the Canvas Protocol), the `vision_client` gained a **`locate`** mode (normalized bbox for described targets), and the in-iframe highlight path is gone (Canvas-Protocol manifest reduced to **v0.2**). The classic TTS service is a `CachedFirstTTSService` (cache hit → raw PCM in the identical `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires; miss → live Cartesia). `generate_quiz_from_knowledge`'s core is the factored `run_quiz_generation` coroutine; inbound `request_narrate` / `request_quiz` / `canvas_capture_result` / `agent_annotate_result` branches sit alongside the canvas dispatch in `on_app_message`; `script_complete` carries `trigger: 'auto' | 'manual'`. **S66** made scene-change refresh fast: **lazy vision** (`VISION_REFRESH_MODE=lazy` default), **flow-knowledge reuse**, and **by-`sceneId` snapshot fetch** off `canvas.sceneChanged` (cursor-independent; cursor fallback retained). **LLM provider:** the conversational LLM now **defaults to Groq** (`GroqLLMService`, OpenAI-compatible, model `openai/gpt-oss-120b`); `openai`/`anthropic`/`gemini` stay selectable via `LLM_CANVAS_PROVIDER`. ⚠️ `gpt-oss-120b` is **text-only**, so the S46 scene-image-in-main-LLM-context injection is **gated off** for Groq (`MAIN_LLM_SUPPORTS_VISION`); visual Q&A still runs via the decoupled S67b Gemini path (see *LLM provider selection*).
+> **Status:** S64c–e + S65 + S65b + S65c + S66 + **S67b + S67c** shipped · **S68 (External Embeds) shipped — zero agent changes** · **S69a (Generation Engine) shipped — zero agent changes** · **P3 latency pass (2026-07-13) shipped** · **Auto Play Phase A (2026-07-16) shipped — truthful playout completion + interruption awareness (see *Recent: Auto Play Phase A*); Phase B is frontend-side** · **next agent-relevant work: none until MCP E2E (S71).** **S67b** added agent vision of the live canvas: `services/vision_client.py` (dedicated `gemini-3.5-flash` multimodal client, decoupled from `LLM_CANVAS_PROVIDER`, graceful stub when `GOOGLE_AI_API_KEY` is unset), the `request_canvas_capture` round-trip (sibling `asyncio.Future` registry; `canvas_capture_result` handled in the non-canvas `on_app_message` branch), `api_client.get_vision_capture()` (fetch the shell-uploaded JPEG from the backend `vision-capture` ingest — the 4 KB Daily limit forbids the image on the data channel), and the `get_vision_image()` rework (capture-first → Pillow fallback with a blind-spot flag); the vision reasoning is returned **in-band as the `canvas_analyze` tool result** (not an out-of-band developer message). **S67c** unified canvas-interaction: **`canvas_highlight` is RETIRED**, replaced by **`canvas_annotate`** which draws on the **same S67a shell overlay** (non-canvas `agent_annotate` round-trip, not the Canvas Protocol), the `vision_client` gained a **`locate`** mode (normalized bbox for described targets), and the in-iframe highlight path is gone (Canvas-Protocol manifest reduced to **v0.2**). The classic TTS service is a `CachedFirstTTSService` (cache hit → raw PCM in the identical `TTSStartedFrame → TTSAudioRawFrame → TTSStoppedFrame` envelope so `BotStoppedSpeakingFrame` still fires; miss → live Cartesia). `generate_quiz_from_knowledge`'s core is the factored `run_quiz_generation` coroutine; inbound `request_narrate` / `request_quiz` / `canvas_capture_result` / `agent_annotate_result` branches sit alongside the canvas dispatch in `on_app_message`; `script_complete` carries `trigger: 'auto' | 'manual'`. **S66** made scene-change refresh fast: **lazy vision** (`VISION_REFRESH_MODE=lazy` default), **flow-knowledge reuse**, and **by-`sceneId` snapshot fetch** off `canvas.sceneChanged` (cursor-independent; cursor fallback retained). **LLM provider:** the conversational LLM now **defaults to Groq** (`GroqLLMService`, OpenAI-compatible, model `openai/gpt-oss-120b`); `openai`/`anthropic`/`gemini` stay selectable via `LLM_CANVAS_PROVIDER`. ⚠️ `gpt-oss-120b` is **text-only**, so the S46 scene-image-in-main-LLM-context injection is **gated off** for Groq (`MAIN_LLM_SUPPORTS_VISION`); visual Q&A still runs via the decoupled S67b Gemini path (see *LLM provider selection*).
 > **Repo:** `pipecat-agent/` (alongside `human-virtual-backend/` and `human-virtual-frontend/`).
 
 ---
@@ -15,7 +15,7 @@ The Pipecat agent runs the avatar's **conversation pipeline**: STT → LLM → T
 3. Emits TTS audio (Cartesia, now via `CachedFirstTTSService`) plus avatar lip-sync data (SoulX-Flashtalk for "talking" display mode).
 4. Calls **canvas tools** via the generic 5-tool surface (`canvas_analyze`, `canvas_annotate`, `canvas_control`, `canvas_action`, `canvas_set_page` — **underscored, not dotted**). *(S67c: `canvas_annotate` replaced the retired `canvas_highlight`; unlike the others it does NOT emit a `canvas.*` command — it drives the shell annotation overlay via the non-canvas `agent_annotate` round-trip.)*
 5. (S46+) Calls **vision** by adding a snapshot image to the LLM's context.
-6. (S49 + S65) Plays the scene's script on entry. **S65** added per-segment script-avatar voice switching, a localized post-script invitation, and `{type:'script_complete'}` carrying `sceneIndex`/`hadScript`. **S65b** added the cached-audio fast path through the same narrator without changing the control flow.
+6. (S49 + S65) Plays the scene's script on entry. **S65** added per-segment script-avatar voice switching, a localized post-script invitation, and `{type:'script_complete'}` carrying `sceneIndex`/`hadScript`. **S65b** added the cached-audio fast path through the same narrator without changing the control flow. **Auto Play Phase A** made `script_complete` truthful (emitted only after real playout drain, never from an interrupted/cancelled run) and added the inbound `autoplay_control` stop/resume controls — every narration entry point now runs in a single-slot background task.
 
 ---
 
@@ -41,7 +41,9 @@ The Pipecat agent runs the avatar's **conversation pipeline**: STT → LLM → T
 ```
 pipecat-agent/
   bot.py                            # Main entrypoint — pipeline assembly, transport, LLM provider branching;
-                                    #   constructs CachedFirstTTSService (S65b) and wires it into both pipelines
+                                    #   constructs CachedFirstTTSService (S65b) and wires it into both pipelines;
+                                    #   Phase A — single-slot narration runs (_narrate_and_complete /
+                                    #   _start_narration_task), _flush_bot_audio handshake, autoplay_control branches
   config.py                         # Settings, provider validation, model defaults;
                                     #   S65b NARRATION_* paired constants (must match backend)
   persona.py                        # build_system_prompt — Strategy 1 path + S65 SCRIPT prompt directive
@@ -49,6 +51,9 @@ pipecat-agent/
   api_client.py                     # HTTP client for the backend (snapshot, persona-prompt, navigate, scene image, generate-quiz, …)
   narration.py                      # S65 — narrate_scene_script: per-segment voice switch + invitation + script_complete
                                     #   S65b — _prefetch_cached_audio + per-segment prime_cached(...) before each speak
+                                    #   Phase A — NarrationCompletionGate drain/interruption (per-utterance counters,
+                                    #   NARRATION_INTERRUPTED sentinel, begin_run), NarrationInterrupted,
+                                    #   compute_playout_drain_timeout + PLAYOUT_DRAIN_* constants (agent-only)
   context/
     prompt_builder.py               # render_canvas_page_section + render_agent_playbook_section + render_voice_output_style_section
     canvas_manifest.py              # CanvasManifestRegistry
@@ -56,7 +61,7 @@ pipecat-agent/
     canvas_protocol_tools.py        # 5 generic tools (canvas_annotate replaced canvas_highlight in S67c) + dispatch_canvas_command; SCENE_NAV_VERBS exemption
     quiz_generation.py              # S64e — generate_quiz_from_knowledge tool + bundled set_page
   services/
-    cached_first_tts.py             # S65b — CachedFirstTTSService (this session)
+    cached_first_tts.py             # S65b — CachedFirstTTSService; Phase A — drops an armed prime on InterruptionFrame
     eager_dispatch/                 # Per-provider streaming hooks (S64c) — constructed, not wired into the streaming loop
       __init__.py
       anthropic_adapter.py
@@ -72,6 +77,7 @@ pipecat-agent/
     test_scene_context_s61.py
     test_scene_narration.py         # S65
     test_cached_first_tts.py        # S65b
+    test_autoplay_phase_a.py        # Phase A — gate drain/interruption, drain-timeout budget, slot compositions
     test_submit_answer_bundling.py  # S64e
     bench_canvas_latency.py
   docs/
@@ -97,11 +103,14 @@ DailyTransport.input  →  Deepgram STT
                       →  LLM (the 5 canvas_* tools registered)
                       →  ThinkingNotifier / TranscriptForwarder / SpeakingStateNotifier
                       →  CachedFirstTTSService (was CartesiaTTSService)   ← S65b
+                      →  NarrationCompletionGate                          ← S65 G3; Phase A made it load-bearing:
                       →  DailyTransport.output  ← emits BotStartedSpeakingFrame / BotStoppedSpeakingFrame
                       →  LLMContextAggregatorPair (assistant side)
 ```
 
-**Relay pipeline** (display_mode == 'talking') — no local TTS; text is forwarded to the SoulX-Flashtalk avatar bot via Daily app-messages on the `avatar-relay.v1` protocol. **S65b caching does NOT apply here** — SoulX renders its own audio, the `CachedFirstTTSService` isn't in the relay pipeline. Narration still happens (text forwarded; `script_complete` emitted identically), per S65 D4.
+The `NarrationCompletionGate` between TTS and output observes `TTSStoppedFrame` (per-segment sequencing, S65) and — since **Phase A** — mirrors the transport's upstream `BotStartedSpeakingFrame`/`BotStoppedSpeakingFrame` broadcast and the pipeline's `InterruptionFrame`, which is what gates `script_complete` on true playout drain and makes narration barge-in-aware. **No pipeline elements were added or moved for Phase A** — the gate was already in place; it just grew the drain/interruption bookkeeping.
+
+**Relay pipeline** (display_mode == 'talking') — no local TTS; text is forwarded to the SoulX-Flashtalk avatar bot via Daily app-messages on the `avatar-relay.v1` protocol. **S65b caching does NOT apply here** — SoulX renders its own audio, the `CachedFirstTTSService` isn't in the relay pipeline. Narration still happens (text forwarded; `script_complete` emitted identically — at text-forwarded, no drain-wait: the Phase A v1 punt), per S65 D4.
 
 Pipeline selection is automatic based on the snapshot's `avatar_display_mode`. Falls back to `CLOUD_OUTPUT_MODE` env var when the snapshot can't be fetched.
 
@@ -207,6 +216,8 @@ The SCRIPT prompt directive (above) keeps the LLM silent during narration.
 
 `refresh_agent_for_current_scene` reads the snapshot's new `current_scene.scripts`, `current_scene.has_script`, `current_scene.narration.*`, and `live_room.auto_advance` to drive the narrator. The agent does **NOT** call `api_navigate` from narration — auto-advance is shell-owned (S64e lesson). The agent's only signal is `script_complete`.
 
+**(Phase A)** `script_complete` emission rules hardened (frozen wire contract v1 — see *Recent: Auto Play Phase A*): classic-pipeline emissions fire only after **true playout drain** (`BotStoppedSpeakingFrame`, not synthesis-complete); cancelled or **interrupted** runs never emit; ALL narration entry points (session start, scene change, manual replay, autoplay resume) run through the **single-slot** background task.
+
 ### Auto-advance signalling (D8)
 
 If `live_room.auto_advance && scene_index < total - 1`: optionally speak `transition_cue`, **skip** the invitation, emit `script_complete`. Else: speak `invitation_line`, emit `script_complete`. No-script scenes: neither branch (the existing conversational greeting stands; the shell knows `hadScript=false` and won't schedule an advance). **(S65c)** entry narration emits `trigger:'auto'`; a manual Script-button replay emits `trigger:'manual'` and the shell ignores `'manual'` for auto-advance — so a replay never moves the flow.
@@ -229,20 +240,21 @@ class CachedFirstTTSService(CartesiaTTSService):
     in the canonical TTS frame envelope; otherwise fall through to live Cartesia synthesis."""
 
     def prime_cached(self, segment: Optional[CachedSegment]) -> None: ...
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         seg = self._consume()
         if seg is None:
-            async for frame in super().run_tts(text):    # live path: voice already set by narrator
+            async for frame in super().run_tts(text, context_id):    # live path: voice already set by narrator
                 yield frame
             return
         # cache hit — emit IDENTICAL envelope CartesiaTTSService would
-        yield TTSStartedFrame()
+        yield TTSStartedFrame(context_id=context_id)
         for chunk in _chunk_pcm(seg.pcm, seg.sample_rate, seg.num_channels, ms=20):
-            yield TTSAudioRawFrame(audio=chunk, sample_rate=seg.sample_rate, num_channels=seg.num_channels)
-        yield TTSStoppedFrame()
+            yield TTSAudioRawFrame(audio=chunk, sample_rate=seg.sample_rate, num_channels=seg.num_channels, context_id=context_id)
+        # Block 15 — sleep the PCM's playback duration before TTSStoppedFrame
+        yield TTSStoppedFrame(context_id=context_id)
 ```
 
-Wired into `bot.py`'s classic pipeline in place of `CartesiaTTSService`. Same constructor kwargs; the cache-first behavior is opt-in via `prime_cached(...)` — when nothing is primed, the service is indistinguishable from the parent.
+Wired into `bot.py`'s classic pipeline in place of `CartesiaTTSService`. Same constructor kwargs; the cache-first behavior is opt-in via `prime_cached(...)` — when nothing is primed, the service is indistinguishable from the parent. **(Phase A)** `process_frame` drops an armed prime on `InterruptionFrame`: the narrator primes immediately before each speak, so a barge-in aborting the run between prime and `run_tts` would otherwise leave the prime for the NEXT `run_tts` — i.e. the LLM's reply to the barge-in would play the scene-script PCM instead of the reply. Guarded by `test_interruption_drops_armed_cache_prime` (in `test_autoplay_phase_a.py`).
 
 ### Narrator prefetch + prime
 
@@ -266,7 +278,7 @@ for seg in current_scene["scripts"]:
 `CachedFirstTTSService` emits the **exact** `TTSStartedFrame → TTSAudioRawFrame(s) → TTSStoppedFrame` sequence that `CartesiaTTSService` emits. **Never `OutputAudioRawFrame`.** Why this matters:
 
 - The output transport's speaking-state machine drives `BotStartedSpeakingFrame` / `BotStoppedSpeakingFrame` off the TTS frame stream, regardless of who produced it. Yielding the canonical envelope means cached playback emits `BotStoppedSpeakingFrame` on **playback** completion, exactly as live playback does.
-- Direct `OutputAudioRawFrame` emission (rejected alternative) **bypasses** that machine — `BotStoppedSpeakingFrame` would never fire, and the in-flight `NarrationCompletionGate` fix (which re-keys on `BotStoppedSpeakingFrame` to stop clipping audio during auto-advance) would break for cached scenes.
+- Direct `OutputAudioRawFrame` emission (rejected alternative) **bypasses** that machine — `BotStoppedSpeakingFrame` would never fire, and the Phase A `NarrationCompletionGate` drain-wait (`expect_playout_drain` resolves on `BotStoppedSpeakingFrame` — the fix that stops auto-advance clipping audio, **shipped 2026-07-16**; earlier CLAUDE.md revisions described it as in-flight before it was built) breaks for cached scenes.
 - `test_cached_first_tts.py::test_hit_never_emits_output_audio_raw_frame` guards this invariant. **Do not relax that test.**
 
 ### Cross-repo audio invariant (READ BEFORE TOUCHING)
@@ -360,7 +372,7 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'canvas.command', commandId, tool, verb?, args}` — canvas tool dispatch.
 - `{type: 'transcript', speaker, text}` — STT or avatar text.
 - `{type: 'speaking_state', isSpeaking}`, `{type: 'llm_thinking', thinking}` — UI cues.
-- **`{type: 'script_complete', sceneIndex, hadScript, trigger}`** *(S65; `trigger` added S65c)* — emitted after the scene's scripts finish; the shell's auto-advance handler advances only when `trigger === 'auto'`.
+- **`{type: 'script_complete', sceneIndex, hadScript, trigger}`** *(S65; `trigger` added S65c)* — emitted after the scene's scripts finish; the shell's auto-advance handler advances only when `trigger === 'auto'`. **(Phase A)** wire shape UNCHANGED, emission rules hardened: classic emits only after **true playout drain** (`BotStoppedSpeakingFrame`); cancelled/interrupted runs never emit; a `resume`-initiated run emits `trigger:'auto'`; script-less scenes still emit `hadScript:false` immediately. Relay still emits at text-forwarded (v1 punt).
 - **`{type: 'quiz_generation_state', state, error?}`** *(S65c)* — `state ∈ {generating, ready, error}`. Emitted by the manual `request_quiz` path (via `run_quiz_generation`'s `on_state` hook) so the shell's Quiz button can show a spinner / error. The LLM-tool quiz path does **not** emit these (no button to update).
 - `{type: 'avatar_relay.*', …}` (relay pipeline only) — text/turn protocol for SoulX.
 
@@ -370,10 +382,11 @@ Both voice-initiated and visitor rail-click scene navigation flow through ONE re
 - `{type: 'canvas.stateChange', semanticState}` → cached in `CanvasManifestRegistry` for the next `analyze()`.
 - `{type: 'canvas.sceneChanged', sceneIndex, sceneId}` → `refresh_agent_for_current_scene()`. **(S66)** `sceneId` drives the cursor-independent by-id snapshot fetch; cursor fallback if absent.
 - `{type: 'canvas.commandResult', commandId, result}` / `{type: 'canvas.commandError', commandId, error}` → complete the awaiting Future.
-- **`{type: 'request_narrate'}`** *(S65c)* → `narrate_scene_script(force=True, trigger='manual')` — re-narrates the current scene's script without auto-advancing.
+- **`{type: 'request_narrate'}`** *(S65c)* → force re-narration of the current scene with `trigger='manual'` — never auto-advances. **(Phase A)** now runs as the **single-slot background task** instead of inline (the inline await held app-message dispatch hostage for the whole narration — the P3 lesson; worse with the A1 drain-wait), so the emit follows the frozen-contract rules (drain-gated; suppressed on interruption/supersede).
 - **`{type: 'request_quiz', count?, language?}`** *(S65c)* → `run_quiz_generation(...)` with the `quiz_generation_state` emitter. Silently ignored if the agent isn't ready yet (no `session_context`).
+- **`{type: 'autoplay_control', action: 'stop' | 'resume'}`** *(Phase A — frozen wire contract v1)* — session-level `request_*`-style early-return branch in BOTH pipelines. `stop`: cancel the single-slot narration run + `narration_gate.cancel_all` + **flush queued bot audio** (classic: `InterruptionTaskFrame` → pipeline-wide interruption, confirmed via `expect_interruption`; relay: best-effort `RELAY_INTERRUPT` of the open narration turn). A stopped run never emits `script_complete`. `resume`: fresh **cursor** snapshot (the `request_narrate` template) → force re-narration of the current scene from segment 0 in the single slot → emits `script_complete {trigger:'auto'}` on true completion. Unknown actions are logged and ignored.
 
-**S65c routing rule (important):** the two `request_*` branches are **early-return branches in `on_app_message`, alongside but BEFORE the `canvas.*` dispatch** — never inside the canvas/relay path. They're session-level requests, not canvas commands (mirrors the frontend keeping them out of `DailyRelay`). They piggyback on the existing defensive `json.loads` (below).
+**S65c routing rule (important):** the `request_*` / `autoplay_control` branches are **early-return branches in `on_app_message`, alongside but BEFORE the `canvas.*` dispatch** — never inside the canvas/relay path. They're session-level requests, not canvas commands (mirrors the frontend keeping them out of `DailyRelay`). They piggyback on the existing defensive `json.loads` (below).
 
 Defensive JSON parsing in `on_app_message`: if Daily delivers the payload as a string (varies by SDK version), parse before the `isinstance(dict)` check. *(S64d hardening — still in place.)*
 
@@ -472,9 +485,49 @@ Production runs on Pipecat Cloud. The Dockerfile is the build manifest. Backend'
 - **Don't ask the LLM to pace UI animations.** Own pacing in the Page (cancellable timers); keep the agent a pass-through. (S65 auto-advance applies the same lesson — pacing lives in the shell.)
 - **`canvas_set_page` is all-or-nothing.** Empty `pageInit` ⇒ snapshot wins for BOTH pageType and init.
 - **`CachedFirstTTSService` must emit the canonical TTS frame envelope on hits.** Never `OutputAudioRawFrame`. The guard test (`test_hit_never_emits_output_audio_raw_frame`) is non-negotiable — the `NarrationCompletionGate` fix depends on it.
+- **`script_complete` emission rules are the frozen wire contract (Phase A).** Emit only after true playout drain (classic); NEVER emit from a cancelled or interrupted run; script-less scenes emit `hadScript:false` immediately. Don't add emit sites outside `_narrate_and_complete` / `_session_start_narration_run` / `_queue_greeting`.
+- **Every classic narration run must go through the single slot and call `narration_gate.begin_run()` first.** `begin_run` clears the interruption latch + stale futures; skipping it either lets a stale barge-in kill the new run instantly (no `script_complete`, auto-play stalls) or lets a stale future misalign the TTS-stop FIFO.
+- **Flush before starting a new run, and confirm via `expect_interruption()`.** `_flush_bot_audio` awaits the gate observing the `InterruptionFrame` it caused; starting a narration run before that confirmation can get its first segment killed by the in-flight flush.
 - **`NARRATION_*` constants are paired with the backend.** Don't change one without the other. Use `NARRATION_CACHE_SCHEMA_VERSION` (bumped on the backend) if you need a one-way invalidation.
 - **On a cache hit, don't call `set_cartesia_voice`.** The voice is baked into the bytes; the call is wasted control traffic.
 - **Keep agent output plain-spoken (Groq/gpt-oss).** The reply is TTS'd *and* shown as a live caption. The `VOICE OUTPUT — STRICT` prompt directive (`render_voice_output_style_section`, appended by `_assemble_full_prompt`) forbids Markdown / emojis / ellipses; the classic TTS also runs `MarkdownTextFilter`. **The directive — not the filter — is what keeps the caption clean**, because the transcript forwarder sits *upstream* of the TTS filter. The relay (`talking`) pipeline has no TTS filter and relies on the directive alone.
+
+---
+
+## Recent: Auto Play Phase A ✅ (2026-07-16 — truthful playout completion + interruption awareness)
+
+Agent half of the Auto Play work (Phase B — the shell's playback UI — is a separate frontend session; the **frozen wire contract v1** below is shared verbatim between both briefs). Zero backend changes. Fixes two bugs:
+
+**Bug 1 — `script_complete` fired at synthesis-complete, not playout-complete.** Live Cartesia renders several× faster than realtime, so the gate's `TTSStoppedFrame`-keyed future released while seconds of audio were still queued in the output transport — the shell advanced over the tail of the narration. **Bug 2 — narration wasn't interruption-aware.** Visitor speech flushed the audio (VAD → `InterruptionFrame` → `MediaSender.handle_interruptions`) but Cartesia drops the cancelled context's `done`, orphaning the gate future: `_classic_speak` stalled the full 30 s, then **continued to the next segment** — narration resumed mid-scene over the conversation and finally emitted an advance-eligible `script_complete`.
+
+### What landed
+
+- **A1 — final playout drain.** `NarrationCompletionGate` now mirrors the transport's speaking state (`BotStartedSpeakingFrame`/`BotStoppedSpeakingFrame` traverse the gate on the upstream broadcast) and exposes `expect_playout_drain()`. ⚠️ **Per-utterance accounting is load-bearing:** the transport emits `BotStoppedSpeakingFrame` at EVERY utterance boundary (`MediaSender._handle_frame` fires per dequeued `TTSStoppedFrame`), and per-segment gating releases at *synthesis*-complete, so a multi-segment run stacks utterances in the transport queue — the gate counts synthesized utterances (`TTSStoppedFrame` downstream, only when audio frames were seen, mirroring the transport's `_tts_audio_received` guard) against played ones (`BotStoppedSpeakingFrame` upstream, only on a true speaking→quiet transition — the post-flush stray is ignored) and releases the drain only when played ≥ synthesized. Resolving on the *first* `BotStoppedSpeakingFrame` would re-open Bug 1 for every multi-utterance scene (caught in adversarial review before ship). Immediate resolve when already drained covers the cached-playback race. `run_scene_narration` gained `wait_playout` (classic passes `_classic_wait_playout`; relay passes nothing — v1 punt); the per-segment `TTSStoppedFrame` gating is UNCHANGED (it's what overlaps segment N's playout with N+1's synthesis). Timeout budget: `compute_playout_drain_timeout` — sum of known `audio.duration_ms` + margin; **`duration_ms` of 0/null = unknown** (backend dedup edge) → fixed cap. Constants `PLAYOUT_DRAIN_MARGIN_S`/`PLAYOUT_DRAIN_FALLBACK_S` in `narration.py` (agent-only, NOT backend-paired).
+- **A2 — interruption awareness.** The gate observes `InterruptionFrame`: resolves ALL pending stop/drain futures with the `NARRATION_INTERRUPTED` sentinel and latches `_interrupted_since_run_start` (an interruption in the between-segments window — no future registered — kills the run's NEXT expect call). `begin_run()` clears the latch + stale futures + utterance counters at the start of every run. Speak/drain callables raise `NarrationInterrupted`; `SceneNarrator.narrate` aborts the loop but **resets the voice to primary on BOTH abort paths — `NarrationInterrupted` AND `asyncio.CancelledError`** (else the LLM's reply renders in the script avatar's clone; the cancel path matters because autoplay stop has no follow-up run to realign the voice); all callers suppress `script_complete`. **`CachedFirstTTSService` drops an armed prime on `InterruptionFrame`** (and `_classic_speak` clears it on the pre-queue abort) — a stale prime would make the LLM's reply to the barge-in play scene-script PCM. The 30 s per-segment `wait_for` stays as a lost-frame backstop only — deliberately NOT reduced, since a long *cached* segment legitimately holds its `TTSStoppedFrame` for the full playback duration (Block 15 sleep).
+- **A3 — flush on scene change.** When a scene change cancels an active narration run, `_flush_bot_audio` queues an `InterruptionTaskFrame` (task source → pipeline-wide `InterruptionFrame`; pipecat exposes no narrower bot-audio flush — the deprecated `BotInterruptionFrame` alias was avoided). The flush is **unconditional when a narration run was active** — gating on `bot_is_speaking` missed the Cartesia-TTFB and inter-utterance windows where old-scene TTS is in flight but not yet audible (old audio then played over the new scene AND its stale `TTSStoppedFrame` could misalign the new run's FIFO). It is **confirmed** via `expect_interruption()` (a fresh waiter, immune to the stale latch; tolerates its waiter being cancelled by a concurrent `cancel_all`) before the new run starts. Relay half: best-effort `RELAY_INTERRUPT` of the open narration turn — **ordering rule: cancel the superseded run's task FIRST, then interrupt** (state cleared synchronously so the cancelled task's shielded `close_turn` no-ops instead of closing the NEW run's turn; interrupting before cancelling would let the still-live old run reopen a fresh turn).
+- **A4 — `autoplay_control` inbound.** See *Daily app-messages*. Both pipelines, early-return branch. `stop` flushes unconditionally (the pause control means "stop the bot's voice now" — an in-flight LLM reply dies too, accepted for v1). `resume` fetches the snapshot **by the session's tracked scene id** (cursor fallback) so the P2 background-cursor window can't serve the previous scene.
+- **A5 — session start in the single slot.** Classic `on_client_connected` narration and the relay `_queue_greeting` now run in `scene_narration_task` with `replace=False` (never stomp a run that raced ahead), so a scene change during the opening narration cancels it. Because that makes session-start cancellable, the **one-time context seeding (presentation-done note vs `GREETING_TRIGGER_PROMPT` + `LLMRunFrame` wake) moved to `_seed_session_context_once`**, called by whichever run completes first — a superseding scene-change run seeds with its own outcome, so a script-less flow still wakes the LLM (an interrupted run marks it done instead: the visitor's own speech drives the LLM, and a belated greeting mid-conversation would be worse). Classic `request_narrate` also moved into the slot (was inline — held app-message dispatch hostage; a replay is now supersedable and drain-gated, `trigger:'manual'` unchanged on the wire).
+
+### Frozen wire contract v1 (shared with the Phase B brief — do not deviate unilaterally)
+
+1. Inbound `{type:'autoplay_control', action:'stop'|'resume'}` (session-level, never rides DailyRelay). 2. `script_complete` shape UNCHANGED; rules: (a) emitted only after true playout drain, (b) cancelled/interrupted runs NEVER emit, (c) resume runs emit `trigger:'auto'`, (d) the shell drops `script_complete` whose `sceneIndex` mismatches its current scene. 3. No new outbound agent→shell messages in v1. 4. Script-less scenes unchanged (`hadScript:false`, immediate).
+
+### Known v1 relay limitations (recorded, not bugs)
+
+No drain-wait (`script_complete` fires at text-forwarded — SoulX owns its playout); narration turns bypass `AvatarRelayProcessor`, so visitor speech does NOT interrupt SoulX narration (only LLM turns); `stop` is best-effort cancel + `RELAY_INTERRUPT`.
+
+### Tests
+
++27 in `tests/test_autoplay_phase_a.py`: gate drain semantics (pends through `TTSStoppedFrame`, **waits for EVERY synthesized utterance's boundary** — the multi-utterance case, inter-utterance-gap registration, post-flush stray boundary ignored, immediate when truly drained), interruption sentinel + between-segments latch + `begin_run` hygiene + `expect_interruption` freshness, drain-timeout budget (0/null/junk → fallback; blanks skipped), `wait_playout` ordering/skip rules, interrupted-run abort (no emit, no stall, voice reset) + **cancelled-run voice reset** + **prime-drop on interruption**, and slot compositions for stop/resume/supersede — including the real-gate ordering test the pre-Phase-A suite deliberately skipped (see the note at the bottom of `test_cached_first_tts.py`). Existing 248 tests pass unchanged (275 total).
+
+### Lessons (READ BEFORE TOUCHING)
+
+1. **`TTSStoppedFrame` means synthesis done, not audio heard.** Only `BotStoppedSpeakingFrame` (or the cached path's Block-15 sleep) means the visitor finished hearing it. Never re-key `script_complete` on anything upstream of the transport's drain signal.
+2. **One `BotStoppedSpeakingFrame` ≠ drained.** The transport fires it at EVERY utterance boundary; since per-segment gating releases at synthesis-complete, later segments + the followup are still queued when the first boundary lands. The gate's synthesized-vs-played counters are the fix — any future "simplification" back to first-frame resolution re-opens Bug 1 for multi-segment scenes.
+3. **Interruption must resolve, not cancel, the gate futures.** Cancelling looks identical to a scene-change supersede; the sentinel lets `_classic_speak` distinguish "abort quietly, suppress emit" from "task torn down". But BOTH abort paths must reset the voice and clear the cache prime — stop/supersede cancellation has no follow-up run to clean up after it.
+4. **The latch is per-run state.** Forgetting `begin_run()` on a new entry point makes a stale barge-in kill the run instantly → no `script_complete` → auto-play stalls. Conversely, resolving the latch lazily (only at expect-time) is what closes the between-segments window without a lock.
+5. **The flush handshake is ordering-critical.** Queue `InterruptionTaskFrame`, await `expect_interruption()`, THEN start the next run — the interruption travels source→sink→source→pipeline and would otherwise race the new run's first `TTSSpeakFrame`. Relay mirror: cancel the superseded task, THEN `_relay_interrupt_narration_turn()` (zeroes turn state synchronously), THEN start — any other order lets the old run's shield-deferred `close_turn` eat the new run's turn, or lets the still-live old run reopen a fresh one.
+6. **Known residual race (accepted, v1):** a barge-in whose `InterruptionFrame` is mid-pipeline when `_classic_speak` registers its future can let exactly ONE more segment queue behind the flush and play briefly. Pre-Phase-A the same race replayed ALL remaining segments after a 30 s stall — strictly better now; fully closing it needs transactional frame queueing pipecat doesn't expose.
 
 ---
 
@@ -647,9 +700,9 @@ canvas_annotate(op, target, …)
 
 ---
 
-## Coming next — S68 (Knowledge-Aware Generate Scene)
+## Coming next
 
-S68 generates a scene's layout + script from a prompt using Scene/Flow Knowledge (S54–56 RAG), targeting `canvas_page_type='composition'`. **Agent involvement is minimal** — generation is a studio/backend feature, not a live-room one. Generated scenes inherit narration (S65), fast switching (S66), and the full visual-interaction stack (S67a/b/c) automatically, since those are shell/agent features keyed off the snapshot, not the page generator. After S68: MCP (S69–70), video export (S71), deployment + launch (S72–76).
+**S68 (External Embeds)** and **S69a (Generation Engine)** both shipped with **zero agent changes** — embeds ride the snapshot's `link` block, and generated flows are indistinguishable from hand-built ones (narration S65, fast switching S66, and the visual-interaction stack S67a/b/c all key off the snapshot, not how the scene was authored). The **P3 latency pass (2026-07-13)** shipped (shared httpx client, narration off the hot path). **Auto Play Phase A (2026-07-16)** shipped the agent half of the Auto Play work; **Phase B (the shell's playback UI) is frontend-only — zero agent changes expected**, and both sides build against the frozen wire contract v1 (see *Recent: Auto Play Phase A*; don't change the contract unilaterally). **Next agent-relevant work: none until MCP E2E (S71).** Roadmap: **S69b (/hv Prompt Orchestrator + Create-with-AI studio UI** — also zero agent changes; a `/hv`-created room is indistinguishable from a modal-created one), then MCP (S70–71), video export (S72), deployment (S73–75), performance & hygiene (S76), launch (S77).
 
 ---
 

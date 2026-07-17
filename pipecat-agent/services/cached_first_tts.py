@@ -23,6 +23,7 @@ from typing import AsyncGenerator, Optional
 
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -81,6 +82,19 @@ class CachedFirstTTSService(CartesiaTTSService):
     def _consume(self) -> Optional[CachedSegment]:
         seg, self._primed = self._primed, None
         return seg
+
+    async def process_frame(self, frame, direction):
+        # Auto Play Phase A (A2) — drop an armed prime on interruption.
+        # The narrator primes BEFORE each speak; if the run aborts
+        # between prime and run_tts (barge-in latch, task cancellation,
+        # or the TTSSpeakFrame being dropped by the interruption
+        # itself), a stale prime would otherwise be consumed by the
+        # NEXT run_tts — i.e. the LLM's reply to the barge-in would
+        # play the scene-script PCM in the script avatar's voice
+        # instead of the reply text.
+        if isinstance(frame, InterruptionFrame):
+            self._primed = None
+        await super().process_frame(frame, direction)
 
     async def run_tts(
         self, text: str, context_id: str

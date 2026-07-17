@@ -28,6 +28,32 @@ still mid-render on segment N's WebSocket context.
 :class:`NarrationCompletionGate` is the small FrameProcessor that
 captures :class:`TTSStoppedFrame` events and resolves caller-supplied
 futures in FIFO order.
+
+Auto Play Phase A extended the gate beyond per-segment sequencing:
+
+  * **Playout drain (A1).** ``TTSStoppedFrame`` fires at *synthesis*
+    complete (live Cartesia renders several× faster than realtime), so
+    gating ``script_complete`` on it alone told the shell "done" while
+    seconds of audio were still queued in the output transport.
+    :meth:`NarrationCompletionGate.expect_playout_drain` resolves on the
+    next :class:`BotStoppedSpeakingFrame` — which the transport
+    broadcasts upstream through this gate's pipeline position only when
+    its audio queue actually drains. ``run_scene_narration`` awaits it
+    (via the injected ``wait_playout``) after the final speak, so the
+    emission callers perform afterwards is truthful.
+  * **Interruption awareness (A2).** Visitor speech pushes an
+    :class:`InterruptionFrame` through the pipeline; the transport
+    flushes its audio but Cartesia drops the context's ``done`` message,
+    orphaning the pending gate future (a 30 s stall, then narration
+    would resume mid-scene). The gate now observes ``InterruptionFrame``
+    and resolves ALL pending futures with :data:`NARRATION_INTERRUPTED`;
+    the speak/drain callables raise :class:`NarrationInterrupted`, the
+    narrator aborts the segment loop, and callers suppress
+    ``script_complete`` (frozen wire rule 2b: interrupted runs never
+    emit). An interruption landing in the between-segments window (no
+    future registered) is latched in ``_interrupted_since_run_start``
+    and kills the run's *next* expect call; :meth:`~NarrationCompletionGate.begin_run`
+    clears the latch at the start of each narration run.
 """
 
 from __future__ import annotations
@@ -38,8 +64,42 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from loguru import logger
-from pipecat.frames.frames import Frame, TTSStoppedFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    InterruptionFrame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+
+class _InterruptedSentinel:
+    """Result value the gate resolves futures with on ``InterruptionFrame``.
+
+    A dedicated object (not ``None``/a string) so it can never collide
+    with the ``context_id`` payload a normal ``TTSStoppedFrame``
+    resolution carries.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<NARRATION_INTERRUPTED>"
+
+
+NARRATION_INTERRUPTED = _InterruptedSentinel()
+
+
+class NarrationInterrupted(Exception):
+    """Visitor speech (or a deliberate flush) interrupted the narration run.
+
+    Raised by the pipeline-side speak / wait-playout callables when a
+    gate future resolves with :data:`NARRATION_INTERRUPTED`. Propagates
+    through :meth:`SceneNarrator.narrate` (which resets the voice to
+    primary on the way out) and :func:`run_scene_narration`; callers
+    catch it and suppress the ``script_complete`` emission — an
+    interrupted run must never advance the flow (wire rule 2b).
+    """
 
 
 SpeakFn = Callable[[str], Awaitable[None]]
@@ -54,6 +114,14 @@ SetVoiceFn = Callable[[str], Awaitable[None]]
 #    narrator skips the per-segment voice switch.
 PrefetchFn = Callable[[list["NarrationSegment"]], Awaitable[None]]
 PrimeFn = Callable[["NarrationSegment"], bool]
+# Auto Play Phase A (A1) — final playout-drain callable, optional. Runs
+# ONCE at the end of run_scene_narration (only when something was
+# actually spoken) with the timeout budget from
+# compute_playout_drain_timeout. The classic pipeline passes a closure
+# awaiting NarrationCompletionGate.expect_playout_drain; the relay
+# pipeline passes None (SoulX owns its own playout — v1 punt, see
+# CLAUDE.md).
+WaitPlayoutFn = Callable[[float], Awaitable[None]]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -175,6 +243,55 @@ def build_script_complete_payload(
         "hadScript": bool(spoke_script),
         "trigger": trigger,
     }
+
+
+# Auto Play Phase A (A1) — playout-drain timeout budget. The drain wait
+# resolves on BotStoppedSpeakingFrame; these bounds only matter when that
+# frame is lost (the transport's own queue-empty fallback fires one within
+# ~3 s of true drain, so in practice they never trip). MARGIN also covers
+# the always-live followup line's playout tail on all-cached scenes.
+PLAYOUT_DRAIN_MARGIN_S = 15.0
+PLAYOUT_DRAIN_FALLBACK_S = 60.0
+
+
+def compute_playout_drain_timeout(
+    snapshot: dict | None,
+    *,
+    margin_s: float = PLAYOUT_DRAIN_MARGIN_S,
+    fallback_s: float = PLAYOUT_DRAIN_FALLBACK_S,
+) -> float:
+    """Upper bound (seconds) for the final playout-drain wait (A1).
+
+    Pure: no I/O. Prefers the sum of the scene's known cached-audio
+    durations plus a margin; any narratable segment with a missing,
+    zero, or malformed ``audio.duration_ms`` makes the total unknown
+    (a backend dedup edge can legitimately serve 0 — treat it as
+    unknown, per the Phase A brief) and the fixed fallback cap applies.
+    Blank segments are skipped entirely — they're never narrated, so
+    they neither add time nor force the fallback.
+    """
+    current_scene = (snapshot or {}).get("current_scene") or {}
+    raw = current_scene.get("scripts") or []
+    total_ms = 0.0
+    saw_segment = False
+    for seg in raw:
+        if not isinstance(seg, dict):
+            continue
+        if not (seg.get("text") or "").strip():
+            continue
+        saw_segment = True
+        audio = seg.get("audio") if isinstance(seg.get("audio"), dict) else None
+        duration = (audio or {}).get("duration_ms")
+        try:
+            duration_ms = float(duration) if duration is not None else 0.0
+        except (TypeError, ValueError):
+            duration_ms = 0.0
+        if duration_ms <= 0:
+            return fallback_s
+        total_ms += duration_ms
+    if not saw_segment:
+        return fallback_s
+    return total_ms / 1000.0 + margin_s
 
 
 def plan_narration_segments(
@@ -368,38 +485,64 @@ class SceneNarrator:
                     "[NARRATION] prefetch failed; live fallback: {!r}", exc
                 )
 
-        for idx, seg in enumerate(plan):
-            # Prime is sync — keeps zero awaits between the prime call
-            # and the TTSSpeakFrame queue so no other run_tts can sneak
-            # in and consume the primed segment.
-            is_hit = bool(self._prime(seg)) if self._prime is not None else False
-            if (
-                not is_hit
-                and self._set_voice is not None
-                and seg.voice_id
-                and seg.voice_id != self._current_voice
-            ):
+        try:
+            for idx, seg in enumerate(plan):
+                # Prime is sync — keeps zero awaits between the prime call
+                # and the TTSSpeakFrame queue so no other run_tts can sneak
+                # in and consume the primed segment.
+                is_hit = bool(self._prime(seg)) if self._prime is not None else False
+                if (
+                    not is_hit
+                    and self._set_voice is not None
+                    and seg.voice_id
+                    and seg.voice_id != self._current_voice
+                ):
+                    logger.info(
+                        "[NARRATION] segment={} voice switch {!r} -> {!r}",
+                        idx,
+                        self._current_voice,
+                        seg.voice_id,
+                    )
+                    await self._set_voice(seg.voice_id)
+                    self._current_voice = seg.voice_id
                 logger.info(
-                    "[NARRATION] segment={} voice switch {!r} -> {!r}",
+                    "[NARRATION] segment={} speak (voice={!r}, chars={}, hit={})",
                     idx,
                     self._current_voice,
-                    seg.voice_id,
+                    len(seg.text),
+                    is_hit,
                 )
-                await self._set_voice(seg.voice_id)
-                self._current_voice = seg.voice_id
-            logger.info(
-                "[NARRATION] segment={} speak (voice={!r}, chars={}, hit={})",
-                idx,
-                self._current_voice,
-                len(seg.text),
-                is_hit,
-            )
-            await self._speak(seg.text)
+                await self._speak(seg.text)
+        except NarrationInterrupted:
+            # Auto Play Phase A (A2) — the visitor barged in mid-scene.
+            # Abort the segment loop, but STILL reset the voice to
+            # primary: the LLM's conversational reply to the barge-in
+            # would otherwise render in the script avatar's voice (the
+            # TTSUpdateSettingsFrame delta is a control frame — safe to
+            # queue during/after an interruption flush).
+            logger.info("[NARRATION] interrupted mid-scene — aborting segment loop")
+            await self._reset_to_primary()
+            raise
+        except asyncio.CancelledError:
+            # Phase A — a cancelled run (autoplay stop / scene-change
+            # supersede / disconnect) needs the same voice reset, or the
+            # conversation stays stuck in the script avatar's clone
+            # indefinitely (stop has no follow-up run to realign it).
+            # Shielded so a second cancellation can't kill the cleanup;
+            # the reset only queues one control frame, so it's cheap.
+            logger.info("[NARRATION] cancelled mid-scene — resetting voice to primary")
+            await asyncio.shield(self._reset_to_primary())
+            raise
 
         # Reset to primary BEFORE returning so the post-narration closing
         # line (and any subsequent conversational TTS) uses the agent
         # voice. Skipped when there's no primary configured (defensive)
         # or when we already happen to be on it.
+        await self._reset_to_primary()
+
+        return True
+
+    async def _reset_to_primary(self) -> None:
         if (
             self._set_voice is not None
             and self._primary_voice_id
@@ -411,8 +554,6 @@ class SceneNarrator:
             )
             await self._set_voice(self._primary_voice_id)
             self._current_voice = self._primary_voice_id
-
-        return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -426,6 +567,7 @@ async def run_scene_narration(
     narrator: SceneNarrator,
     speak_followup: SpeakFn,
     force: bool = False,
+    wait_playout: WaitPlayoutFn | None = None,
 ) -> bool:
     """Compose narrate + post-narration follow-up into one call.
 
@@ -454,6 +596,18 @@ async def run_scene_narration(
     ``bot.py`` constructs the ``script_complete`` payload with
     ``build_script_complete_payload(..., trigger="manual")`` directly.
 
+    Auto Play Phase A (A1) — ``wait_playout``, when provided and when
+    something was actually spoken, is awaited LAST (after the followup)
+    with the drain-timeout budget from
+    :func:`compute_playout_drain_timeout`. It returns only once the
+    output transport's audio queue has truly drained
+    (``BotStoppedSpeakingFrame``), so the caller's ``script_complete``
+    emission means "the visitor finished hearing it" — not "synthesis
+    finished". Script-less scenes never call it: the ``hadScript:false``
+    emission stays immediate (wire rule 4). May raise
+    :class:`NarrationInterrupted` (like the speak callables), which
+    callers translate into a suppressed emission.
+
     Used by ``bot.py`` in four places: classic + relay
     ``on_client_connected`` (session-start narration), and classic +
     relay ``refresh_agent_for_current_scene`` (scene-change narration,
@@ -466,6 +620,8 @@ async def run_scene_narration(
     followup = plan_post_narration_followup(snapshot or {}, spoke_script=spoke_script)
     if followup:
         await speak_followup(followup)
+    if wait_playout is not None and (spoke_script or followup):
+        await wait_playout(compute_playout_drain_timeout(snapshot))
     return spoke_script
 
 
@@ -502,35 +658,207 @@ class NarrationCompletionGate(FrameProcessor):
     conversation is paused on the navigation; if that ever races, we'll
     add a "wait for BotStoppedSpeakingFrame quiescence" gate before
     entering narration.
+
+    Auto Play Phase A additions (see module docstring for the why):
+
+      * :meth:`expect_playout_drain` — a Future resolving when every
+        utterance synthesized this run has finished playing out, or
+        immediately when that's already true (covers the cached-playback
+        race where the drain lands before the caller registers, and the
+        no-audio edge). Resolves with :data:`NARRATION_INTERRUPTED` on
+        interruption. **Per-utterance accounting is load-bearing:** the
+        transport emits ``BotStoppedSpeakingFrame`` at EVERY utterance
+        boundary (``MediaSender._handle_frame`` fires
+        ``_bot_stopped_speaking`` each time a ``TTSStoppedFrame`` is
+        dequeued from its audio queue), and because per-segment gating
+        releases at *synthesis*-complete, a multi-segment run stacks
+        several utterances in the transport queue — resolving on the
+        FIRST ``BotStoppedSpeakingFrame`` would re-open Bug 1 for every
+        multi-utterance scene (segment 1's boundary, segments 2..N +
+        followup still queued). The gate therefore counts synthesized
+        utterances (``TTSStoppedFrame`` downstream, only when audio
+        frames were seen — mirroring the transport's
+        ``_tts_audio_received`` guard) against played-out utterances
+        (``BotStoppedSpeakingFrame`` upstream, only on a true
+        speaking→quiet transition — a post-flush stray is ignored) and
+        releases the drain only when played ≥ synthesized.
+      * :meth:`expect_next_stop` / :meth:`expect_playout_drain` resolve
+        immediately with :data:`NARRATION_INTERRUPTED` when an
+        ``InterruptionFrame`` has been observed since the last
+        :meth:`begin_run` — closes the between-segments window where no
+        future is registered.
+      * :meth:`expect_interruption` — a fresh Future resolving on the
+        NEXT ``InterruptionFrame`` regardless of the latch. Used by
+        bot.py's ``_flush_bot_audio`` to confirm that the flush it just
+        queued has traversed the TTS+gate positions (so the next
+        narration run's frames can't be swallowed by it).
+      * :meth:`begin_run` — per-run reset: clears the interruption latch
+        and cancels stale stop/drain futures so a leftover (e.g. a
+        timed-out, already-cancelled future) can't consume the new run's
+        first ``TTSStoppedFrame`` and shift the FIFO off by one.
+      * :attr:`bot_is_speaking` — mirror of the transport's speaking
+        state (``BotStartedSpeakingFrame`` / ``BotStoppedSpeakingFrame``),
+        used by bot.py to decide whether a scene change needs an audio
+        flush at all.
     """
 
     def __init__(self):
         super().__init__()
         self._pending: deque[asyncio.Future] = deque()
+        self._drain_pending: deque[asyncio.Future] = deque()
+        self._interrupt_waiters: deque[asyncio.Future] = deque()
+        self._bot_speaking = False
+        self._interrupted_since_run_start = False
+        # Per-run utterance accounting (see class docstring): synthesized
+        # counts TTSStoppedFrames whose utterance produced audio;
+        # played counts true speaking→quiet transitions. Drain resolves
+        # only when played >= synthesized.
+        self._synthesized_utterances = 0
+        self._played_utterances = 0
+        self._utterance_saw_audio = False
+
+    @property
+    def bot_is_speaking(self) -> bool:
+        """Mirror of the output transport's bot-speaking state."""
+        return self._bot_speaking
+
+    def _all_playouts_observed(self) -> bool:
+        return (
+            not self._bot_speaking
+            and self._played_utterances >= self._synthesized_utterances
+        )
+
+    def begin_run(self) -> None:
+        """Reset per-run state at the start of a narration run (Phase A).
+
+        Clears the interruption latch (a conversational barge-in from
+        *before* this run must not abort it), resets the utterance
+        counters, and drops any stale stop/drain futures left over from
+        a superseded or timed-out run (a stale entry at the head of the
+        FIFO would otherwise consume this run's first
+        ``TTSStoppedFrame``). Interrupt waiters are NOT touched — they
+        belong to an in-flight flush, not to a run.
+        """
+        self._interrupted_since_run_start = False
+        self._synthesized_utterances = 0
+        self._played_utterances = 0
+        self._utterance_saw_audio = False
+        self._cancel_deque(self._pending, "superseded_by_new_run")
+        self._cancel_deque(self._drain_pending, "superseded_by_new_run")
 
     def expect_next_stop(self) -> asyncio.Future:
         """Register a Future that will resolve on the next ``TTSStoppedFrame``.
 
         Call this BEFORE queuing the ``TTSSpeakFrame``, otherwise a fast
         TTS could complete and emit ``TTSStoppedFrame`` before the
-        future is registered, leading to a stuck wait.
+        future is registered, leading to a stuck wait. Resolves
+        immediately with :data:`NARRATION_INTERRUPTED` when an
+        interruption already landed since :meth:`begin_run` — callers
+        must check ``fut.done()`` before queuing the speak frame.
         """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
+        if self._interrupted_since_run_start:
+            fut.set_result(NARRATION_INTERRUPTED)
+            return fut
         self._pending.append(fut)
+        return fut
+
+    def expect_playout_drain(self) -> asyncio.Future:
+        """Register a Future resolving when queued bot audio truly drains.
+
+        Resolution order of precedence:
+
+          * interruption already latched this run ⇒ immediate
+            :data:`NARRATION_INTERRUPTED`;
+          * every synthesized utterance already played out (and the bot
+            is quiet) ⇒ immediate ``None`` — covers the cached-playback
+            race (drain landed before registration) and the no-audio
+            edge. The counter comparison, not just ``bot_is_speaking``,
+            is what keeps a registration landing in the microsecond gap
+            BETWEEN utterance boundaries pending correctly;
+          * otherwise pends until played ≥ synthesized (``None``) or an
+            ``InterruptionFrame`` (:data:`NARRATION_INTERRUPTED`).
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        if self._interrupted_since_run_start:
+            fut.set_result(NARRATION_INTERRUPTED)
+        elif self._all_playouts_observed():
+            fut.set_result(None)
+        else:
+            self._drain_pending.append(fut)
+        return fut
+
+    def expect_interruption(self) -> asyncio.Future:
+        """Register a Future resolving on the NEXT ``InterruptionFrame``.
+
+        Deliberately ignores the latch: the caller (bot.py's audio
+        flush) is about to CAUSE an interruption and needs to observe
+        that specific one passing this pipeline position, not a stale
+        latch from an earlier barge-in.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._interrupt_waiters.append(fut)
         return fut
 
     def cancel_all(self, reason: str = "narration_cancelled") -> None:
         """Cancel all pending futures (called on session teardown)."""
-        while self._pending:
-            fut = self._pending.popleft()
+        self._cancel_deque(self._pending, reason)
+        self._cancel_deque(self._drain_pending, reason)
+        self._cancel_deque(self._interrupt_waiters, reason)
+
+    @staticmethod
+    def _cancel_deque(pending: deque, reason: str) -> None:
+        while pending:
+            fut = pending.popleft()
             if not fut.done():
                 fut.cancel(reason)
 
+    @staticmethod
+    def _resolve_deque(pending: deque, result) -> None:
+        while pending:
+            fut = pending.popleft()
+            if not fut.done():
+                fut.set_result(result)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TTSStoppedFrame) and self._pending:
-            fut = self._pending.popleft()
-            if not fut.done():
-                fut.set_result(getattr(frame, "context_id", None))
+        if isinstance(frame, TTSStoppedFrame):
+            if self._pending:
+                fut = self._pending.popleft()
+                if not fut.done():
+                    fut.set_result(getattr(frame, "context_id", None))
+            # Count the utterance as synthesized only if it produced
+            # audio — mirrors the transport's _tts_audio_received guard,
+            # which suppresses the per-utterance BotStoppedSpeakingFrame
+            # for audio-less utterances. Counting those here would leave
+            # played < synthesized forever (drain waits ride the timeout
+            # backstop instead of hanging, but why pay it).
+            if self._utterance_saw_audio:
+                self._synthesized_utterances += 1
+                self._utterance_saw_audio = False
+        elif isinstance(frame, TTSAudioRawFrame):
+            self._utterance_saw_audio = True
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            # Guarded on a true speaking→quiet transition: the transport
+            # pushes one extra BotStoppedSpeakingFrame from
+            # handle_interruptions after a flush, which arrives when the
+            # gate already marked itself quiet (InterruptionFrame branch
+            # below) — counting it would skew a subsequent run's drain
+            # accounting one utterance early.
+            if self._bot_speaking:
+                self._played_utterances += 1
+            self._bot_speaking = False
+            if self._played_utterances >= self._synthesized_utterances:
+                self._resolve_deque(self._drain_pending, None)
+        elif isinstance(frame, InterruptionFrame):
+            self._bot_speaking = False
+            self._interrupted_since_run_start = True
+            self._resolve_deque(self._pending, NARRATION_INTERRUPTED)
+            self._resolve_deque(self._drain_pending, NARRATION_INTERRUPTED)
+            self._resolve_deque(self._interrupt_waiters, None)
         await self.push_frame(frame, direction)

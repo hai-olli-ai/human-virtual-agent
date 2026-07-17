@@ -37,6 +37,7 @@ from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
     InterruptionFrame,
+    InterruptionTaskFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMRunFrame,
@@ -128,7 +129,9 @@ from tools.quiz_generation import (
 # on_client_connected (session start) AND refresh_agent_for_current_scene
 # (scene change — S65 Bug #2 fix) so both moments narrate identically.
 from narration import (
+    NARRATION_INTERRUPTED,
     NarrationCompletionGate,
+    NarrationInterrupted,
     SceneNarrator,
     build_script_complete_payload,
     run_scene_narration,
@@ -1064,10 +1067,30 @@ async def run_bot_classic(
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
     # P3 (2026-07-13) — single-slot handle for the backgrounded
-    # scene-change narration (see the narration tail of the refresh
-    # closure below). A new scene change cancels the previous scene's
-    # narration task before starting its own.
+    # narration run. Auto Play Phase A widened the slot's tenants:
+    # scene-change narration, session-start narration (A5), manual
+    # request_narrate replays, and autoplay_control resume all run here.
+    # A newer run cancels the previous one before starting its own, and
+    # a cancelled run never emits script_complete.
     scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
+
+    def _start_narration_task(coro, *, replace: bool = True) -> bool:
+        """Put a narration coroutine into the single slot (Phase A).
+
+        ``replace=True`` (scene change / manual replay / resume) cancels
+        the active run first — newest wins. ``replace=False`` (session
+        start) yields to an already-active run instead: a run that raced
+        ahead already owns narration, and stomping it would
+        double-narrate. Returns True iff the task was started.
+        """
+        prev = scene_narration_task["task"]
+        if prev is not None and not prev.done():
+            if not replace:
+                coro.close()  # avoid a "never awaited" warning
+                return False
+            prev.cancel()
+        scene_narration_task["task"] = asyncio.create_task(coro)
+        return True
 
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
@@ -1230,44 +1253,24 @@ async def run_bot_classic(
         # cancelled task deliberately does NOT emit script_complete —
         # the superseding navigation already moved the shell forward.
         if fresh_snapshot:
-            narration_gate.cancel_all("scene_change")
             prev_task = scene_narration_task["task"]
-            if prev_task is not None and not prev_task.done():
+            narration_active = prev_task is not None and not prev_task.done()
+            narration_gate.cancel_all("scene_change")
+            if narration_active:
                 prev_task.cancel()
-
-            async def _narrate_and_complete(snap: dict) -> None:
-                try:
-                    try:
-                        spoke_script = await run_scene_narration(
-                            snap,
-                            narrator=narrator,
-                            speak_followup=_classic_speak,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[CANVAS SCENECHANGED] narration failed: {!r}", exc
-                        )
-                        spoke_script = False
-                    await output_transport.send_message(
-                        OutputTransportMessageFrame(
-                            message=build_script_complete_payload(
-                                snap, spoke_script=spoke_script
-                            )
-                        )
-                    )
-                    logger.info(
-                        "[CANVAS SCENECHANGED] narration complete spoke_script={}",
-                        spoke_script,
-                    )
-                except asyncio.CancelledError:
-                    logger.info(
-                        "[CANVAS SCENECHANGED] narration superseded by a newer scene change"
-                    )
-                    raise
-
-            scene_narration_task["task"] = asyncio.create_task(
-                _narrate_and_complete(fresh_snapshot)
-            )
+                # A3 — flush UNCONDITIONALLY when a narration run was
+                # active. Gating on bot_is_speaking missed two windows
+                # where old-scene TTS work is in flight but not yet
+                # audible (Cartesia TTFB after a queued TTSSpeakFrame;
+                # the inter-utterance boundary gap) — the old scene's
+                # audio then played over the new scene AND its stale
+                # TTSStoppedFrame could misalign the new run's FIFO.
+                # The flush's InterruptionFrame also makes the TTS
+                # service drop that in-flight context, closing both. A
+                # completed (drained) prior run skips this — flushing
+                # then would only clip unrelated conversation audio.
+                await _flush_bot_audio("scene_change")
+            _start_narration_task(_narrate_and_complete(fresh_snapshot))
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
@@ -1377,20 +1380,44 @@ async def run_bot_classic(
         # Register the completion future BEFORE queuing the speak — a
         # short utterance can fire TTSStoppedFrame before we register
         # otherwise (race), leaving us waiting forever. 30 s upper
-        # bound is generous for any single narration segment; on
-        # timeout we log and proceed so the rest of the narration plan
-        # still runs.
+        # bound stays as a lost-frame backstop only (Phase A A2: an
+        # interruption now resolves the future immediately instead of
+        # stalling it out); it is NOT reduced because a long cached
+        # segment legitimately holds its TTSStoppedFrame for the full
+        # playback duration (Block 15 sleep). On timeout we log and
+        # proceed so the rest of the narration plan still runs.
         fut = narration_gate.expect_next_stop()
+        if fut.done() and fut.result() is NARRATION_INTERRUPTED:
+            # A2 — an InterruptionFrame landed in the between-segments
+            # window (no future registered). Abort BEFORE queuing the
+            # speak so the interrupted run can't say another word. Drop
+            # the armed prime too — the narrator primed this segment
+            # right before calling us, and a stale prime would be
+            # consumed by the NEXT run_tts (the LLM's reply to the
+            # barge-in would play scene-script PCM instead).
+            tts.prime_cached(None)
+            logger.info("[NARRATION] segment skipped — run already interrupted")
+            raise NarrationInterrupted()
         await task.queue_frames([TTSSpeakFrame(text=text)])
         try:
-            await asyncio.wait_for(fut, timeout=30.0)
+            result = await asyncio.wait_for(fut, timeout=30.0)
         except asyncio.TimeoutError:
             logger.warning(
                 "[NARRATION] segment TTSStoppedFrame timeout — continuing"
             )
+            return
         except asyncio.CancelledError:
             logger.warning("[NARRATION] segment future cancelled")
             raise
+        if result is NARRATION_INTERRUPTED:
+            # A2 — visitor speech interrupted this segment mid-playout.
+            # The transport already flushed the audio; abort the run so
+            # narration doesn't resume mid-scene over the conversation.
+            # (Prime already consumed by this segment's run_tts, or
+            # dropped by CachedFirstTTSService's InterruptionFrame
+            # handler — nothing to clear here.)
+            logger.info("[NARRATION] segment interrupted by visitor speech")
+            raise NarrationInterrupted()
 
     # Block 13 — narration cache closures. Shared dict between prefetch
     # (fills it once at the top of each per-scene narration) and prime
@@ -1452,6 +1479,205 @@ async def run_bot_classic(
         prime=_narration_prime,
     )
 
+    # ── Auto Play Phase A — narration-run machinery (classic) ──
+
+    async def _classic_wait_playout(timeout_s: float) -> None:
+        """A1 — block until queued narration audio truly finishes playing.
+
+        Resolves on BotStoppedSpeakingFrame (the transport's true
+        audio-queue drain, broadcast upstream through the gate);
+        immediately when nothing is playing (covers the cached-playback
+        race where drain lands before registration, and the no-audio
+        edge); with NARRATION_INTERRUPTED → NarrationInterrupted on a
+        visitor barge-in during the playout tail. The timeout is the
+        compute_playout_drain_timeout budget — a lost-frame backstop,
+        not the normal exit path.
+        """
+        fut = narration_gate.expect_playout_drain()
+        try:
+            result = await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[NARRATION] playout-drain timeout after {}s — continuing",
+                timeout_s,
+            )
+            return
+        if result is NARRATION_INTERRUPTED:
+            logger.info("[NARRATION] playout drain interrupted by visitor speech")
+            raise NarrationInterrupted()
+
+    async def _flush_bot_audio(reason: str) -> None:
+        """Flush queued bot audio via a pipeline interruption (A3/A4).
+
+        pipecat exposes no narrower transport-level bot-audio flush —
+        MediaSender.handle_interruptions (the thing that must run) only
+        fires off an InterruptionFrame. Queueing an InterruptionTaskFrame
+        makes the PipelineTask broadcast one from the source; that also
+        cancels any in-flight LLM turn, which is acceptable at both call
+        sites (old-scene audio on scene change; everything on autoplay
+        stop — stale output must die either way).
+
+        Awaits the gate's expect_interruption so the flush has traversed
+        the TTS + gate pipeline positions before returning — a narration
+        run started right after this would otherwise race the in-flight
+        InterruptionFrame and lose its first segment to it.
+        """
+        confirm = narration_gate.expect_interruption()
+        await task.queue_frames([InterruptionTaskFrame()])
+        try:
+            await asyncio.wait_for(confirm, timeout=2.0)
+            logger.info("[NARRATION] bot audio flushed ({})", reason)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[NARRATION] flush ({}) not confirmed within 2s — continuing",
+                reason,
+            )
+        except asyncio.CancelledError:
+            # Distinguish "a concurrent handler ran narration_gate.
+            # cancel_all (scene change / stop / teardown racing this
+            # flush)" — the WAITER was cancelled, our task wasn't; the
+            # interruption is still in flight, so just proceed — from a
+            # genuine cancellation of the calling task, which must
+            # propagate.
+            if confirm.cancelled():
+                logger.info(
+                    "[NARRATION] flush ({}) confirm waiter cancelled — continuing",
+                    reason,
+                )
+            else:
+                raise
+
+    # Phase A — session-start context seeding must survive slot
+    # supersession. The greeting/presentation-done developer message
+    # (and the LLMRunFrame wake for script-less scenes) used to live
+    # exclusively in the session-start path; now that path is
+    # cancellable (A5), so whichever run COMPLETES first performs the
+    # one-time seeding instead. An interrupted run also marks it done —
+    # the visitor's own speech drives the LLM from there, and a
+    # belated greeting mid-conversation would be worse than none.
+    session_seeded = {"done": False}
+
+    async def _seed_session_context_once(spoke_script: bool) -> None:
+        if session_seeded["done"]:
+            return
+        session_seeded["done"] = True
+        if spoke_script:
+            context.add_message({
+                "role": "developer",
+                "content": (
+                    "You just finished presenting the scene scripts to the visitor. "
+                    "They heard your full presentation. Don't repeat what you already said."
+                ),
+            })
+        else:
+            context.add_message({
+                "role": "developer",
+                "content": GREETING_TRIGGER_PROMPT,
+            })
+            await task.queue_frames([LLMRunFrame()])
+
+    async def _narrate_and_complete(
+        snap: dict, *, force: bool = False, trigger: str = "auto"
+    ) -> None:
+        """One narration run: narrate → followup → drain → script_complete.
+
+        Runs as the single-slot background task (P3). Emission rules per
+        the frozen wire contract: script_complete goes out only after
+        true playout drain (A1); NEVER for cancelled (superseded /
+        stopped) or interrupted runs (A2 / rule 2b); a plain failure
+        still emits with hadScript=false so the shell doesn't stall.
+        """
+        try:
+            # Clear the gate's interruption latch + any stale futures
+            # from a superseded run (see NarrationCompletionGate.begin_run).
+            narration_gate.begin_run()
+            try:
+                spoke_script = await run_scene_narration(
+                    snap,
+                    narrator=narrator,
+                    speak_followup=_classic_speak,
+                    force=force,
+                    wait_playout=_classic_wait_playout,
+                )
+            except NarrationInterrupted:
+                session_seeded["done"] = True  # visitor spoke — no greeting
+                logger.info(
+                    "[NARRATION] run interrupted by visitor speech — "
+                    "script_complete suppressed (trigger={})",
+                    trigger,
+                )
+                return
+            except Exception as exc:
+                logger.warning("[NARRATION] narration failed: {!r}", exc)
+                spoke_script = False
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        snap, spoke_script=spoke_script, trigger=trigger
+                    )
+                )
+            )
+            logger.info(
+                "[NARRATION] run complete spoke_script={} trigger={}",
+                spoke_script,
+                trigger,
+            )
+            # If this run superseded the (cancelled) session-start run
+            # before it could seed the LLM context, do it now with THIS
+            # run's outcome — otherwise a script-less flow never wakes
+            # the LLM and the avatar stays silent until spoken to.
+            await _seed_session_context_once(spoke_script)
+        except asyncio.CancelledError:
+            logger.info(
+                "[NARRATION] run superseded or stopped — script_complete suppressed"
+            )
+            raise
+
+    async def _session_start_narration_run() -> None:
+        """A5 — session-start narration in the single slot.
+
+        Previously inlined in on_client_connected, which made the
+        opening narration uncancellable — a scene change during it kept
+        the old scene's script playing over the new scene. Same emission
+        rules as _narrate_and_complete, plus the one-time session
+        context seeding (presentation-done note vs greeting wake).
+        """
+        try:
+            narration_gate.begin_run()
+            try:
+                spoke_script = await run_scene_narration(
+                    scene_snapshot,
+                    narrator=narrator,
+                    speak_followup=_classic_speak,
+                    wait_playout=_classic_wait_playout,
+                )
+            except NarrationInterrupted:
+                session_seeded["done"] = True  # visitor spoke — no greeting
+                logger.info(
+                    "[NARRATION] session-start narration interrupted — "
+                    "script_complete suppressed"
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "[NARRATION] session-start narration failed: {!r}", exc
+                )
+                spoke_script = False
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        scene_snapshot, spoke_script=spoke_script
+                    )
+                )
+            )
+            await _seed_session_context_once(spoke_script)
+        except asyncio.CancelledError:
+            logger.info(
+                "[NARRATION] session-start narration superseded — "
+                "script_complete suppressed"
+            )
+            raise
+
     # ── Event handlers (simple — no participant role detection) ──
 
     @transport.event_handler("on_app_message")
@@ -1496,30 +1722,65 @@ async def run_bot_classic(
             if not manual_snapshot:
                 logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
                 return
+            # Phase A — manual replays now run through the single-slot
+            # narration task instead of inline. Inline, the replay held
+            # this session's app-message dispatch hostage for the whole
+            # narration (the exact P3 lesson, worsened by the new A1
+            # drain-wait), and a scene change couldn't cancel it. The
+            # slot run applies the frozen-contract emission rules
+            # (drain-gated, suppressed on interruption/supersede) with
+            # trigger="manual" preserved on the wire.
             narration_gate.cancel_all("manual_replay")
-            spoke_script = False
-            try:
-                spoke_script = await run_scene_narration(
-                    manual_snapshot,
-                    narrator=narrator,
-                    speak_followup=_classic_speak,
-                    force=True,
-                )
-            except Exception as exc:
-                logger.warning("[REQUEST_NARRATE] narration failed: {!r}", exc)
-            await output_transport.send_message(
-                OutputTransportMessageFrame(
-                    message=build_script_complete_payload(
-                        manual_snapshot,
-                        spoke_script=spoke_script,
-                        trigger="manual",
-                    )
-                )
+            _start_narration_task(
+                _narrate_and_complete(manual_snapshot, force=True, trigger="manual")
             )
-            logger.info(
-                "[REQUEST_NARRATE] manual replay complete spoke_script={}",
-                spoke_script,
-            )
+            logger.info("[REQUEST_NARRATE] manual replay started")
+            return
+
+        if msg_type == "autoplay_control":
+            # ── Auto Play Phase A (A4) — shell playback controls ──
+            # Session-level early-return branch, same discipline as
+            # request_* (exact string match; never rides DailyRelay).
+            # Frozen wire contract v1: action ∈ {stop, resume}.
+            action = message.get("action")
+            if action == "stop":
+                # Cancel the active narration run (a cancelled run never
+                # emits script_complete) AND flush queued bot audio.
+                # Unconditional flush: the pause control means "stop the
+                # bot's voice now", so an in-flight LLM reply dies too.
+                prev = scene_narration_task["task"]
+                if prev is not None and not prev.done():
+                    prev.cancel()
+                narration_gate.cancel_all("autoplay_stop")
+                await _flush_bot_audio("autoplay_stop")
+                logger.info("[AUTOPLAY] stop: narration cancelled, audio flushed")
+            elif action == "resume":
+                # Fresh snapshot → re-narrate the CURRENT scene from
+                # segment 0. Fetched by the session's tracked scene id
+                # (refreshed on every canvas.sceneChanged) so the P2
+                # background-cursor window can't serve the PREVIOUS
+                # scene; cursor fallback when the id is unknown.
+                # force=True bypasses the once-per-entry guard (the
+                # stopped run already marked the scene); default
+                # trigger="auto" keeps the completion advance-eligible
+                # per the contract.
+                if not room_id:
+                    logger.info("[AUTOPLAY] resume skipped: no room_id")
+                    return
+                from api_client import get_scene_snapshot
+                resume_snapshot = await get_scene_snapshot(
+                    room_id, api_url,
+                    scene_id=session_context.get_current_scene_id() or None,
+                )
+                if not resume_snapshot:
+                    logger.info("[AUTOPLAY] resume skipped: snapshot fetch failed")
+                    return
+                _start_narration_task(
+                    _narrate_and_complete(resume_snapshot, force=True)
+                )
+                logger.info("[AUTOPLAY] resume: re-narration started")
+            else:
+                logger.warning("[AUTOPLAY] unknown action {!r} ignored", action)
             return
 
         if msg_type == "request_quiz":
@@ -1681,38 +1942,17 @@ async def run_bot_classic(
         # S65 G3+G4 — narrate scene scripts via SceneNarrator (per-segment
         # voice switching, idempotent per scene_id), then speak the
         # localized invitation OR transition_cue, then emit
-        # script_complete LAST. run_scene_narration composes the
-        # narrate + followup steps; we emit script_complete separately
-        # because in the relay pipeline the RELAY_TURN must close
-        # between followup and script_complete — keeping the emit at
-        # the call site lets each pipeline own its turn lifecycle.
-        spoke_script = await run_scene_narration(
-            scene_snapshot,
-            narrator=narrator,
-            speak_followup=_classic_speak,
-        )
-        await output_transport.send_message(
-            OutputTransportMessageFrame(
-                message=build_script_complete_payload(
-                    scene_snapshot, spoke_script=spoke_script
-                )
-            )
-        )
-
-        if spoke_script:
-            context.add_message({
-                "role": "developer",
-                "content": (
-                    "You just finished presenting the scene scripts to the visitor. "
-                    "They heard your full presentation. Don't repeat what you already said."
-                ),
-            })
-        else:
-            context.add_message({
-                "role": "developer",
-                "content": GREETING_TRIGGER_PROMPT,
-            })
-            await task.queue_frames([LLMRunFrame()])
+        # script_complete LAST.
+        #
+        # Auto Play Phase A (A5) — this used to run INLINE, outside the
+        # single-slot task, so a scene change during the opening
+        # narration could not cancel it and the old scene's script kept
+        # playing over the new scene. It now runs in the same slot as
+        # scene-change narration. replace=False: if a run already owns
+        # the slot (a scene change raced ahead of this handler, or a
+        # second client connected mid-narration), yield to it instead of
+        # double-narrating.
+        _start_narration_task(_session_start_narration_run(), replace=False)
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -2032,10 +2272,30 @@ async def run_bot_relay(
     canvas_ctx.ensure_vision = _ensure_vision_for_active_scene
 
     # P3 (2026-07-13) — single-slot handle for the backgrounded
-    # scene-change narration (see the narration tail of the refresh
-    # closure below). A new scene change cancels the previous scene's
-    # narration task before starting its own.
+    # narration run. Auto Play Phase A widened the slot's tenants:
+    # scene-change narration, session-start narration (A5), manual
+    # request_narrate replays, and autoplay_control resume all run here.
+    # A newer run cancels the previous one before starting its own, and
+    # a cancelled run never emits script_complete.
     scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
+
+    def _start_narration_task(coro, *, replace: bool = True) -> bool:
+        """Put a narration coroutine into the single slot (Phase A).
+
+        ``replace=True`` (scene change / manual replay / resume) cancels
+        the active run first — newest wins. ``replace=False`` (session
+        start) yields to an already-active run instead: a run that raced
+        ahead already owns narration, and stomping it would
+        double-narrate. Returns True iff the task was started.
+        """
+        prev = scene_narration_task["task"]
+        if prev is not None and not prev.done():
+            if not replace:
+                coro.close()  # avoid a "never awaited" warning
+                return False
+            prev.cancel()
+        scene_narration_task["task"] = asyncio.create_task(coro)
+        return True
 
     # ── Scene-change refresh (S64c) ──
     # Single refresh entry point for both voice-initiated and
@@ -2189,46 +2449,11 @@ async def run_bot_relay(
             prev_task = scene_narration_task["task"]
             if prev_task is not None and not prev_task.done():
                 prev_task.cancel()
-
-            async def _narrate_and_complete(snap: dict) -> None:
-                spoke_script = False
-                try:
-                    try:
-                        spoke_script = await run_scene_narration(
-                            snap,
-                            narrator=narrator,
-                            speak_followup=_relay_speak,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[CANVAS SCENECHANGED] narration failed: {!r}", exc
-                        )
-                    finally:
-                        # Shielded so the RELAY_TURN still closes even when
-                        # this task is cancelled mid-narration (an await in
-                        # a cancelled task would otherwise re-raise before
-                        # the close completes).
-                        await asyncio.shield(_relay_close_turn())
-                    await output_transport.send_message(
-                        OutputTransportMessageFrame(
-                            message=build_script_complete_payload(
-                                snap, spoke_script=spoke_script
-                            )
-                        )
-                    )
-                    logger.info(
-                        "[CANVAS SCENECHANGED] narration complete spoke_script={}",
-                        spoke_script,
-                    )
-                except asyncio.CancelledError:
-                    logger.info(
-                        "[CANVAS SCENECHANGED] narration superseded by a newer scene change"
-                    )
-                    raise
-
-            scene_narration_task["task"] = asyncio.create_task(
-                _narrate_and_complete(fresh_snapshot)
-            )
+                # A3 (relay half) — best-effort: RELAY_INTERRUPT the open
+                # narration turn so SoulX stops rendering the old scene's
+                # text over the new scene. No local audio to flush here.
+                await _relay_interrupt_narration_turn()
+            _start_narration_task(_narrate_and_complete(fresh_snapshot))
 
     # ── Canvas Protocol generic tool handlers (S64c) ──
     canvas_protocol_handlers = make_canvas_protocol_handlers(canvas_ctx)
@@ -2452,6 +2677,121 @@ async def run_bot_relay(
         speak=_relay_speak,
     )
 
+    # ── Auto Play Phase A — narration-run machinery (relay) ──
+    # Known v1 limitations (recorded per the Phase A brief, alongside the
+    # existing relay narration punts): _relay_speak is fire-and-forget
+    # text to SoulX, so there is NO drain-wait (script_complete still
+    # fires at text-forwarded, not at SoulX playout-complete) and NO
+    # speech-interruption awareness for narration turns (the narration
+    # turn bypasses AvatarRelayProcessor, whose InterruptionFrame
+    # handling only covers LLM turns). "stop" is a best-effort cancel:
+    # the run task is cancelled and the open narration turn is
+    # RELAY_INTERRUPTed so SoulX stops rendering what it already
+    # received.
+
+    async def _relay_interrupt_narration_turn() -> None:
+        """Best-effort SoulX-side flush of the open narration turn.
+
+        Clears the turn state FIRST (synchronously) so the cancelled
+        run's finally-block close_turn no-ops instead of racing this
+        with a TURN_END, then sends RELAY_INTERRUPT — the same primitive
+        AvatarRelayProcessor uses for LLM-turn interruptions.
+
+        ORDERING RULE (all call sites): cancel the superseded run's task
+        BEFORE calling this. Interrupting first leaves the still-live
+        old run free to reopen a fresh turn between the interrupt and
+        the cancel; and cancelling first means the old task's
+        shield-deferred close_turn unwinds during THIS function's await
+        (while turn state is already zeroed) instead of after the new
+        run opens its turn — which would close the NEW run's turn and
+        eat its first segment.
+        """
+        turn_id = relay_turn_state["turn_id"]
+        if turn_id is None:
+            return
+        relay_turn_state["turn_id"] = None
+        relay_turn_state["seq"] = 0
+        await _send_relay(RELAY_INTERRUPT, turn_id=turn_id)
+        logger.info("[NARRATION] relay narration turn {} interrupted", turn_id)
+
+    def _cancel_active_narration_run() -> None:
+        """Cancel the single-slot run if active (see ordering rule above)."""
+        prev = scene_narration_task["task"]
+        if prev is not None and not prev.done():
+            prev.cancel()
+
+    # Phase A — session-start context seeding must survive slot
+    # supersession (mirror of the classic pipeline's helper; see there
+    # for the full rationale). _queue_greeting seeds on completion;
+    # if it was cancelled by a superseding run, that run seeds instead.
+    session_seeded = {"done": False}
+
+    async def _seed_session_context_once(spoke_script: bool) -> None:
+        if session_seeded["done"]:
+            return
+        session_seeded["done"] = True
+        if spoke_script:
+            context.add_message({
+                "role": "developer",
+                "content": (
+                    "You just finished presenting the scene scripts to the visitor. "
+                    "They heard your full presentation. Don't repeat what you already said."
+                ),
+            })
+        else:
+            context.add_message({
+                "role": "developer",
+                "content": GREETING_TRIGGER_PROMPT,
+            })
+            await task.queue_frames([LLMRunFrame()])
+
+    async def _narrate_and_complete(
+        snap: dict, *, force: bool = False, trigger: str = "auto"
+    ) -> None:
+        """One relay narration run: narrate → close turn → script_complete.
+
+        Runs as the single-slot background task (P3). The RELAY_TURN is
+        closed in a shielded finally so a cancellation mid-narration
+        never strands SoulX waiting for TURN_END; a cancelled run does
+        NOT emit script_complete (frozen wire rule 2b).
+        """
+        spoke_script = False
+        try:
+            try:
+                spoke_script = await run_scene_narration(
+                    snap,
+                    narrator=narrator,
+                    speak_followup=_relay_speak,
+                    force=force,
+                )
+            except Exception as exc:
+                logger.warning("[NARRATION] narration failed: {!r}", exc)
+            finally:
+                # Shielded so the RELAY_TURN still closes even when this
+                # task is cancelled mid-narration (an await in a cancelled
+                # task would otherwise re-raise before the close completes).
+                await asyncio.shield(_relay_close_turn())
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message=build_script_complete_payload(
+                        snap, spoke_script=spoke_script, trigger=trigger
+                    )
+                )
+            )
+            logger.info(
+                "[NARRATION] run complete spoke_script={} trigger={}",
+                spoke_script, trigger,
+            )
+            # Seed the session context if the cancelled greeting never
+            # got to (script-less flows must still wake the LLM — see
+            # the classic pipeline's mirror).
+            await _seed_session_context_once(spoke_script)
+        except asyncio.CancelledError:
+            logger.info(
+                "[NARRATION] run superseded or stopped — script_complete suppressed"
+            )
+            raise
+
     # ── Greeting (waits for avatar readiness) ──
 
     async def _queue_greeting():
@@ -2475,6 +2815,13 @@ async def run_bot_relay(
             # already auto-advanced. The orchestrator returns
             # spoke_script for the script_complete payload + the
             # developer-context message branch below.
+            #
+            # Phase A (A5) — this coroutine now runs in the single
+            # narration slot, so a scene change can cancel it. The close
+            # is shielded (mirrors _narrate_and_complete) so cancellation
+            # mid-narration never strands SoulX on a dangling turn; the
+            # propagating CancelledError then suppresses the
+            # script_complete emit below (wire rule 2b).
             try:
                 spoke_script = await run_scene_narration(
                     scene_snapshot,
@@ -2482,7 +2829,7 @@ async def run_bot_relay(
                     speak_followup=_relay_speak,
                 )
             finally:
-                await _relay_close_turn()
+                await asyncio.shield(_relay_close_turn())
 
         # S65 G4 — script_complete fires for BOTH branches; payload
         # carries {sceneIndex, hadScript} so the shell knows whether
@@ -2496,20 +2843,11 @@ async def run_bot_relay(
             )
         )
 
-        if spoke_script:
-            context.add_message({
-                "role": "developer",
-                "content": (
-                    "You just finished presenting the scene scripts to the visitor. "
-                    "They heard your full presentation. Don't repeat what you already said."
-                ),
-            })
-        else:
-            context.add_message({
-                "role": "developer",
-                "content": GREETING_TRIGGER_PROMPT,
-            })
-            await task.queue_frames([LLMRunFrame()])
+        # Phase A — one-time seeding via the shared helper: if this
+        # greeting gets cancelled by a superseding run before reaching
+        # here, that run performs the seeding instead (script-less
+        # flows must still wake the LLM).
+        await _seed_session_context_once(spoke_script)
 
     async def _cancel_for_human_leave(reason: str, pid: str | None):
         nonlocal active_human_id, captured_audio_participant_id, greeting_sent
@@ -2575,31 +2913,62 @@ async def run_bot_relay(
                 if not manual_snapshot:
                     logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
                     return
-                spoke_script = False
-                try:
-                    spoke_script = await run_scene_narration(
-                        manual_snapshot,
-                        narrator=narrator,
-                        speak_followup=_relay_speak,
-                        force=True,
+                # Phase A — slot-run like the classic pipeline: a replay
+                # racing an active narration run now supersedes it
+                # (newest wins) instead of interleaving RELAY_TEXT into
+                # its open turn. Cancel FIRST, then interrupt the turn
+                # (see _relay_interrupt_narration_turn's ordering rule),
+                # then start the new run.
+                _cancel_active_narration_run()
+                await _relay_interrupt_narration_turn()
+                _start_narration_task(
+                    _narrate_and_complete(
+                        manual_snapshot, force=True, trigger="manual"
                     )
-                except Exception as exc:
-                    logger.warning("[REQUEST_NARRATE] narration failed: {!r}", exc)
-                finally:
-                    await _relay_close_turn()
-                await output_transport.send_message(
-                    OutputTransportMessageFrame(
-                        message=build_script_complete_payload(
-                            manual_snapshot,
-                            spoke_script=spoke_script,
-                            trigger="manual",
+                )
+                logger.info("[REQUEST_NARRATE] manual replay started")
+                return
+
+            if msg_type == "autoplay_control":
+                # ── Auto Play Phase A (A4) — relay half. Known v1
+                # limitation (see the machinery comment above): no local
+                # audio, so "stop" is a best-effort cancel + turn
+                # interrupt, and completions fire at text-forwarded.
+                action = message.get("action")
+                if action == "stop":
+                    _cancel_active_narration_run()
+                    await _relay_interrupt_narration_turn()
+                    logger.info(
+                        "[AUTOPLAY] stop: narration cancelled, relay turn interrupted"
+                    )
+                elif action == "resume":
+                    if not room_id:
+                        logger.info("[AUTOPLAY] resume skipped: no room_id")
+                        return
+                    from api_client import get_scene_snapshot
+                    # By tracked scene id (cursor fallback) — see the
+                    # classic resume branch for the P2 rationale.
+                    resume_snapshot = await get_scene_snapshot(
+                        room_id, api_url,
+                        scene_id=session_context.get_current_scene_id() or None,
+                    )
+                    if not resume_snapshot:
+                        logger.info(
+                            "[AUTOPLAY] resume skipped: snapshot fetch failed"
                         )
+                        return
+                    # Cancel + interrupt BEFORE starting (ordering rule in
+                    # _relay_interrupt_narration_turn): a resume racing an
+                    # active run must not let the superseded run's
+                    # shield-deferred close_turn eat the new run's turn.
+                    _cancel_active_narration_run()
+                    await _relay_interrupt_narration_turn()
+                    _start_narration_task(
+                        _narrate_and_complete(resume_snapshot, force=True)
                     )
-                )
-                logger.info(
-                    "[REQUEST_NARRATE] manual replay complete spoke_script={}",
-                    spoke_script,
-                )
+                    logger.info("[AUTOPLAY] resume: re-narration started")
+                else:
+                    logger.warning("[AUTOPLAY] unknown action {!r} ignored", action)
                 return
 
             if msg_type == "request_quiz":
@@ -2766,7 +3135,13 @@ async def run_bot_relay(
         await _start_human_audio_capture(active_human_id)
         if not avatar_ready_event.is_set():
             logger.info("Human joined before avatar relay bot was ready; cloud bot will wait")
-        asyncio.create_task(_queue_greeting())
+        # Phase A (A5) — the greeting (session-start narration) runs in
+        # the single narration slot so a scene change during the opening
+        # narration cancels it instead of letting the old scene's script
+        # keep playing. replace=False: never stomp a run that already
+        # owns the slot (e.g. a raced scene change, or a second client
+        # connecting mid-narration).
+        _start_narration_task(_queue_greeting(), replace=False)
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
