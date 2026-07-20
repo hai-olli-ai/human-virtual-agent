@@ -337,7 +337,7 @@ EAGER_DISPATCH_VERBS = frozenset({
 })
 ```
 
-**Current limitation:** the hook objects are constructed in `_build_llm_and_eager_hook` but **not yet called by Pipecat's streaming loop**. Result: 0 ms savings in production today. The infrastructure is ready when someone wires `await eager_hook.on_stream_event(chunk)` into the Pipecat LLM service subclass. (Tracked for S74.)
+**Current limitation:** the hook objects are constructed in `_build_llm_and_eager_hook` but **not yet called by Pipecat's streaming loop**. Result: 0 ms savings in production today. The infrastructure is ready when someone wires `await eager_hook.on_stream_event(chunk)` into the Pipecat LLM service subclass. (Tracked for S75.)
 
 **Double-dispatch safety:** `PendingCommandRegistry.is_eager(commandId)`. When `stop_reason` arrives and the regular handler runs, it checks this flag and awaits the existing future without re-sending.
 
@@ -700,16 +700,26 @@ canvas_annotate(op, target, …)
 
 ---
 
+## CI (S72)
+
+`.github/workflows/ci.yml` **at the repo root** (the project lives in the `pipecat-agent/` subdirectory — the workflow sets `defaults.run.working-directory`). Jobs **`lint` · `test`** — ⚠️ **the branch-protection contract (C8)**: main requires both; renaming one leaves the old required context stuck on "Expected" and jams every PR until protection is updated in lockstep. (The C5 revisit ADDED lint — a passing ruff config existed.)
+
+- `lint`: `uvx ruff@0.15.7 check .` — check-only (ruff is not a dev dependency; `ruff format --check` is dirty today → S75 hygiene).
+- `test`: `uv sync --frozen` → `uv run pytest -q` — 275 tests, `live` marker excluded by pyproject addopts, python 3.12 pinned in the workflow (no committed interpreter pin).
+- **This repo is PUBLIC — C9 hard rule: the workflow carries ZERO env and ZERO secrets** (the suite passes under `env -i`). Nothing here may ever name a provider key.
+
+Local parity (from `pipecat-agent/`): `uvx ruff@0.15.7 check .` · `uv run pytest -q`.
+
 ## Coming next
 
-**S68 (External Embeds)** and **S69a (Generation Engine)** both shipped with **zero agent changes** — embeds ride the snapshot's `link` block, and generated flows are indistinguishable from hand-built ones (narration S65, fast switching S66, and the visual-interaction stack S67a/b/c all key off the snapshot, not how the scene was authored). The **P3 latency pass (2026-07-13)** shipped (shared httpx client, narration off the hot path). **Auto Play Phase A (2026-07-16)** shipped the agent half of the Auto Play work; **Phase B (the shell's playback UI) is frontend-only — zero agent changes expected**, and both sides build against the frozen wire contract v1 (see *Recent: Auto Play Phase A*; don't change the contract unilaterally). **Next agent-relevant work: none until MCP E2E (S71).** Roadmap: **S69b (/hv Prompt Orchestrator + Create-with-AI studio UI** — also zero agent changes; a `/hv`-created room is indistinguishable from a modal-created one), then MCP (S70–71), video export (S72), deployment (S73–75), performance & hygiene (S76), launch (S77).
+**S68 (External Embeds)** and **S69a (Generation Engine)** both shipped with **zero agent changes** — embeds ride the snapshot's `link` block, and generated flows are indistinguishable from hand-built ones (narration S65, fast switching S66, and the visual-interaction stack S67a/b/c all key off the snapshot, not how the scene was authored). The **P3 latency pass (2026-07-13)** shipped (shared httpx client, narration off the hot path). **Auto Play Phase A (2026-07-16)** shipped the agent half of the Auto Play work; **Phase B (the shell's playback UI) is frontend-only — zero agent changes expected**, and both sides build against the frozen wire contract v1 (see *Recent: Auto Play Phase A*; don't change the contract unilaterally). **Next agent-relevant work: none until MCP E2E (S71).** Roadmap: **S69b (/hv Prompt Orchestrator + Create-with-AI studio UI** — also zero agent changes; a `/hv`-created room is indistinguishable from a modal-created one), then MCP (S70–71). Next: Phase 10 — Production Launch. **S72 CI/CD [was S73] ✅ (2026-07-20** — agent CI live, see the CI section**)** · **S73 Production Deployment [was S74]** (rotation = its gate A0, R1) · S74 Monitoring [was S75] · S75 Hardening, Hygiene & Performance [was S76] · S76 Launch [was S77]. Real video export moved to the post-launch backlog (P1).
 
 ---
 
 ## Out of scope
 
 - Mid-session provider switching (`LLM_CANVAS_PROVIDER` fixed at boot).
-- Persistent iframe shell (per-scene unmount + keyed remount is current; S66's optional prewarm double-buffer was **deferred to S74** — Blocks 1–5 hit the < 1 s target without it).
+- Persistent iframe shell (per-scene unmount + keyed remount is current; S66's optional prewarm double-buffer was **deferred to S75** — Blocks 1–5 hit the < 1 s target without it).
 - A/B testing infrastructure for comparing providers in production.
 - Eager-dispatch-to-Pipecat-streaming-loop wiring (hooks constructed; never invoked; tracked for S75).
 - **Caching narration audio for the relay (`talking`) pipeline.** SoulX renders its own audio — `CachedFirstTTSService` is only in the classic pipeline. Per-script-avatar voice in relay is the same v0.2 punt.
