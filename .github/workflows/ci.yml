@@ -1,0 +1,64 @@
+# S72 B7 — agent CI. Job names (lint · test) are the branch-protection
+# contract (C8) — renaming a job silently un-protects it. The C5 revisit
+# resolved to ADDING lint (A1 found a passing ruff config; decided at B7,
+# 2026-07-19), extending the agent contract from `test` to `lint · test`.
+# C9, public-repo edition: this repo is PUBLIC, so the workflow must stay
+# OBVIOUSLY credential-free — the suite needs zero env (A7: 275 passed under
+# `env -i`), so no job sets env or references secrets. Keep it that way.
+# Repo layout: the project lives in the pipecat-agent/ SUBDIRECTORY (repo
+# root is just pipecat-agent/ + README.md — A0), hence the
+# defaults.run.working-directory below.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Public repo: the job token has no business writing anything.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: pipecat-agent
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # ruff is NOT a dev dependency here (A1) — no uv sync; uvx pinned to
+      # the version verified clean at B7. check-only, unlike backend/mcp:
+      # `ruff format --check` is dirty today (34 files — S75 hygiene
+      # backlog); add format enforcement there, not here.
+      - run: uvx ruff@0.15.7 check .
+
+  test:
+    runs-on: ubuntu-latest
+    # A7 wall: 27.72s for the suite itself; the budget is dominated by the
+    # cold-cache uv sync of pipecat's heavy native wheels.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          # No committed interpreter pin exists (unlike backend/mcp's
+          # .python-version) and ubuntu-latest's default python drifts —
+          # pin the version A7 verified (py3.13+ would likely also work via
+          # pipecat's audioop-lts shim, but 3.12 is what the evidence covers).
+          python-version: "3.12"
+      - run: uv sync --frozen
+      # 275 passed, 1 deselected (`live` marker, excluded by pyproject
+      # addopts) with an EMPTY environment (A7). NO env block, NO secrets —
+      # C9 on a public repo: nothing here may ever name a provider key.
+      - run: uv run pytest -q
