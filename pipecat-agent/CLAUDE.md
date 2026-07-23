@@ -285,7 +285,7 @@ for seg in current_scene["scripts"]:
 
 The agent's `config.py` and the backend's `app/config.py` carry **paired** constants. Mismatch = garbled cached playback that "works" locally but breaks where configs drift. Paired keys:
 
-- `NARRATION_TTS_MODEL_ID` (e.g. `sonic-2`).
+- `NARRATION_TTS_MODEL_ID` (e.g. `sonic-3`).
 - `NARRATION_AUDIO_ENCODING` (`pcm_s16le`).
 - `NARRATION_AUDIO_SAMPLE_RATE` (e.g. `24000` Hz).
 - `NARRATION_AUDIO_NUM_CHANNELS` (`1`).
@@ -449,7 +449,7 @@ LLM_CANVAS_PROVIDER=groq                  # groq (default) | openai | anthropic 
 
 # --- S65b — must match backend exactly ---
 NARRATION_CACHE_ENABLED=true
-NARRATION_TTS_MODEL_ID=sonic-2            # MUST equal backend
+NARRATION_TTS_MODEL_ID=sonic-3            # MUST equal backend (R5 resolved S73: sonic-3 everywhere)
 NARRATION_AUDIO_ENCODING=pcm_s16le
 NARRATION_AUDIO_SAMPLE_RATE=24000         # MUST equal backend
 NARRATION_AUDIO_NUM_CHANNELS=1
