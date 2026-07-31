@@ -733,3 +733,10 @@ Local parity (from `pipecat-agent/`): `uvx ruff@0.15.7 check .` · `uv run pytes
 - **Caching narration audio for the relay (`talking`) pipeline.** SoulX renders its own audio — `CachedFirstTTSService` is only in the classic pipeline. Per-script-avatar voice in relay is the same v0.2 punt.
 - **Caching fallback (room-primary-voiced) segments.** Room-dependent → requires room-scoped keys → v2.
 - **Cache warming on publish, edge/multi-region warming, Opus/OGG encoding to cut R2 size.** All v2 considerations.
+
+## Staging & Promotion (S74b — live since 2026-07-30)
+
+- **Staging agent:** `human-virtual-agent-staging` (Pipecat Cloud us-west), deployed from **`pcc-deploy.staging.toml`** — always pinned to **the SAME image tag production runs**; secret set `human-virtual-agent-staging-secrets` = the prod set verbatim with ONE delta (`HV_API_URL=https://api.staging.hv.ai/api/v1`). The §7/NARRATION pairing law spans tiers — the sonic-3 block is byte-identical in both sets.
+- **Promotion model — the agent has NO `production` branch.** It promotes by image tag: build/push a new tag → deploy to STAGING first (`pcc deploy --config-file pcc-deploy.staging.toml`) → verify via the staging smoke → then `pcc deploy` with the prod toml at that same tag (the backend `scripts/promote_production.sh` tail prints this reminder).
+- The staging backend summons this agent via `PIPECAT_AGENT_NAME=human-virtual-agent-staging` (settings-backed on the backend since S69-era config; the staging Railway matrix carries the value).
+- Ops detail: backend `docs/deploy/PRODUCTION_RUNBOOK.md` §11; evidence: backend `guidelines/SESSION_74B_COMPLETION.md`.
