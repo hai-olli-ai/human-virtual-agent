@@ -3,6 +3,7 @@
 Takes a scene snapshot dict from the API and builds descriptive text
 for the LLM system prompt.
 """
+
 from loguru import logger
 from typing import Any
 
@@ -249,6 +250,7 @@ def build_knowledge_context(knowledge: dict[str, Any] | None) -> str:
 
 VISION_MESSAGE = "This is the current scene canvas that the visitor is seeing. The canvas is 1280x720 pixels (origin top-left). Remember the layout, colors, positions, and content of all elements. When discussing the scene, reference what you see in this image. When using canvas action tools (highlight, arrow, annotation), estimate pixel coordinates from this image."
 
+
 def build_vision_message(image_base64: str) -> dict:
     """Build an OpenAI-format user message with a canvas image for vision.
 
@@ -271,6 +273,7 @@ def build_vision_message(image_base64: str) -> dict:
         ],
     }
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Element aliases (S64c)
 # ──────────────────────────────────────────────────────────────────────
@@ -288,6 +291,7 @@ def build_vision_message(image_base64: str) -> dict:
 # bot.py stores the alias→UUID map on canvas_ctx; the tool handlers
 # translate aliases back to real UUIDs before sending the canvas.command
 # to the frontend. The LLM only ever needs to copy the short alias.
+
 
 def compute_element_aliases(elements: list[dict]) -> dict[str, str]:
     """Return ``{alias: element_id}`` for the given elements list.
@@ -326,13 +330,15 @@ def _summarize_element(el: dict) -> str:
     if et == "button" and el.get("title"):
         return f'button "{el["title"]}"'
     if et == "emoji" and el.get("emoji_character"):
-        return f'emoji {el["emoji_character"]}'
+        return f"emoji {el['emoji_character']}"
     if el.get("label"):
         return f"{et} ({el['label']})"
     return et
 
 
-def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = None) -> str:
+def build_scene_description(
+    snapshot: dict, aliases: dict[str, str] | None = None
+) -> str:
     """Build a human-readable scene description from a snapshot.
 
     The snapshot comes from GET /live-rooms/{room_id}/scene-snapshot.
@@ -367,11 +373,17 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
     parts.append(f"Avatar display mode: {display_mode}")
 
     if display_mode == "invisible":
-        parts.append("Note: You are in voice-only mode. The visitor cannot see you, only hear you. Focus entirely on verbal communication.")
+        parts.append(
+            "Note: You are in voice-only mode. The visitor cannot see you, only hear you. Focus entirely on verbal communication."
+        )
     elif display_mode == "talking":
-        parts.append("Note: You are rendered as a talking avatar with lip sync. The visitor can see your face moving as you speak.")
+        parts.append(
+            "Note: You are rendered as a talking avatar with lip sync. The visitor can see your face moving as you speak."
+        )
     elif display_mode == "3dgs":
-        parts.append("Note: You are rendered as a 3D model. The visitor sees a 3D representation of you.")
+        parts.append(
+            "Note: You are rendered as a 3D model. The visitor sees a 3D representation of you."
+        )
 
     # Canvas elements
     elements = current_scene.get("elements", [])
@@ -401,15 +413,15 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
             if el.get("text"):
                 desc += f': "{el["text"]}"'
             if el.get("label"):
-                desc += f' (label: {el["label"]})'
+                desc += f" (label: {el['label']})"
             if el.get("title"):
-                desc += f' (title: {el["title"]})'
+                desc += f" (title: {el['title']})"
             # S64c (Option 2) — surface emoji_character so the LLM can tell
             # one emoji from another, and so emoji elements aren't a
             # content-less line in the prompt that the LLM might mistake
             # for "the title".
             if el.get("emoji_character"):
-                desc += f' (emoji: {el["emoji_character"]})'
+                desc += f" (emoji: {el['emoji_character']})"
             if el.get("display_mode"):
                 desc += f" [display: {el['display_mode']}]"
 
@@ -426,7 +438,9 @@ def build_scene_description(snapshot: dict, aliases: dict[str, str] | None = Non
     if total > 1:
         index = flow_state.get("scene_index", 0)
         parts.append(f"\nThis is scene {index + 1} of {total} in a multi-scene flow.")
-        parts.append("You can navigate between scenes when appropriate by using the navigate_scene tool.")
+        parts.append(
+            "You can navigate between scenes when appropriate by using the navigate_scene tool."
+        )
 
     return "\n".join(parts)
 
@@ -517,7 +531,9 @@ def build_canvas_tools_section(
     current_scene = snapshot.get("current_scene") or {}
 
     total = flow_state.get("total_scenes", 1)
-    control_verbs = "next_scene, previous_scene, goto_scene, clear" if total > 1 else "clear"
+    control_verbs = (
+        "next_scene, previous_scene, goto_scene, clear" if total > 1 else "clear"
+    )
 
     # Page-type-aware bullets. The OLD pre-S64d wording asserted composition
     # rules unconditionally ("element_id MUST, box NOT supported") which
@@ -548,75 +564,87 @@ def build_canvas_tools_section(
 
         if page_type == "youtube":
             ids_line = (
-                "- Canvas elements on this scene (informational only — the YouTube page "
-                "has no per-element aliases to annotate; use `describe` or `region` "
-                "targets, and `canvas_control` verbs for playback):\n" + "\n".join(listed)
-            ) if listed else (
-                "- No standalone canvas elements declared on this scene."
+                (
+                    "- Canvas elements on this scene (informational only — the YouTube page "
+                    "has no per-element aliases to annotate; use `describe` or `region` "
+                    "targets, and `canvas_control` verbs for playback):\n"
+                    + "\n".join(listed)
+                )
+                if listed
+                else ("- No standalone canvas elements declared on this scene.")
             )
         else:
             ids_line = (
-                "- Available canvas elements (pass these aliases as "
-                "`target.element` for canvas_annotate, and as `from` / `to` "
-                "for canvas_action with verb=draw_arrow):\n"
-                + "\n".join(listed)
-            ) if listed else (
-                "- No canvas elements are available on this scene — annotate by "
-                "`describe`/`region` instead; `canvas_action(verb='draw_arrow')` cannot be called."
+                (
+                    "- Available canvas elements (pass these aliases as "
+                    "`target.element` for canvas_annotate, and as `from` / `to` "
+                    "for canvas_action with verb=draw_arrow):\n" + "\n".join(listed)
+                )
+                if listed
+                else (
+                    "- No canvas elements are available on this scene — annotate by "
+                    "`describe`/`region` instead; `canvas_action(verb='draw_arrow')` cannot be called."
+                )
             )
     else:
         # Fallback path: aliases not wired (sync test builder, older callers).
         # Surface raw UUIDs so the existing behavior is preserved.
         element_ids = [el.get("id") for el in elements if el.get("id")]
         if element_ids:
-            ids_line = "- Available element ids: " + ", ".join(f"`{eid}`" for eid in element_ids) + "."
+            ids_line = (
+                "- Available element ids: "
+                + ", ".join(f"`{eid}`" for eid in element_ids)
+                + "."
+            )
         else:
             ids_line = "- No element ids are available on this scene — annotate by `describe`/`region` instead."
 
     annotate_bullet = (
         "2. `canvas_annotate(op, target)` — draw a temporary annotation on the overlay "
         "the visitor sees (`op`: circle | arrow | shape | highlight | text | erase). Set "
-        "`target` to `{element: \"<alias>\"}` for a known scene element, `{describe: "
-        "\"...\"}` for something in a video/image (you'll look at the screen to locate "
+        '`target` to `{element: "<alias>"}` for a known scene element, `{describe: '
+        '"..."}` for something in a video/image (you\'ll look at the screen to locate '
         "it), or `{region: {x, y, w, h}}` (0-1 fractions) if you already have coords. "
         "Annotations clear on scene change; use `op='erase'` to clear sooner. See the "
         "AGENT PLAYBOOK for when to annotate. (The old in-iframe `canvas_highlight` tool "
         "no longer exists.)"
     )
 
-    return "\n".join([
-        "## Canvas Actions",
-        "",
-        "**Use ONLY the 5 tools below for any canvas interaction.**",
-        "",
-        "1. `canvas_analyze(question, options={})` — answer a question about what is "
-        "visible on the canvas using the active page's semantic state. Use when the "
-        "visitor asks something you cannot determine from your existing context.",
-        "",
-        annotate_bullet,
-        "",
-        f"3. `canvas_control(verb, args={{}})` — state-transition verbs. Supported: "
-        f"{control_verbs}. Most take `args={{}}`.",
-        "",
-        "4. `canvas_action(verb, args)` — content-producing verbs. **Verb-specific "
-        "fields go INSIDE `args` (a nested object), not at the top level next to `verb`.**",
-        "   - `draw_arrow`: pass `args = {\"from\": \"<element_id>\", \"to\": \"<element_id>\"}`. "
-        "Both ids MUST come from the Available element ids list in Notes below "
-        "(UUID-shaped). Do NOT use overlay ids (e.g. `ovl_3`) or any other id-shaped "
-        "strings returned from earlier tool results — those are not element ids.",
-        "   - `add_annotation`: pass `args = {\"text\": \"<string>\", \"x\": <number>, "
-        "\"y\": <number>}`. `x` and `y` are in 1280x720 design-space coordinates.",
-        "",
-        "5. `canvas_set_page(pageType, pageInit={})` — switch the active canvas page. "
-        "`pageType` must be one of `composition`, `youtube`, `quiz`. v0.1 only allows "
-        "`composition` — only call this if the visitor explicitly asks for a different mode.",
-        "",
-        "Notes:",
-        "- The canvas is 1280x720 pixels (origin top-left).",
-        ids_line,
-        "- For arg-less verbs (next_scene, previous_scene, clear), call with verb only and args={}.",
-        "- Use these tools naturally during conversation when they help the visitor.",
-    ])
+    return "\n".join(
+        [
+            "## Canvas Actions",
+            "",
+            "**Use ONLY the 5 tools below for any canvas interaction.**",
+            "",
+            "1. `canvas_analyze(question, options={})` — answer a question about what is "
+            "visible on the canvas using the active page's semantic state. Use when the "
+            "visitor asks something you cannot determine from your existing context.",
+            "",
+            annotate_bullet,
+            "",
+            f"3. `canvas_control(verb, args={{}})` — state-transition verbs. Supported: "
+            f"{control_verbs}. Most take `args={{}}`.",
+            "",
+            "4. `canvas_action(verb, args)` — content-producing verbs. **Verb-specific "
+            "fields go INSIDE `args` (a nested object), not at the top level next to `verb`.**",
+            '   - `draw_arrow`: pass `args = {"from": "<element_id>", "to": "<element_id>"}`. '
+            "Both ids MUST come from the Available element ids list in Notes below "
+            "(UUID-shaped). Do NOT use overlay ids (e.g. `ovl_3`) or any other id-shaped "
+            "strings returned from earlier tool results — those are not element ids.",
+            '   - `add_annotation`: pass `args = {"text": "<string>", "x": <number>, '
+            '"y": <number>}`. `x` and `y` are in 1280x720 design-space coordinates.',
+            "",
+            "5. `canvas_set_page(pageType, pageInit={})` — switch the active canvas page. "
+            "`pageType` must be one of `composition`, `youtube`, `quiz`. v0.1 only allows "
+            "`composition` — only call this if the visitor explicitly asks for a different mode.",
+            "",
+            "Notes:",
+            "- The canvas is 1280x720 pixels (origin top-left).",
+            ids_line,
+            "- For arg-less verbs (next_scene, previous_scene, clear), call with verb only and args={}.",
+            "- Use these tools naturally during conversation when they help the visitor.",
+        ]
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -630,6 +658,7 @@ def build_canvas_tools_section(
 # intentionally parallel until that legacy endpoint is retired.
 # When you add or remove a section here, mirror the change in
 # persona.build_system_prompt.
+
 
 def build_system_prompt(snapshot: dict | None) -> str:
     """Assemble the agent's system prompt from a scene snapshot.

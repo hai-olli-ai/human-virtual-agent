@@ -43,11 +43,18 @@ from context.canvas_manifest import CanvasManifestRegistry
 
 # Arg-less control/action verbs — eager dispatch fires the moment the verb
 # token closes. The verb name alone is sufficient; no other args needed.
-EAGER_DISPATCH_VERBS: frozenset[str] = frozenset({
-    "next_scene", "previous_scene", "clear",
-    "next_question", "previous_question", "restart",
-    "play", "pause",
-})
+EAGER_DISPATCH_VERBS: frozenset[str] = frozenset(
+    {
+        "next_scene",
+        "previous_scene",
+        "clear",
+        "next_question",
+        "previous_question",
+        "restart",
+        "play",
+        "pause",
+    }
+)
 
 # Shell-level control verbs. These do NOT execute against the active Page's
 # iframe — they're intercepted by the frontend's DailyRelay (see
@@ -61,14 +68,19 @@ EAGER_DISPATCH_VERBS: frozenset[str] = frozenset({
 #      YouTube, Quiz) doesn't declare them in its iframe manifest.
 # Kept in sync with the relay-side constant by convention (two-line drift
 # risk acceptable; these verbs are stable).
-SCENE_NAV_VERBS: frozenset[str] = frozenset({
-    "next_scene", "previous_scene", "goto_scene",
-})
+SCENE_NAV_VERBS: frozenset[str] = frozenset(
+    {
+        "next_scene",
+        "previous_scene",
+        "goto_scene",
+    }
+)
 
 
 # ----------------------------------------------------------------------------
 # Pending command tracking — bridges async tool-call handlers and Daily replies
 # ----------------------------------------------------------------------------
+
 
 @dataclass
 class PendingCommand:
@@ -87,7 +99,9 @@ class PendingCommandRegistry:
     def open(self, command_id: str, eager: bool = False) -> asyncio.Future:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
-        self._pending[command_id] = PendingCommand(command_id, fut, eager_dispatched=eager)
+        self._pending[command_id] = PendingCommand(
+            command_id, fut, eager_dispatched=eager
+        )
         return fut
 
     def is_eager(self, command_id: str) -> bool:
@@ -133,6 +147,7 @@ class CanvasCommandError(Exception):
 # Tool schemas — what the LLM sees
 # ----------------------------------------------------------------------------
 
+
 def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
     """Build the 4 generic canvas-protocol tool schemas. The descriptions reference the active
     Page's manifest if available — this gives the LLM verb-level guidance
@@ -158,8 +173,14 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
                 "check the screen, or about anything they've drawn or pointed at."
             ),
             properties={
-                "question": {"type": "string", "description": "The question in natural language."},
-                "options": {"type": "object", "description": "Reserved for future provider hints. Pass {} for v0.1."},
+                "question": {
+                    "type": "string",
+                    "description": "The question in natural language.",
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Reserved for future provider hints. Pass {} for v0.1.",
+                },
             },
             required=["question"],
         ),
@@ -171,17 +192,20 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
                 "Verb-specific fields MUST be nested inside `args`, not placed at the top level alongside `verb`."
             ),
             properties={
-                "verb": {"type": "string", "description": "The control verb to invoke."},
+                "verb": {
+                    "type": "string",
+                    "description": "The control verb to invoke.",
+                },
                 "args": {
                     "type": "object",
                     "description": (
                         "Verb-specific args object. "
                         "Argless verbs (next_scene, previous_scene, clear, play, pause, restart, "
                         "next_question, previous_question) take {}. "
-                        "For seek: {\"seconds\": <non-negative number>} — absolute timestamp in seconds "
+                        'For seek: {"seconds": <non-negative number>} — absolute timestamp in seconds '
                         "(e.g. 120 for two minutes). "
-                        "For set_speed: {\"rate\": <number>} — playback rate, 1.0 normal, 0.5 half, 2.0 double. "
-                        "For goto_scene: {\"index\": <integer>} — zero-based scene index."
+                        'For set_speed: {"rate": <number>} — playback rate, 1.0 normal, 0.5 half, 2.0 double. '
+                        'For goto_scene: {"index": <integer>} — zero-based scene index.'
                     ),
                 },
             },
@@ -200,11 +224,11 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
                     "type": "object",
                     "description": (
                         "Verb-specific args object. "
-                        "For draw_arrow: {\"from\": \"<element_id>\", \"to\": \"<element_id>\"} — "
+                        'For draw_arrow: {"from": "<element_id>", "to": "<element_id>"} — '
                         "both ids must be element ids from CANVAS ELEMENTS (not overlay ids "
                         "like 'ovl_3' from prior tool results). "
-                        "For add_annotation: {\"text\": \"<string>\", \"x\": <number>, "
-                        "\"y\": <number>} — x and y in 1280x720 design-space coordinates."
+                        'For add_annotation: {"text": "<string>", "x": <number>, '
+                        '"y": <number>} — x and y in 1280x720 design-space coordinates.'
                     ),
                 },
             },
@@ -222,8 +246,14 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
                 "composition, youtube, quiz."
             ),
             properties={
-                "pageType": {"type": "string", "description": "One of: composition, youtube, quiz. Prefer 'composition' for returning to the scene view."},
-                "pageInit": {"type": "object", "description": "Page-specific seed data. Pass {} for composition (the snapshot drives the page) and youtube. Not used for quiz — see generate_quiz_from_knowledge."},
+                "pageType": {
+                    "type": "string",
+                    "description": "One of: composition, youtube, quiz. Prefer 'composition' for returning to the scene view.",
+                },
+                "pageInit": {
+                    "type": "object",
+                    "description": "Page-specific seed data. Pass {} for composition (the snapshot drives the page) and youtube. Not used for quiz — see generate_quiz_from_knowledge.",
+                },
             },
             required=["pageType"],
         ),
@@ -234,7 +264,10 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
 # Daily message helpers
 # ----------------------------------------------------------------------------
 
-def build_canvas_command(tool: str, args: dict, command_id: Optional[str] = None) -> dict:
+
+def build_canvas_command(
+    tool: str, args: dict, command_id: Optional[str] = None
+) -> dict:
     """Build the Daily app-message payload for an outbound canvas command.
     Wire format mirrors the in-iframe postMessage protocol exactly so the
     frontend's Daily relay can forward it to the Canvas Service unchanged."""
@@ -255,6 +288,7 @@ def build_canvas_command(tool: str, args: dict, command_id: Optional[str] = None
 # ----------------------------------------------------------------------------
 # Tool handler factory — produces the async handlers Pipecat will register
 # ----------------------------------------------------------------------------
+
 
 @dataclass
 class CanvasToolContext:
@@ -307,15 +341,21 @@ async def dispatch_canvas_command(
         # the future. We just need to await the existing future.
         existing = ctx.pending._pending.get(cmd["commandId"])
         future = existing.future if existing else ctx.pending.open(cmd["commandId"])
-        logger.info(f"[CANVAS DISPATCH] tool={tool} commandId={cmd['commandId']} (eager already sent)")
+        logger.info(
+            f"[CANVAS DISPATCH] tool={tool} commandId={cmd['commandId']} (eager already sent)"
+        )
     else:
         future = ctx.pending.open(cmd["commandId"])
         await ctx.send_app_message(cmd)
-        logger.info(f"[CANVAS DISPATCH] tool={tool} commandId={cmd['commandId']} payload={cmd!r}")
+        logger.info(
+            f"[CANVAS DISPATCH] tool={tool} commandId={cmd['commandId']} payload={cmd!r}"
+        )
 
     try:
         result = await asyncio.wait_for(future, timeout=ctx.command_timeout_s)
-        logger.info(f"[CANVAS RESULT] tool={tool} commandId={cmd['commandId']} result={result!r}")
+        logger.info(
+            f"[CANVAS RESULT] tool={tool} commandId={cmd['commandId']} result={result!r}"
+        )
         return result
     except asyncio.TimeoutError:
         ctx.pending._pending.pop(cmd["commandId"], None)
@@ -324,7 +364,10 @@ async def dispatch_canvas_command(
             f"after {ctx.command_timeout_s}s — frontend Canvas Service did not reply"
         )
         raise CanvasCommandError(
-            {"code": "TIMEOUT", "message": f"canvas {tool} timed out after {ctx.command_timeout_s}s"}
+            {
+                "code": "TIMEOUT",
+                "message": f"canvas {tool} timed out after {ctx.command_timeout_s}s",
+            }
         )
 
 
@@ -349,7 +392,9 @@ def make_handlers(ctx: CanvasToolContext):
     Each handler validates against the manifest, sends the Daily message, awaits
     the reply via Future."""
 
-    async def _dispatch(tool: str, args: dict, command_id: Optional[str] = None) -> dict:
+    async def _dispatch(
+        tool: str, args: dict, command_id: Optional[str] = None
+    ) -> dict:
         return await dispatch_canvas_command(ctx, tool, args, command_id=command_id)
 
     def _resolve_element_id(raw: Any) -> Any:
@@ -361,18 +406,22 @@ def make_handlers(ctx: CanvasToolContext):
             return ctx.element_alias_map[raw]
         return raw
 
-    async def _emit_error(params: FunctionCallParams, exc: CanvasCommandError, tool_label: str) -> None:
+    async def _emit_error(
+        params: FunctionCallParams, exc: CanvasCommandError, tool_label: str
+    ) -> None:
         """Return the canvas error to the LLM as a tool result instead of
         letting it propagate as a pipeline ErrorFrame. Mirrors V2.13's
         always-result_callback pattern so a single failed call doesn't
         break the conversation turn — the LLM can read the error and
         recover (e.g. retry with a different argument shape, or apologize)."""
         logger.warning(f"[{tool_label}] error code={exc.code} message={exc.message!r}")
-        await params.result_callback({
-            "error": exc.code,
-            "message": exc.message,
-            "details": exc.details,
-        })
+        await params.result_callback(
+            {
+                "error": exc.code,
+                "message": exc.message,
+                "details": exc.details,
+            }
+        )
 
     async def handle_analyze(params: FunctionCallParams):
         args = params.arguments or {}
@@ -396,7 +445,9 @@ def make_handlers(ctx: CanvasToolContext):
         # the vision answer — for visual questions, vision IS the answer.
         page_state = None
         try:
-            page_state = await _dispatch("analyze", {"question": question, "options": args.get("options", {})})
+            page_state = await _dispatch(
+                "analyze", {"question": question, "options": args.get("options", {})}
+            )
         except CanvasCommandError as exc:
             if vision_answer is None:
                 await _emit_error(params, exc, "CANVAS_ANALYZE")
@@ -428,10 +479,12 @@ def make_handlers(ctx: CanvasToolContext):
                             f"[CANVAS_CONTROL] UNSUPPORTED_VERB verb={verb!r} "
                             f"available={cap.get('verbs', [])}"
                         )
-                        raise CanvasCommandError({
-                            "code": "UNSUPPORTED_VERB",
-                            "message": f"Active page does not support control verb '{verb}'. Available: {cap.get('verbs', [])}",
-                        })
+                        raise CanvasCommandError(
+                            {
+                                "code": "UNSUPPORTED_VERB",
+                                "message": f"Active page does not support control verb '{verb}'. Available: {cap.get('verbs', [])}",
+                            }
+                        )
             result = await _dispatch("control", {"verb": verb, **verb_args})
             # Scene-change refresh is no longer triggered from here. Both
             # voice and visitor-initiated nav flow through the frontend's
@@ -471,10 +524,12 @@ def make_handlers(ctx: CanvasToolContext):
                         f"[CANVAS_ACTION] UNSUPPORTED_VERB verb={verb!r} "
                         f"available={cap.get('verbs', [])}"
                     )
-                    raise CanvasCommandError({
-                        "code": "UNSUPPORTED_VERB",
-                        "message": f"Active page does not support action verb '{verb}'. Available: {cap.get('verbs', [])}",
-                    })
+                    raise CanvasCommandError(
+                        {
+                            "code": "UNSUPPORTED_VERB",
+                            "message": f"Active page does not support action verb '{verb}'. Available: {cap.get('verbs', [])}",
+                        }
+                    )
             result = await _dispatch("action", {"verb": verb, **verb_args})
             # No bundled next_question here. Question-to-question advancement
             # is owned by the Quiz Page itself (it auto-reveals the explanation
@@ -492,16 +547,24 @@ def make_handlers(ctx: CanvasToolContext):
         args = params.arguments or {}
         page_type = args.get("pageType")
         page_init = args.get("pageInit") or {}
-        logger.info(f"[CANVAS_SET_PAGE] called: pageType={page_type!r} pageInit={page_init!r}")
+        logger.info(
+            f"[CANVAS_SET_PAGE] called: pageType={page_type!r} pageInit={page_init!r}"
+        )
         try:
             # In v0.1 only composition is allowed. S64d/e expand the allowlist.
             if page_type not in {"composition", "youtube", "quiz"}:
-                logger.warning(f"[CANVAS_SET_PAGE] UNKNOWN_PAGE_TYPE pageType={page_type!r}")
-                raise CanvasCommandError({
-                    "code": "UNKNOWN_PAGE_TYPE",
-                    "message": f"pageType '{page_type}' is not in the allowlist",
-                })
-            result = await _dispatch("set_page", {"pageType": page_type, "pageInit": page_init})
+                logger.warning(
+                    f"[CANVAS_SET_PAGE] UNKNOWN_PAGE_TYPE pageType={page_type!r}"
+                )
+                raise CanvasCommandError(
+                    {
+                        "code": "UNKNOWN_PAGE_TYPE",
+                        "message": f"pageType '{page_type}' is not in the allowlist",
+                    }
+                )
+            result = await _dispatch(
+                "set_page", {"pageType": page_type, "pageInit": page_init}
+            )
             await params.result_callback(result)
         except CanvasCommandError as exc:
             await _emit_error(params, exc, "CANVAS_SET_PAGE")

@@ -11,3 +11,5 @@ build/
 
 # Environment
 .env
+# macOS noise (S75 B13)
+.DS_Store

@@ -45,10 +45,10 @@ def test_english_word_deltas_round_trip():
 
 def test_flush_releases_trailing_partial_word():
     agg = WordBoundaryAggregator()
-    assert agg.feed("Xin") == ""        # no whitespace yet — buffered
-    assert agg.feed(" chào") == "Xin"   # "Xin" complete, "chào" still buffered
-    assert agg.flush() == "chào"        # released at the turn boundary
-    assert agg.flush() == ""            # idempotent / empty afterwards
+    assert agg.feed("Xin") == ""  # no whitespace yet — buffered
+    assert agg.feed(" chào") == "Xin"  # "Xin" complete, "chào" still buffered
+    assert agg.flush() == "chào"  # released at the turn boundary
+    assert agg.flush() == ""  # idempotent / empty afterwards
 
 
 def test_no_whitespace_run_buffers_until_flush():

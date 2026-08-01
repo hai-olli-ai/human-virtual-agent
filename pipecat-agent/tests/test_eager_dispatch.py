@@ -37,18 +37,33 @@ class TestDetectCompletedVerb:
 
 
 class TestIsArgLessVerb:
-    @pytest.mark.parametrize("verb", [
-        "next_scene", "previous_scene", "clear",
-        "next_question", "previous_question", "restart",
-        "play", "pause",
-    ])
+    @pytest.mark.parametrize(
+        "verb",
+        [
+            "next_scene",
+            "previous_scene",
+            "clear",
+            "next_question",
+            "previous_question",
+            "restart",
+            "play",
+            "pause",
+        ],
+    )
     def test_known_arg_less(self, verb):
         assert is_arg_less_verb(verb) is True
 
-    @pytest.mark.parametrize("verb", [
-        "draw_arrow", "add_annotation", "submit_answer",
-        "goto_scene", "seek", "set_speed",
-    ])
+    @pytest.mark.parametrize(
+        "verb",
+        [
+            "draw_arrow",
+            "add_annotation",
+            "submit_answer",
+            "goto_scene",
+            "seek",
+            "set_speed",
+        ],
+    )
     def test_known_arg_having(self, verb):
         assert is_arg_less_verb(verb) is False
 

@@ -63,11 +63,11 @@ from scene_context import (
 # the LLM self-corrects from the error result handed back as a tool reply.
 VERB_ARG_SHAPES: dict[str, str] = {
     # control verbs
-    "seek":       '{"seconds": <non-negative number>}',
-    "set_speed":  '{"rate": <number; 1.0 normal, 0.5 half, 2.0 double>}',
+    "seek": '{"seconds": <non-negative number>}',
+    "set_speed": '{"rate": <number; 1.0 normal, 0.5 half, 2.0 double>}',
     "goto_scene": '{"index": <zero-based integer scene index>}',
     # action verbs
-    "draw_arrow":     '{"from": "<element_id>", "to": "<element_id>"}',
+    "draw_arrow": '{"from": "<element_id>", "to": "<element_id>"}',
     "add_annotation": '{"text": "<string>", "x": <number>, "y": <number>}',
 }
 
@@ -117,13 +117,23 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
     if cap.get("analyze", {}).get("supported"):
         lines.append("- analyze: supported (semantic state provider).")
 
-    lines.extend(_render_verb_list("control", (cap.get("control") or {}).get("verbs") or []))
-    lines.extend(_render_verb_list("action", (cap.get("action") or {}).get("verbs") or []))
+    lines.extend(
+        _render_verb_list("control", (cap.get("control") or {}).get("verbs") or [])
+    )
+    lines.extend(
+        _render_verb_list("action", (cap.get("action") or {}).get("verbs") or [])
+    )
 
     lines.append("")
-    lines.append("Use these verbs through canvas_control(verb=..., args={...}) and canvas_action(verb=..., args={...}).")
-    lines.append("Verb-specific fields MUST be nested inside `args` — never at the top level alongside `verb`.")
-    lines.append("If you call an unsupported verb, the dispatch returns UNSUPPORTED_VERB and you should pick a supported alternative.")
+    lines.append(
+        "Use these verbs through canvas_control(verb=..., args={...}) and canvas_action(verb=..., args={...})."
+    )
+    lines.append(
+        "Verb-specific fields MUST be nested inside `args` — never at the top level alongside `verb`."
+    )
+    lines.append(
+        "If you call an unsupported verb, the dispatch returns UNSUPPORTED_VERB and you should pick a supported alternative."
+    )
     lines.append("")
     # Scene-navigation verbs are SHELL-level and apply regardless of which
     # Canvas Page is active — they're routed by the frontend's DailyRelay
@@ -162,6 +172,7 @@ def render_canvas_page_section(manifest: Optional[dict]) -> str:
 # satisfy ^[a-zA-Z0-9_-]+$" applies here too — dotted forms would steer
 # the model toward calls that 400 at the provider boundary.
 
+
 def render_voice_output_style_section() -> str:
     """VOICE OUTPUT STYLE — hard formatting constraint for TTS + caption.
 
@@ -180,7 +191,7 @@ def render_voice_output_style_section() -> str:
         "- NO Markdown or formatting characters of any kind — no asterisks "
         "(`*`, `**`), underscores, backticks, pound/hash signs, bullet points, or "
         "numbered-list markers.\n"
-        "- NO emojis, and NO ellipses (\"…\" or \"...\"). Never trail off — finish "
+        '- NO emojis, and NO ellipses ("…" or "..."). Never trail off — finish '
         "every sentence you start.\n"
         "- Speak the way a person talks: short, complete sentences. To emphasize a "
         "word, just say it plainly — never wrap it in symbols.\n"
@@ -204,8 +215,8 @@ def render_agent_playbook_section() -> str:
         "to test their knowledge:\n"
         "\n"
         "1. **First, SPEAK a short acknowledgement aloud.** One sentence is enough "
-        "— for example: \"Alright, let me put a few questions together for you.\" "
-        "or \"Sure, give me just a second to pull some questions.\" "
+        '— for example: "Alright, let me put a few questions together for you." '
+        'or "Sure, give me just a second to pull some questions." '
         "**Do NOT call any tool yet.** Speak first, in the same turn, so the user "
         "hears your voice immediately. Dead air while a tool runs feels broken to "
         "the user, and this acknowledgement masks the generation latency.\n"
@@ -219,12 +230,12 @@ def render_agent_playbook_section() -> str:
         "Page's `semanticState.questionText` (the source of truth for what's "
         "currently on screen). Map the choices for the user as needed from "
         "`semanticState.choices`.\n"
-        "4. When the user answers verbally (e.g. \"I'll go with B\" or \"the answer "
+        '4. When the user answers verbally (e.g. "I\'ll go with B" or "the answer '
         "is Paris\"), call `canvas_action` with `verb='submit_answer'` and "
-        "`args={\"choice\": \"<letter>\"}`. Use `semanticState.choices` to map "
+        '`args={"choice": "<letter>"}`. Use `semanticState.choices` to map '
         "the user's words to a choice id (A/B/C/D).\n"
-        "   - **If the user says \"I don't know\", \"I'm not sure\", \"skip\", "
-        "\"no idea\", \"pass\", or otherwise opts out of answering:** call "
+        '   - **If the user says "I don\'t know", "I\'m not sure", "skip", '
+        '"no idea", "pass", or otherwise opts out of answering:** call '
         "`canvas_action` with `verb='skip_question'` and `args={}` INSTEAD of "
         "submit_answer. The Page reveals the correct answer, shows the "
         "explanation, and auto-advances on the same timer as a real answer. "
@@ -249,8 +260,8 @@ def render_agent_playbook_section() -> str:
         "   - **`completed: true`** — the visitor just answered the LAST "
         "question. The Page stays on the final result view (no advance). "
         "Narrate a brief wrap-up using the running tally you've been keeping "
-        "(see \"Score tracking\" below), e.g. \"You got 2 out of 3 — nice "
-        "work!\". Then ask whether the visitor wants to continue with the "
+        '(see "Score tracking" below), e.g. "You got 2 out of 3 — nice '
+        'work!". Then ask whether the visitor wants to continue with the '
         "lesson; if yes, call `canvas_set_page` with `pageType='composition'` "
         "to return to the scene view.\n"
         "\n"
@@ -276,7 +287,7 @@ def render_agent_playbook_section() -> str:
         "banner automatically as part of its post-answer sequence. Reserve "
         "this verb for the rare case where you want the banner revealed "
         "without the visitor having answered (e.g. they asked \"what's the "
-        "explanation?\" mid-question).\n"
+        'explanation?" mid-question).\n'
         "\n"
         "To exit the quiz back to the regular scene view at any time, call "
         "`canvas_set_page` with `pageType='composition'` (`pageInit` can be "
@@ -287,9 +298,9 @@ def render_agent_playbook_section() -> str:
         "drawn) is NOT in your text context. Whenever the visitor asks what is on "
         "the screen, what you see, to look at / read / check the screen, OR refers "
         "to something they've drawn, circled, highlighted, or written — e.g. "
-        "\"what do you see on the screen?\", \"what's showing right now?\", \"what "
-        "am I pointing at?\", \"what did I circle?\", \"is this answer I wrote "
-        "correct?\" — do NOT answer from the scene description; instead:\n"
+        '"what do you see on the screen?", "what\'s showing right now?", "what '
+        'am I pointing at?", "what did I circle?", "is this answer I wrote '
+        'correct?" — do NOT answer from the scene description; instead:\n'
         "\n"
         "1. Call `canvas_analyze` with the visitor's question. This triggers a "
         "live look at what the visitor actually sees, including their own "
@@ -311,9 +322,9 @@ def render_agent_playbook_section() -> str:
         "\n"
         "1. Pick an `op`: `circle`, `arrow`, `shape`, `highlight`, `text`, or `erase`.\n"
         "2. Pick a `target` (required for every op except `erase`):\n"
-        "   - `{element: \"<alias>\"}` — when it's a known scene element (composition "
+        '   - `{element: "<alias>"}` — when it\'s a known scene element (composition '
         "scenes; use an alias from CANVAS ELEMENTS).\n"
-        "   - `{describe: \"...\"}` — when it's something in a video or image; you will "
+        '   - `{describe: "..."}` — when it\'s something in a video or image; you will '
         "look at the live screen to locate it.\n"
         "   - `{region: {x, y, w, h}}` — only if you already have normalized 0-1 coords.\n"
         "3. Annotations appear on the SAME overlay the visitor draws on and clear on "
@@ -328,6 +339,7 @@ def render_agent_playbook_section() -> str:
 # ----------------------------------------------------------------------------
 # CANVAS ACTIONS — REPLACED (S64c)
 # ----------------------------------------------------------------------------
+
 
 def render_canvas_actions_section() -> str:
     """Render the CANVAS ACTIONS section explaining how to use the 5 generic tools.
@@ -346,7 +358,7 @@ def render_canvas_actions_section() -> str:
         "\n"
         "2. **canvas_annotate(op, target)** — draw a temporary annotation on the overlay "
         "the visitor sees (op: circle | arrow | shape | highlight | text | erase). target is "
-        "{element: \"<alias>\"}, {describe: \"...\"}, or {region: {x, y, w, h}}. See AGENT PLAYBOOK.\n"
+        '{element: "<alias>"}, {describe: "..."}, or {region: {x, y, w, h}}. See AGENT PLAYBOOK.\n'
         "\n"
         "3. **canvas_control(verb, args={})** — invoke a state-transition verb. The CANVAS "
         "PAGE section above lists which verbs are supported. Most control verbs take {}.\n"
@@ -360,7 +372,7 @@ def render_canvas_actions_section() -> str:
         "set_page, a new manifest arrives and your CANVAS PAGE section updates.\n"
         "\n"
         "Notes:\n"
-        "- Annotations persist until canvas_annotate(op=\"erase\") or scene change.\n"
+        '- Annotations persist until canvas_annotate(op="erase") or scene change.\n'
         "- Reuse element ids from CANVAS ELEMENTS when possible — they are stable.\n"
         "- For arg-less verbs (next_scene, previous_scene, clear, pause, play, restart, "
         "next_question, previous_question), call control or action with verb only and args={}."
@@ -373,6 +385,7 @@ def render_canvas_actions_section() -> str:
 # scene_context.build_scene_description so the dynamic suffix can render
 # them as discrete sections; the legacy V2.13 helper stays untouched.)
 # ----------------------------------------------------------------------------
+
 
 def _render_display_mode(display_mode: str | None) -> str:
     if not display_mode:
@@ -407,9 +420,9 @@ def _render_canvas_elements(elements: list[dict] | None) -> str:
         if el.get("text"):
             desc += f': "{el["text"]}"'
         if el.get("label"):
-            desc += f' (label: {el["label"]})'
+            desc += f" (label: {el['label']})"
         if el.get("title"):
-            desc += f' (title: {el["title"]})'
+            desc += f" (title: {el['title']})"
         if el.get("display_mode"):
             desc += f" [display: {el['display_mode']}]"
         pos = el.get("position") or {}
@@ -426,6 +439,7 @@ def _render_canvas_elements(elements: list[dict] | None) -> str:
 # ----------------------------------------------------------------------------
 # Split builder — returns (stable_prefix, dynamic_suffix)
 # ----------------------------------------------------------------------------
+
 
 def build_system_prompt_split(
     *,
@@ -489,9 +503,7 @@ def build_system_prompt_split(
     # ── Dynamic suffix (sections 6 → 9) ──
     dynamic_parts: list[str] = []
 
-    display_block = _render_display_mode(
-        current_scene_block.get("avatar_display_mode")
-    )
+    display_block = _render_display_mode(current_scene_block.get("avatar_display_mode"))
     if display_block:
         dynamic_parts.append(display_block)
 

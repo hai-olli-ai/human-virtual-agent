@@ -78,9 +78,7 @@ def request_quiz_ready(session_context) -> bool:
     session")``), but the handler's pre-gate is what keeps the wire
     silent in the silent-ignore case.
     """
-    return bool(
-        session_context.get_slug() and session_context.get_current_scene_id()
-    )
+    return bool(session_context.get_slug() and session_context.get_current_scene_id())
 
 
 @dataclass
@@ -270,7 +268,8 @@ async def run_quiz_generation(
         except CanvasCommandError as exc:
             logger.warning(
                 "[GENERATE_QUIZ] page swap failed code={!r} message={!r}",
-                exc.code, exc.message,
+                exc.code,
+                exc.message,
             )
             msg = f"quiz page swap failed: {exc.code}: {exc.message[:200]}"
             if on_state is not None:
@@ -283,7 +282,9 @@ async def run_quiz_generation(
                 await on_state("error", msg)
             return QuizGenerationResult(ok=False, blob=blob, error=msg)
     else:
-        logger.info("[GENERATE_QUIZ] canvas dispatch not wired; skipping bundled set_page")
+        logger.info(
+            "[GENERATE_QUIZ] canvas dispatch not wired; skipping bundled set_page"
+        )
 
     if on_state is not None:
         await on_state("ready", None)
@@ -307,6 +308,7 @@ def make_handle_generate_quiz(backend_client, session_context, canvas_ctx):
     never emits Daily app-messages — those are S65c's manual-button
     path concern (Block 5 + Block 6).
     """
+
     async def handle_generate_quiz(params: FunctionCallParams):
         args = params.arguments or {}
         count = args.get("count", 3)

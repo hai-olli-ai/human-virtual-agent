@@ -37,10 +37,10 @@ jobs:
         with:
           enable-cache: true
       # ruff is NOT a dev dependency here (A1) — no uv sync; uvx pinned to
-      # the version verified clean at B7. check-only, unlike backend/mcp:
-      # `ruff format --check` is dirty today (34 files — S75 hygiene
-      # backlog); add format enforcement there, not here.
+      # the version verified clean at B7. Format enforcement added in S75
+      # B13 (the 34-file backlog was formatted in the same PR).
       - run: uvx ruff@0.15.7 check .
+      - run: uvx ruff@0.15.7 format --check .
 
   test:
     runs-on: ubuntu-latest

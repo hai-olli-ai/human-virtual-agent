@@ -29,6 +29,7 @@ def _run(coro):
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
+
 class FakeParams:
     """Minimal FunctionCallParams stand-in: carries arguments, captures the result."""
 
@@ -99,12 +100,16 @@ def _make(
     handler = make_handle_canvas_annotate(
         send_message=send_message,
         pending=pending,
-        vision_client=vision_client if vision_client is not None else FakeVision(locate_box),
+        vision_client=vision_client
+        if vision_client is not None
+        else FakeVision(locate_box),
         request_capture=request_capture,
         fetch_live_bytes=fetch_live_bytes,
         backend_client=FakeBackend(elements),
         session_context=FakeSession(),
-        element_alias_map=alias_map if alias_map is not None else {"button_1": "uuid-b1"},
+        element_alias_map=alias_map
+        if alias_map is not None
+        else {"button_1": "uuid-b1"},
         room_id="room-1",
         api_url=None,
         timeout_s=timeout_s,
@@ -123,6 +128,7 @@ def _el(eid, x, y, w, h, etype="button"):
 
 # ── Schema ───────────────────────────────────────────────────────────────────
 
+
 def test_schema_shape():
     assert AGENT_ANNOTATE_SCHEMA.name == "canvas_annotate"
     assert AGENT_ANNOTATE_SCHEMA.required == ["op"]
@@ -132,6 +138,7 @@ def test_schema_shape():
 
 
 # ── element_box_from_snapshot — the A-AG-3 ÷100 contract ──────────────────────
+
 
 def test_element_box_percent_to_fraction():
     elements = [_el("uuid-b1", 25, 50, 10, 20)]
@@ -148,7 +155,12 @@ def test_element_box_raw_uuid_passthrough():
 
 
 def test_element_box_unknown_alias_returns_none():
-    assert element_box_from_snapshot("text_9", [_el("uuid-b1", 1, 1, 1, 1)], {"button_1": "uuid-b1"}) is None
+    assert (
+        element_box_from_snapshot(
+            "text_9", [_el("uuid-b1", 1, 1, 1, 1)], {"button_1": "uuid-b1"}
+        )
+        is None
+    )
 
 
 def test_element_box_missing_geometry_returns_none():
@@ -158,7 +170,9 @@ def test_element_box_missing_geometry_returns_none():
 
 def test_element_box_degenerate_returns_none():
     elements = [_el("uuid-b1", 10, 10, 0, 20)]  # zero width
-    assert element_box_from_snapshot("button_1", elements, {"button_1": "uuid-b1"}) is None
+    assert (
+        element_box_from_snapshot("button_1", elements, {"button_1": "uuid-b1"}) is None
+    )
 
 
 def test_element_box_empty_alias_returns_none():
@@ -166,6 +180,7 @@ def test_element_box_empty_alias_returns_none():
 
 
 # ── handler: erase / region / element / describe / failure / emit ─────────────
+
 
 def test_erase_emits_erase_op():
     handler, sent = _make()
@@ -189,7 +204,9 @@ def test_element_target_from_snapshot():
     handler, sent = _make(elements=[_el("uuid-b1", 50, 50, 20, 10)])
     p = FakeParams({"op": "highlight", "target": {"element": "button_1"}})
     _run(handler(p))
-    assert sent[0]["ops"] == [{"op": "highlight", "box": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.1}}]
+    assert sent[0]["ops"] == [
+        {"op": "highlight", "box": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.1}}
+    ]
 
 
 def test_describe_target_uses_locate():
@@ -218,25 +235,39 @@ def test_unresolvable_element_returns_error_no_emit():
 
 def test_shape_op_includes_shape_field():
     handler, sent = _make()
-    p = FakeParams({"op": "shape", "shape": "heart", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}})
+    p = FakeParams(
+        {
+            "op": "shape",
+            "shape": "heart",
+            "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}},
+        }
+    )
     _run(handler(p))
     assert sent[0]["ops"][0]["shape"] == "heart"
 
 
 def test_text_op_includes_text_field():
     handler, sent = _make()
-    p = FakeParams({"op": "text", "text": "Look here", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}})
+    p = FakeParams(
+        {
+            "op": "text",
+            "text": "Look here",
+            "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}},
+        }
+    )
     _run(handler(p))
     assert sent[0]["ops"][0]["text"] == "Look here"
 
 
 def test_arrow_from_resolves_source_box():
     handler, sent = _make(elements=[_el("uuid-b1", 10, 10, 10, 10)])
-    p = FakeParams({
-        "op": "arrow",
-        "from": "button_1",
-        "target": {"region": {"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1}},
-    })
+    p = FakeParams(
+        {
+            "op": "arrow",
+            "from": "button_1",
+            "target": {"region": {"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1}},
+        }
+    )
     _run(handler(p))
     op = sent[0]["ops"][0]
     assert op["box"] == {"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1}
@@ -246,7 +277,9 @@ def test_arrow_from_resolves_source_box():
 def test_emit_timeout_is_best_effort_ok_true():
     # No ack from the shell + a tiny timeout → _emit times out but reports rendered.
     handler, sent = _make(ack=False, timeout_s=0.01)
-    p = FakeParams({"op": "circle", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}})
+    p = FakeParams(
+        {"op": "circle", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}}
+    )
     _run(handler(p))
     assert len(sent) == 1
     assert p.result["ok"] is True
@@ -254,20 +287,25 @@ def test_emit_timeout_is_best_effort_ok_true():
 
 def test_emit_ack_failure_reports_not_ok():
     handler, sent = _make(ack=True, ack_ok=False)
-    p = FakeParams({"op": "circle", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}})
+    p = FakeParams(
+        {"op": "circle", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}}
+    )
     _run(handler(p))
     assert p.result["ok"] is False
 
 
 def test_unknown_op_rejected_no_emit():
     handler, sent = _make()
-    p = FakeParams({"op": "frobnicate", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}})
+    p = FakeParams(
+        {"op": "frobnicate", "target": {"region": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}}
+    )
     _run(handler(p))
     assert sent == []
     assert p.result["ok"] is False
 
 
 # ── B10 #1/#4 — element target → box → emitted + success copy ─────────────────
+
 
 def test_circle_element_target_emits_box_and_success_copy():
     handler, sent = _make(
@@ -277,11 +315,14 @@ def test_circle_element_target_emits_box_and_success_copy():
     p = FakeParams({"op": "circle", "target": {"element": "title"}})
     _run(handler(p))
     assert sent[0]["type"] == "agent_annotate"
-    assert sent[0]["ops"] == [{"op": "circle", "box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}}]
+    assert sent[0]["ops"] == [
+        {"op": "circle", "box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}}
+    ]
     assert p.result["ok"] is True and "circle" in p.result["message"]
 
 
 # ── B10 #7 — real VisionClient stub (GOOGLE_AI_API_KEY unset) → locate None ────
+
 
 def test_describe_with_vision_stub_asks_to_clarify():
     # A real VisionClient with no key is the deployed stub path: locate() returns
@@ -300,16 +341,23 @@ def test_describe_with_vision_stub_asks_to_clarify():
 #    (full pipecat stack), so we guard the real source structurally AND mirror
 #    the routing contract — same approach test_canvas_vision uses for captures.
 
+
 def test_agent_annotate_result_routed_before_canvas_dispatch():
     src = (Path(__file__).resolve().parent.parent / "bot.py").read_text()
     # Present in both pipelines (classic + relay).
     assert src.count('msg_type == "agent_annotate_result"') == 2
     # Each branch sits before canvas.register and early-returns, so the canvas
     # dispatch never sees the ack.
-    blocks = re.findall(r'msg_type == "agent_annotate_result"(.*?)canvas\.register', src, re.S)
-    assert len(blocks) == 2, "annotate-ack branch must precede canvas.register in both handlers"
+    blocks = re.findall(
+        r'msg_type == "agent_annotate_result"(.*?)canvas\.register', src, re.S
+    )
+    assert len(blocks) == 2, (
+        "annotate-ack branch must precede canvas.register in both handlers"
+    )
     for b in blocks:
-        assert "return" in b, "annotate-ack branch must early-return before the canvas dispatch"
+        assert "return" in b, (
+            "annotate-ack branch must early-return before the canvas dispatch"
+        )
 
 
 def test_agent_annotate_result_short_circuits_before_dispatch():
@@ -348,13 +396,17 @@ def test_agent_annotate_result_short_circuits_before_dispatch():
         # delivered as a JSON STRING (defensive json.loads) → routed to the
         # annotate branch, dispatch never called, future resolved.
         r1 = await _route(
-            json.dumps({"type": "agent_annotate_result", "annotateId": "a1", "ok": True}),
-            pending=pending, canvas_dispatch=_canvas_dispatch,
+            json.dumps(
+                {"type": "agent_annotate_result", "annotateId": "a1", "ok": True}
+            ),
+            pending=pending,
+            canvas_dispatch=_canvas_dispatch,
         )
         # control: a canvas.* message DOES reach the dispatch.
         r2 = await _route(
             {"type": "canvas.register", "pageType": "quiz"},
-            pending=pending, canvas_dispatch=_canvas_dispatch,
+            pending=pending,
+            canvas_dispatch=_canvas_dispatch,
         )
         return r1, r2, dispatched, pending["a1"]
 

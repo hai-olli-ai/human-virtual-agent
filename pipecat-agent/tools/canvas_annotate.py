@@ -45,7 +45,13 @@ from pipecat.services.llm_service import FunctionCallParams
 
 # Shapes the overlay can stamp at a target box (op="shape").
 AGENT_ANNOTATE_SHAPES = (
-    "heart", "circle", "rectangle", "arrow", "star", "checkmark", "question_mark",
+    "heart",
+    "circle",
+    "rectangle",
+    "arrow",
+    "star",
+    "checkmark",
+    "question_mark",
 )
 # Top-level operations. "erase" clears all annotations; everything else needs a target.
 AGENT_ANNOTATE_OPS = ("circle", "arrow", "shape", "highlight", "text", "erase")
@@ -214,7 +220,9 @@ def make_handle_canvas_annotate(
         if element:
             # Geometry from a by-scene_id snapshot (cheap — backend Redis-cached, S66).
             scene_id = session_context.get_current_scene_id()
-            snap = await backend_client.get_scene_snapshot(room_id, api_url, scene_id=scene_id)
+            snap = await backend_client.get_scene_snapshot(
+                room_id, api_url, scene_id=scene_id
+            )
             elements = ((snap or {}).get("current_scene") or {}).get("elements") or []
             return element_box_from_snapshot(element, elements, element_alias_map)
         describe = target.get("describe")
@@ -223,8 +231,12 @@ def make_handle_canvas_annotate(
             # locate box is capture-relative; treated as canvas-relative (the capture
             # surface is expected to be the canvas — A-AG-5 §4).
             slug = session_context.get_slug()
-            capture_id, capture_result = await request_capture("locate: " + str(describe))
-            img = await fetch_live_bytes(capture_id, capture_result, backend_client, slug, api_url)
+            capture_id, capture_result = await request_capture(
+                "locate: " + str(describe)
+            )
+            img = await fetch_live_bytes(
+                capture_id, capture_result, backend_client, slug, api_url
+            )
             if img is None:
                 return None
             return await vision_client.locate(img, str(describe))
@@ -233,26 +245,34 @@ def make_handle_canvas_annotate(
     async def handle_canvas_annotate(params: FunctionCallParams):
         args = params.arguments or {}
         op = args.get("op")
-        logger.info("[CANVAS_ANNOTATE] called: op={!r} target={!r}", op, args.get("target"))
+        logger.info(
+            "[CANVAS_ANNOTATE] called: op={!r} target={!r}", op, args.get("target")
+        )
 
         if op not in AGENT_ANNOTATE_OPS:
-            await params.result_callback({"ok": False, "message": f"Unknown annotate op '{op}'."})
+            await params.result_callback(
+                {"ok": False, "message": f"Unknown annotate op '{op}'."}
+            )
             return
 
         if op == "erase":
             await _emit([{"op": "erase"}])
-            await params.result_callback({"ok": True, "message": "Erased all annotations."})
+            await params.result_callback(
+                {"ok": True, "message": "Erased all annotations."}
+            )
             return
 
         box = await _resolve_box(args.get("target") or {})
         if box is None:
-            await params.result_callback({
-                "ok": False,
-                "message": (
-                    "I couldn't locate that on screen — ask the visitor to point at it "
-                    "or describe it more specifically."
-                ),
-            })
+            await params.result_callback(
+                {
+                    "ok": False,
+                    "message": (
+                        "I couldn't locate that on screen — ask the visitor to point at it "
+                        "or describe it more specifically."
+                    ),
+                }
+            )
             return
 
         op_obj: dict[str, Any] = {"op": op, "box": box}

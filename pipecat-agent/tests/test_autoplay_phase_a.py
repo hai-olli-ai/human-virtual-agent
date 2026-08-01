@@ -110,8 +110,12 @@ async def _feed(gate, frame, direction=FrameDirection.DOWNSTREAM):
 async def _feed_synthesized_utterance(gate, ctx="ctx"):
     """One utterance's downstream synthesis frames as the gate sees them:
     audio chunk(s), then TTSStoppedFrame (synthesis-complete)."""
-    await _feed(gate, TTSAudioRawFrame(audio=b"\x00\x00", sample_rate=24000,
-                                       num_channels=1, context_id=ctx))
+    await _feed(
+        gate,
+        TTSAudioRawFrame(
+            audio=b"\x00\x00", sample_rate=24000, num_channels=1, context_id=ctx
+        ),
+    )
     await _feed(gate, TTSStoppedFrame(context_id=ctx))
 
 
@@ -388,10 +392,12 @@ def test_gate_cancel_all_covers_all_three_registries():
 
 
 def test_drain_timeout_sums_known_durations_plus_margin():
-    snap = _snap(scripts=[
-        {"text": "a", "audio": {"url": "u1", "duration_ms": 1500}},
-        {"text": "b", "audio": {"url": "u2", "duration_ms": 2500}},
-    ])
+    snap = _snap(
+        scripts=[
+            {"text": "a", "audio": {"url": "u1", "duration_ms": 1500}},
+            {"text": "b", "audio": {"url": "u2", "duration_ms": 2500}},
+        ]
+    )
     assert compute_playout_drain_timeout(snap) == 4.0 + PLAYOUT_DRAIN_MARGIN_S
 
 
@@ -399,8 +405,13 @@ def test_drain_timeout_unknown_duration_falls_back():
     """Missing audio block, missing duration, zero (the backend dedup
     edge — a legit 0 means UNKNOWN, not instant), and junk values all
     force the fixed cap."""
-    for bad_audio in (None, {}, {"duration_ms": 0}, {"duration_ms": None},
-                      {"duration_ms": "junk"}):
+    for bad_audio in (
+        None,
+        {},
+        {"duration_ms": 0},
+        {"duration_ms": None},
+        {"duration_ms": "junk"},
+    ):
         scripts = [
             {"text": "known", "audio": {"url": "u", "duration_ms": 1000}},
             {"text": "unknown"},
@@ -416,20 +427,19 @@ def test_drain_timeout_unknown_duration_falls_back():
 def test_drain_timeout_blank_segments_neither_add_nor_force_fallback():
     """Blank segments are never narrated — they must not drag the total
     to the fallback just because they carry no audio."""
-    snap = _snap(scripts=[
-        {"text": "  ", "order": 0},  # blank, no audio — skipped
-        {"text": "spoken", "audio": {"url": "u", "duration_ms": 3000}},
-    ])
+    snap = _snap(
+        scripts=[
+            {"text": "  ", "order": 0},  # blank, no audio — skipped
+            {"text": "spoken", "audio": {"url": "u", "duration_ms": 3000}},
+        ]
+    )
     assert compute_playout_drain_timeout(snap) == 3.0 + PLAYOUT_DRAIN_MARGIN_S
 
 
 def test_drain_timeout_no_narratable_segments_falls_back():
     assert compute_playout_drain_timeout(None) == PLAYOUT_DRAIN_FALLBACK_S
     assert compute_playout_drain_timeout({}) == PLAYOUT_DRAIN_FALLBACK_S
-    assert (
-        compute_playout_drain_timeout(_snap(scripts=[]))
-        == PLAYOUT_DRAIN_FALLBACK_S
-    )
+    assert compute_playout_drain_timeout(_snap(scripts=[])) == PLAYOUT_DRAIN_FALLBACK_S
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -464,9 +474,14 @@ def test_wait_playout_called_last_with_computed_budget():
         scripts=[{"text": "hello", "audio": {"url": "u", "duration_ms": 2000}}],
         auto_advance=False,
     )
-    spoke = _run(run_scene_narration(
-        snap, narrator=narrator, speak_followup=speak, wait_playout=wait_playout,
-    ))
+    spoke = _run(
+        run_scene_narration(
+            snap,
+            narrator=narrator,
+            speak_followup=speak,
+            wait_playout=wait_playout,
+        )
+    )
     assert spoke is True
     # Order: script speak → invitation speak → drain wait LAST, with the
     # budget computed from the snapshot's cached durations.
@@ -482,10 +497,14 @@ def test_wait_playout_skipped_when_nothing_spoken():
     narrator, _, speak = _make_event_narrator(events)
     drain = AsyncMock()
 
-    spoke = _run(run_scene_narration(
-        _snap(scripts=[]), narrator=narrator, speak_followup=speak,
-        wait_playout=drain,
-    ))
+    spoke = _run(
+        run_scene_narration(
+            _snap(scripts=[]),
+            narrator=narrator,
+            speak_followup=speak,
+            wait_playout=drain,
+        )
+    )
     assert spoke is False
     drain.assert_not_awaited()
 
@@ -518,9 +537,9 @@ async def _drive_run(
         )
     except NarrationInterrupted:
         return None
-    await send(build_script_complete_payload(
-        snapshot, spoke_script=spoke, trigger=trigger
-    ))
+    await send(
+        build_script_complete_payload(snapshot, spoke_script=spoke, trigger=trigger)
+    )
     return spoke
 
 
@@ -544,11 +563,13 @@ def test_interrupted_segment_aborts_loop_resets_voice_no_emit_no_stall():
     )
     send = AsyncMock(side_effect=lambda m: events.append(("send", m)))
 
-    snap = _snap(scripts=[
-        {"text": "one", "voice_id": "clone-A"},
-        {"text": "two", "voice_id": "clone-A"},
-        {"text": "three", "voice_id": "clone-A"},
-    ])
+    snap = _snap(
+        scripts=[
+            {"text": "one", "voice_id": "clone-A"},
+            {"text": "two", "voice_id": "clone-A"},
+            {"text": "three", "voice_id": "clone-A"},
+        ]
+    )
 
     t0 = time.monotonic()
     result = _run(_drive_run(snap, narrator, speak, send))
@@ -583,10 +604,12 @@ def test_cancelled_run_still_resets_voice_to_primary():
     narrator, set_voice, speak = _make_event_narrator(
         events, speak_side_effect=_cancel_on_second
     )
-    snap = _snap(scripts=[
-        {"text": "one", "voice_id": "clone-A"},
-        {"text": "two", "voice_id": "clone-A"},
-    ])
+    snap = _snap(
+        scripts=[
+            {"text": "one", "voice_id": "clone-A"},
+            {"text": "two", "voice_id": "clone-A"},
+        ]
+    )
 
     async def body():
         try:
@@ -680,12 +703,11 @@ def _gate_wired_callables(gate: NarrationCompletionGate, events: list):
         events.append(("speak", text))
         # Simulate the transport: audio starts flowing, then synthesis
         # completes (fast — several× realtime) while playout continues.
+        await gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
         await gate.process_frame(
-            BotStartedSpeakingFrame(), FrameDirection.UPSTREAM
-        )
-        await gate.process_frame(
-            TTSAudioRawFrame(audio=b"\x00\x00", sample_rate=24000,
-                             num_channels=1, context_id="ctx"),
+            TTSAudioRawFrame(
+                audio=b"\x00\x00", sample_rate=24000, num_channels=1, context_id="ctx"
+            ),
             FrameDirection.DOWNSTREAM,
         )
         await gate.process_frame(
@@ -720,9 +742,7 @@ def test_script_complete_waits_for_last_utterance_playout():
         narrator = SceneNarrator(
             primary_voice_id="primary", set_voice=AsyncMock(), speak=speak
         )
-        snap = _snap(
-            scripts=[{"text": "hello"}, {"text": "world"}], auto_advance=False
-        )
+        snap = _snap(scripts=[{"text": "hello"}, {"text": "world"}], auto_advance=False)
 
         gate.begin_run()
         run = asyncio.create_task(
@@ -740,23 +760,17 @@ def test_script_complete_waits_for_last_utterance_playout():
         # Intermediate boundaries: utterances 1 and 2 finish playing
         # while the next one starts — still no emission.
         for _ in range(2):
-            await gate.process_frame(
-                BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM
-            )
+            await gate.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
             for _ in range(10):
                 await asyncio.sleep(0)
             assert not any(k == "send" for k, _ in events), (
                 "script_complete emitted at an intermediate utterance "
                 "boundary — later segments still queued in the transport"
             )
-            await gate.process_frame(
-                BotStartedSpeakingFrame(), FrameDirection.UPSTREAM
-            )
+            await gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
 
         # Final boundary — the invitation's audio drained.
-        await gate.process_frame(
-            BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM
-        )
+        await gate.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
         spoke = await asyncio.wait_for(run, timeout=5.0)
         assert spoke is True
         sends = [m for k, m in events if k == "send"]
@@ -919,10 +933,18 @@ def test_scene_change_supersede_yields_exactly_one_emission():
         narrator2 = SceneNarrator(
             primary_voice_id="primary", set_voice=AsyncMock(), speak=fast_speak
         )
-        snap1 = _snap(scene_id="s1", scripts=[{"text": "scene one"}],
-                      scene_index=0, total_scenes=2)
-        snap2 = _snap(scene_id="s2", scripts=[{"text": "scene two"}],
-                      scene_index=1, total_scenes=2)
+        snap1 = _snap(
+            scene_id="s1",
+            scripts=[{"text": "scene one"}],
+            scene_index=0,
+            total_scenes=2,
+        )
+        snap2 = _snap(
+            scene_id="s2",
+            scripts=[{"text": "scene two"}],
+            scene_index=1,
+            total_scenes=2,
+        )
 
         slot = _Slot()
         slot.start(_drive_run(snap1, narrator1, slow_speak, send))

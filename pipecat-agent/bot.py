@@ -68,6 +68,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 load_dotenv(override=True)
 
 import pipecat
+
 logger.info(f"Pipecat SDK version: {pipecat.__version__}")
 
 from config import (
@@ -98,6 +99,7 @@ from config import (
     resolve_deepgram_language,
 )
 from persona import build_system_prompt
+
 # S64c — Canvas Protocol generic tool surface (registered alongside V2.13 tools
 # until Block 7 cutover). See CLAUDE.md "Coming in S64c".
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -114,6 +116,7 @@ from context.prompt_builder import (
     render_canvas_page_section,
     render_voice_output_style_section,
 )
+
 # S64e — generate_quiz_from_knowledge tool + session-scoped slug/scene state.
 import api_client
 from tools.quiz_generation import (
@@ -123,6 +126,7 @@ from tools.quiz_generation import (
     request_quiz_ready,
     run_quiz_generation,
 )
+
 # S65 G3+G4 — per-scene narration helper with per-segment voice switching,
 # post-narration invitation/cue branch, and the script_complete payload.
 # run_scene_narration is the orchestrator wired into both
@@ -136,11 +140,13 @@ from narration import (
     build_script_complete_payload,
     run_scene_narration,
 )
+
 # Block 12 — cache-first Cartesia TTS service (replay of pre-rendered
 # narration PCM via single-shot prime). The narrator's prefetch+prime
 # closures (~run_bot_classic) populate and consume the cache; on a miss
 # the service falls through to live Cartesia synthesis.
 from services.cached_first_tts import CachedFirstTTSService, CachedSegment
+
 # S66 Block 5a — lazy vision-frame tracker. Owns "which scene_id's vision
 # is currently in context"; the canvas_analyze handler calls ensure() to
 # fetch+inject on demand instead of every scene change.
@@ -151,6 +157,7 @@ from tools.canvas_annotate import (
     AGENT_ANNOTATE_SCHEMA,
     make_handle_canvas_annotate,
 )
+
 # S66 Block 5b — per-session memoisation of the FLOW-scope knowledge
 # block. Constructed once per pipeline; threaded through build_system_prompt
 # on session start and every scene-change refresh.
@@ -177,7 +184,9 @@ RELAY_INTERRUPT = "avatar_relay.interrupt"
 
 # Output mode fallback (env var used when scene snapshot unavailable)
 VALID_OUTPUT_MODES = {"cartesia", "relay_avatar"}
-CLOUD_OUTPUT_MODE = os.getenv("CLOUD_OUTPUT_MODE", "cartesia").strip().lower() or "cartesia"
+CLOUD_OUTPUT_MODE = (
+    os.getenv("CLOUD_OUTPUT_MODE", "cartesia").strip().lower() or "cartesia"
+)
 if CLOUD_OUTPUT_MODE not in VALID_OUTPUT_MODES:
     logger.warning(
         "Unknown CLOUD_OUTPUT_MODE={}, falling back to cartesia",
@@ -186,18 +195,28 @@ if CLOUD_OUTPUT_MODE not in VALID_OUTPUT_MODES:
     CLOUD_OUTPUT_MODE = "cartesia"
 
 # Bot names
-CLOUD_BOT_NAME = os.getenv("CLOUD_BOT_NAME", "Human Virtual Cloud").strip() or "Human Virtual Cloud"
-AVATAR_BOT_NAME = os.getenv("SOULX_AVATAR_BOT_NAME", "Digital Twin Avatar").strip() or "Digital Twin Avatar"
+CLOUD_BOT_NAME = (
+    os.getenv("CLOUD_BOT_NAME", "Human Virtual Cloud").strip() or "Human Virtual Cloud"
+)
+AVATAR_BOT_NAME = (
+    os.getenv("SOULX_AVATAR_BOT_NAME", "Digital Twin Avatar").strip()
+    or "Digital Twin Avatar"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Participant helpers (relay pipeline)
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _participant_id(participant: object) -> str:
     if not isinstance(participant, dict):
         return ""
-    value = participant.get("id") or participant.get("participant_id") or participant.get("participantId")
+    value = (
+        participant.get("id")
+        or participant.get("participant_id")
+        or participant.get("participantId")
+    )
     return str(value).strip() if value else ""
 
 
@@ -270,10 +289,14 @@ def _is_relay_ready_message(message: object) -> bool:
     )
 
 
-def _build_transport_message(message: dict[str, object], participant_id: str | None = None):
+def _build_transport_message(
+    message: dict[str, object], participant_id: str | None = None
+):
     if participant_id:
         try:
-            from pipecat.transports.daily.transport import DailyOutputTransportMessageFrame
+            from pipecat.transports.daily.transport import (
+                DailyOutputTransportMessageFrame,
+            )
         except Exception:
             logger.debug(
                 "Daily transport targeting unavailable, broadcasting relay message type={}",
@@ -290,6 +313,7 @@ def _build_transport_message(message: dict[str, object], participant_id: str | N
 # ──────────────────────────────────────────────────────────────────────
 # Shared frame processors
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TranscriptForwarder(FrameProcessor):
     """Forward user STT and bot text updates over the transport data channel.
@@ -323,7 +347,9 @@ class TranscriptForwarder(FrameProcessor):
             ready = self._avatar_agg.feed(frame.text)
             if ready:
                 await self._send_transcript("avatar", ready)
-        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame, EndFrame, CancelFrame)):
+        elif isinstance(
+            frame, (LLMFullResponseEndFrame, InterruptionFrame, EndFrame, CancelFrame)
+        ):
             # Turn/stream boundary — release the final partial word so the
             # caption isn't left missing the tail of the utterance.
             ready = self._avatar_agg.flush()
@@ -339,7 +365,9 @@ class TranscriptForwarder(FrameProcessor):
                 "speaker": speaker,
                 "text": text,
             }
-            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
+            await self._transport.send_message(
+                OutputTransportMessageFrame(message=payload)
+            )
         except Exception as exc:
             logger.warning("Could not forward transcript: {}", exc)
 
@@ -363,7 +391,10 @@ class SpeakingStateNotifier(FrameProcessor):
         ):
             self._is_speaking = True
             await self._send_state(True)
-        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._is_speaking:
+        elif (
+            isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame))
+            and self._is_speaking
+        ):
             self._is_speaking = False
             await self._send_state(False)
 
@@ -375,7 +406,9 @@ class SpeakingStateNotifier(FrameProcessor):
                 "type": "speaking_state",
                 "isSpeaking": is_speaking,
             }
-            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
+            await self._transport.send_message(
+                OutputTransportMessageFrame(message=payload)
+            )
         except Exception as exc:
             logger.warning("Could not send speaking state: {}", exc)
 
@@ -394,7 +427,10 @@ class ThinkingNotifier(FrameProcessor):
         if isinstance(frame, LLMFullResponseStartFrame) and not self._is_thinking:
             self._is_thinking = True
             await self._send_state(True)
-        elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame)) and self._is_thinking:
+        elif (
+            isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame))
+            and self._is_thinking
+        ):
             self._is_thinking = False
             await self._send_state(False)
 
@@ -406,7 +442,9 @@ class ThinkingNotifier(FrameProcessor):
                 "type": "llm_thinking",
                 "thinking": thinking,
             }
-            await self._transport.send_message(OutputTransportMessageFrame(message=payload))
+            await self._transport.send_message(
+                OutputTransportMessageFrame(message=payload)
+            )
         except Exception as exc:
             logger.warning("Could not send thinking state: {}", exc)
 
@@ -414,6 +452,7 @@ class ThinkingNotifier(FrameProcessor):
 # ──────────────────────────────────────────────────────────────────────
 # Relay-only frame processors
 # ──────────────────────────────────────────────────────────────────────
+
 
 class HumanOnlyAudioInputFilter(FrameProcessor):
     """Drops SoulX/local bot audio before it reaches STT in relay mode."""
@@ -429,8 +468,12 @@ class HumanOnlyAudioInputFilter(FrameProcessor):
 
         if isinstance(frame, UserAudioRawFrame):
             user_id = str(frame.user_id or "").strip()
-            avatar_participant_id = str(self._avatar_participant_id_getter() or "").strip()
-            local_participant_id = str(self._local_participant_id_getter() or "").strip()
+            avatar_participant_id = str(
+                self._avatar_participant_id_getter() or ""
+            ).strip()
+            local_participant_id = str(
+                self._local_participant_id_getter() or ""
+            ).strip()
 
             if user_id and avatar_participant_id and user_id == avatar_participant_id:
                 self._log_drop(user_id, "avatar_participant")
@@ -584,12 +627,15 @@ class AvatarRelayProcessor(FrameProcessor):
                 payload,
             )
         except Exception:
-            logger.exception("Failed to send avatar relay message type={}", message_type)
+            logger.exception(
+                "Failed to send avatar relay message type={}", message_type
+            )
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Output mode resolution
 # ──────────────────────────────────────────────────────────────────────
+
 
 async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
     """Determine output mode from the avatar's display mode in the scene.
@@ -638,6 +684,7 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
 # because that's the only LLM extra in pyproject.toml. Override via
 # LLM_CANVAS_PROVIDER env var after installing the corresponding extra.
 
+
 def _assemble_full_prompt(base: str, manifest: dict | None) -> str:
     """Concatenate base persona prompt, CANVAS PAGE, AGENT PLAYBOOK, VOICE OUTPUT.
 
@@ -649,12 +696,14 @@ def _assemble_full_prompt(base: str, manifest: dict | None) -> str:
     (recency) to keep the model's reply plain-spoken — no Markdown/ellipsis
     noise reaching the TTS or the live caption.
     """
-    return "\n\n".join([
-        base,
-        render_canvas_page_section(manifest),
-        render_agent_playbook_section(),
-        render_voice_output_style_section(),
-    ])
+    return "\n\n".join(
+        [
+            base,
+            render_canvas_page_section(manifest),
+            render_agent_playbook_section(),
+            render_voice_output_style_section(),
+        ]
+    )
 
 
 def _build_llm_and_eager_hook(
@@ -671,6 +720,7 @@ def _build_llm_and_eager_hook(
     """
     if provider == "openai":
         from services.eager_dispatch.openai_adapter import OpenAIEagerHook
+
         llm = OpenAILLMService(
             api_key=OPENAI_API_KEY,
             settings=OpenAILLMService.Settings(
@@ -688,6 +738,7 @@ def _build_llm_and_eager_hook(
         # the native `groq` SDK shipped via the pipecat-ai[groq] extra.
         from pipecat.services.groq.llm import GroqLLMService
         from services.eager_dispatch.openai_adapter import OpenAIEagerHook
+
         llm = GroqLLMService(
             api_key=GROQ_API_KEY,
             settings=GroqLLMService.Settings(
@@ -700,6 +751,7 @@ def _build_llm_and_eager_hook(
     if provider == "anthropic":
         from pipecat.services.anthropic.llm import AnthropicLLMService
         from services.eager_dispatch.anthropic_adapter import AnthropicEagerHook
+
         llm = AnthropicLLMService(
             api_key=ANTHROPIC_API_KEY,
             model=ANTHROPIC_MODEL,
@@ -712,12 +764,15 @@ def _build_llm_and_eager_hook(
         try:
             llm._settings.system_instruction = system_prompt  # type: ignore[attr-defined]
         except Exception:
-            logger.warning("Anthropic LLM service did not accept system_instruction setter")
+            logger.warning(
+                "Anthropic LLM service did not accept system_instruction setter"
+            )
         return llm, AnthropicEagerHook(canvas_pending, send_canvas_message)
 
     if provider == "gemini":
         from pipecat.services.google.llm import GoogleLLMService
         from services.eager_dispatch.gemini_adapter import GeminiEagerHook
+
         llm = GoogleLLMService(
             api_key=GOOGLE_AI_API_KEY,
             model=GEMINI_MODEL,
@@ -738,6 +793,7 @@ def _build_llm_and_eager_hook(
 #  any disconnect cancels the pipeline.
 #
 # ======================================================================
+
 
 async def run_bot_classic(
     transport: BaseTransport,
@@ -774,7 +830,11 @@ async def run_bot_classic(
     avatar_config = None
     scene_image_b64 = None
     if room_id:
-        from api_client import get_avatar_config, get_scene_image_base64, get_scene_snapshot
+        from api_client import (
+            get_avatar_config,
+            get_scene_image_base64,
+            get_scene_snapshot,
+        )
 
         scene_snapshot, avatar_config, scene_image_b64 = await asyncio.gather(
             get_scene_snapshot(room_id, api_url),
@@ -782,11 +842,15 @@ async def run_bot_classic(
             get_scene_image_base64(room_id, api_url),
         )
         if avatar_config:
-            logger.info(f"Avatar config: name={avatar_config.get('name')}, voiceModelId={avatar_config.get('voiceModelId')}")
+            logger.info(
+                f"Avatar config: name={avatar_config.get('name')}, voiceModelId={avatar_config.get('voiceModelId')}"
+            )
         else:
             logger.info("No avatar config available — using default voice")
         if scene_image_b64:
-            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
+            logger.info(
+                "Fetched scene canvas image ({} chars base64)", len(scene_image_b64)
+            )
         else:
             logger.info("No scene image available; vision disabled for this session")
         if scene_snapshot:
@@ -817,7 +881,9 @@ async def run_bot_classic(
     async def send_canvas_message(payload: dict) -> None:
         """Send a Canvas Protocol Daily app-message to the frontend."""
         try:
-            await output_transport.send_message(OutputTransportMessageFrame(message=payload))
+            await output_transport.send_message(
+                OutputTransportMessageFrame(message=payload)
+            )
         except Exception as exc:
             logger.warning("Failed to send canvas message: {}", exc)
 
@@ -850,24 +916,28 @@ async def run_bot_classic(
         _pending_captures[capture_id] = fut
         logger.info("[VISION] requesting canvas capture {} hint={!r}", capture_id, hint)
         try:
-            await send_canvas_message({
-                "type": "request_canvas_capture",
-                "captureId": capture_id,
-                "hint": hint,
-                "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
-            })
+            await send_canvas_message(
+                {
+                    "type": "request_canvas_capture",
+                    "captureId": capture_id,
+                    "hint": hint,
+                    "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
+                }
+            )
             result = await asyncio.wait_for(
                 fut, timeout=VISION_CAPTURE_TIMEOUT_MS / 1000
             )
             logger.info(
                 "[VISION] capture {} resolved status={!r}",
-                capture_id, (result or {}).get("status"),
+                capture_id,
+                (result or {}).get("status"),
             )
             return capture_id, result
         except asyncio.TimeoutError:
             logger.warning(
                 "[VISION] capture {} timed out after {}ms",
-                capture_id, VISION_CAPTURE_TIMEOUT_MS,
+                capture_id,
+                VISION_CAPTURE_TIMEOUT_MS,
             )
             return capture_id, None
         finally:
@@ -997,7 +1067,8 @@ async def run_bot_classic(
     )
     logger.info(
         "Canvas Protocol LLM provider={} eager_hook={}",
-        LLM_CANVAS_PROVIDER, eager_hook.__class__.__name__,
+        LLM_CANVAS_PROVIDER,
+        eager_hook.__class__.__name__,
     )
     # NOTE: eager_hook is instantiated but not yet wired into the LLM
     # service's streaming loop — that's a per-provider integration that
@@ -1014,6 +1085,7 @@ async def run_bot_classic(
     initial_messages = []
     if scene_image_b64 and MAIN_LLM_SUPPORTS_VISION:
         from scene_context import build_vision_message
+
         initial_messages.append(build_vision_message(scene_image_b64))
     elif scene_image_b64:
         logger.info(
@@ -1149,7 +1221,10 @@ async def run_bot_classic(
             room_id, api_url, scene_id=target_scene_id or None
         )
         new_base = await build_system_prompt(
-            room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
+            room_id=room_id,
+            avatar_id=avatar_id,
+            scene_id=scene_id,
+            api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
             flow_cache=flow_knowledge_cache,
             snapshot_scene_id=target_scene_id or None,
@@ -1163,9 +1238,14 @@ async def run_bot_classic(
         new_prompt = _assemble_full_prompt(new_base, canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
-            logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
+            logger.info(
+                "[CANVAS SCENECHANGED] system prompt refreshed ({} chars)",
+                len(new_prompt),
+            )
         except Exception:
-            logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+            logger.warning(
+                "[CANVAS SCENECHANGED] could not set system_instruction on llm service"
+            )
         t_prompt = time.monotonic()
 
         # S64e — refresh session_context.current_scene_id from the
@@ -1197,11 +1277,16 @@ async def run_bot_classic(
             )
             if new_image:
                 from scene_context import build_vision_message
+
                 context.add_message(build_vision_message(new_image))
                 vision_tracker.mark_loaded(session_context.get_current_scene_id())
-                logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+                logger.info(
+                    "[CANVAS SCENECHANGED] vision context refreshed with new scene image"
+                )
             else:
-                logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+                logger.warning(
+                    "[CANVAS SCENECHANGED] could not fetch new scene image after navigation"
+                )
         else:
             # lazy mode, OR a text-only main LLM (MAIN_LLM_SUPPORTS_VISION=false)
             # where injecting the image would 400 — either way defer to the
@@ -1210,7 +1295,8 @@ async def run_bot_classic(
             logger.info(
                 "[CANVAS SCENECHANGED] vision-refresh deferred (mode={}, main_llm_vision={}) — "
                 "scene image fetched on next canvas_analyze via S67b",
-                VISION_REFRESH_MODE, MAIN_LLM_SUPPORTS_VISION,
+                VISION_REFRESH_MODE,
+                MAIN_LLM_SUPPORTS_VISION,
             )
 
         # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.
@@ -1335,20 +1421,22 @@ async def run_bot_classic(
     narration_gate = NarrationCompletionGate()
 
     # ── Pipeline ──
-    pipeline = Pipeline([
-        transport.input(),       # Visitor's microphone audio (WebRTC)
-        stt,                     # Deepgram: speech -> text
-        user_transcript_fwd,     # Forward user STT transcripts to frontend
-        user_aggregator,         # Add user message to conversation history
-        llm,                     # OpenAI: generate response
-        thinking_notifier,       # Notify frontend of LLM thinking state
-        avatar_transcript_fwd,   # Forward avatar LLM text to frontend
-        speaking_notifier,       # Notify frontend of speaking state
-        tts,                     # Cartesia: response -> speech audio
-        narration_gate,          # S65 G3: observe TTSStoppedFrame for narration
-        output_transport,        # Send audio back to visitor (WebRTC)
-        assistant_aggregator,    # Add bot response to conversation history
-    ])
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Visitor's microphone audio (WebRTC)
+            stt,  # Deepgram: speech -> text
+            user_transcript_fwd,  # Forward user STT transcripts to frontend
+            user_aggregator,  # Add user message to conversation history
+            llm,  # OpenAI: generate response
+            thinking_notifier,  # Notify frontend of LLM thinking state
+            avatar_transcript_fwd,  # Forward avatar LLM text to frontend
+            speaking_notifier,  # Notify frontend of speaking state
+            tts,  # Cartesia: response -> speech audio
+            narration_gate,  # S65 G3: observe TTSStoppedFrame for narration
+            output_transport,  # Send audio back to visitor (WebRTC)
+            assistant_aggregator,  # Add bot response to conversation history
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -1402,9 +1490,7 @@ async def run_bot_classic(
         try:
             result = await asyncio.wait_for(fut, timeout=30.0)
         except asyncio.TimeoutError:
-            logger.warning(
-                "[NARRATION] segment TTSStoppedFrame timeout — continuing"
-            )
+            logger.warning("[NARRATION] segment TTSStoppedFrame timeout — continuing")
             return
         except asyncio.CancelledError:
             logger.warning("[NARRATION] segment future cancelled")
@@ -1429,10 +1515,7 @@ async def run_bot_classic(
 
     async def _narration_prefetch(plan):
         _narration_cache.clear()
-        targets = [
-            seg for seg in plan
-            if seg.id and seg.audio and seg.audio.get("url")
-        ]
+        targets = [seg for seg in plan if seg.id and seg.audio and seg.audio.get("url")]
         if not targets:
             return
         # 10 s per-segment timeout — narration is on the critical path
@@ -1446,14 +1529,19 @@ async def run_bot_classic(
                     if r.status_code != 200:
                         logger.warning(
                             "[NARRATION] prefetch {} -> HTTP {}, live fallback",
-                            seg.id, r.status_code,
+                            seg.id,
+                            r.status_code,
                         )
                         continue
-                    sr = int(seg.audio.get("sample_rate") or NARRATION_AUDIO_SAMPLE_RATE)
+                    sr = int(
+                        seg.audio.get("sample_rate") or NARRATION_AUDIO_SAMPLE_RATE
+                    )
                     if sr != NARRATION_AUDIO_SAMPLE_RATE:
                         logger.warning(
                             "[NARRATION] prefetch {} sr={} != configured {}, skip",
-                            seg.id, sr, NARRATION_AUDIO_SAMPLE_RATE,
+                            seg.id,
+                            sr,
+                            NARRATION_AUDIO_SAMPLE_RATE,
                         )
                         continue
                     _narration_cache[seg.id] = CachedSegment(
@@ -1462,9 +1550,7 @@ async def run_bot_classic(
                         num_channels=NARRATION_AUDIO_NUM_CHANNELS,
                     )
                 except Exception as exc:
-                    logger.warning(
-                        "[NARRATION] prefetch {} failed: {!r}", seg.id, exc
-                    )
+                    logger.warning("[NARRATION] prefetch {} failed: {!r}", seg.id, exc)
 
     def _narration_prime(seg) -> bool:
         cached = _narration_cache.get(seg.id) if seg.id else None
@@ -1562,18 +1648,22 @@ async def run_bot_classic(
             return
         session_seeded["done"] = True
         if spoke_script:
-            context.add_message({
-                "role": "developer",
-                "content": (
-                    "You just finished presenting the scene scripts to the visitor. "
-                    "They heard your full presentation. Don't repeat what you already said."
-                ),
-            })
+            context.add_message(
+                {
+                    "role": "developer",
+                    "content": (
+                        "You just finished presenting the scene scripts to the visitor. "
+                        "They heard your full presentation. Don't repeat what you already said."
+                    ),
+                }
+            )
         else:
-            context.add_message({
-                "role": "developer",
-                "content": GREETING_TRIGGER_PROMPT,
-            })
+            context.add_message(
+                {
+                    "role": "developer",
+                    "content": GREETING_TRIGGER_PROMPT,
+                }
+            )
             await task.queue_frames([LLMRunFrame()])
 
     async def _narrate_and_complete(
@@ -1659,9 +1749,7 @@ async def run_bot_classic(
                 )
                 return
             except Exception as exc:
-                logger.warning(
-                    "[NARRATION] session-start narration failed: {!r}", exc
-                )
+                logger.warning("[NARRATION] session-start narration failed: {!r}", exc)
                 spoke_script = False
             await output_transport.send_message(
                 OutputTransportMessageFrame(
@@ -1718,6 +1806,7 @@ async def run_bot_classic(
                 logger.info("[REQUEST_NARRATE] skipped: no room_id")
                 return
             from api_client import get_scene_snapshot
+
             manual_snapshot = await get_scene_snapshot(room_id, api_url)
             if not manual_snapshot:
                 logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
@@ -1768,8 +1857,10 @@ async def run_bot_classic(
                     logger.info("[AUTOPLAY] resume skipped: no room_id")
                     return
                 from api_client import get_scene_snapshot
+
                 resume_snapshot = await get_scene_snapshot(
-                    room_id, api_url,
+                    room_id,
+                    api_url,
                     scene_id=session_context.get_current_scene_id() or None,
                 )
                 if not resume_snapshot:
@@ -1805,7 +1896,8 @@ async def run_bot_classic(
 
             logger.info(
                 "[REQUEST_QUIZ] generating: count={} language={!r}",
-                quiz_count, quiz_language,
+                quiz_count,
+                quiz_language,
             )
             try:
                 result = await run_quiz_generation(
@@ -1818,7 +1910,8 @@ async def run_bot_classic(
                 )
                 logger.info(
                     "[REQUEST_QUIZ] complete ok={} error={!r}",
-                    result.ok, result.error,
+                    result.ok,
+                    result.error,
                 )
                 if result.ok:
                     # Wake the LLM with the blob in context. The voice path
@@ -1832,21 +1925,23 @@ async def run_bot_classic(
                     # (developer message + LLMRunFrame). On failure we
                     # skip both — the visitor sees the error state and
                     # the LLM stays in its prior context.
-                    context.add_message({
-                        "role": "developer",
-                        "content": (
-                            "A quiz has just been activated on the canvas by the visitor "
-                            "clicking the Quiz action button (not by your tool call). The "
-                            "quiz Page is already showing on screen. Here is the quiz blob "
-                            "you need to drive the session:\n\n"
-                            f"{json.dumps(result.blob)}\n\n"
-                            "Now read the first question aloud and wait for the visitor's "
-                            "answer, exactly as you would after calling "
-                            "generate_quiz_from_knowledge yourself. Use canvas_action "
-                            "verbs (submit_answer / skip_question) to record their answers "
-                            "and let the Quiz Page own the pacing."
-                        ),
-                    })
+                    context.add_message(
+                        {
+                            "role": "developer",
+                            "content": (
+                                "A quiz has just been activated on the canvas by the visitor "
+                                "clicking the Quiz action button (not by your tool call). The "
+                                "quiz Page is already showing on screen. Here is the quiz blob "
+                                "you need to drive the session:\n\n"
+                                f"{json.dumps(result.blob)}\n\n"
+                                "Now read the first question aloud and wait for the visitor's "
+                                "answer, exactly as you would after calling "
+                                "generate_quiz_from_knowledge yourself. Use canvas_action "
+                                "verbs (submit_answer / skip_question) to record their answers "
+                                "and let the Quiz Page own the pacing."
+                            ),
+                        }
+                    )
                     await task.queue_frames([LLMRunFrame()])
             except Exception as exc:
                 # run_quiz_generation already catches its own failures
@@ -1870,8 +1965,10 @@ async def run_bot_classic(
             logger.info(
                 "[VISION] canvas_capture_result reached on_app_message: captureId={} "
                 "status={!r} pending_future={}",
-                cid, message.get("status"),
-                "found" if fut is not None
+                cid,
+                message.get("status"),
+                "found"
+                if fut is not None
                 else "MISSING (already timed out, unknown id, or this handler never received earlier captures)",
             )
             if fut is not None and not fut.done():
@@ -1890,7 +1987,9 @@ async def run_bot_classic(
             return
 
         if msg_type == "canvas.register":
-            logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
+            logger.info(
+                f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}"
+            )
             canvas_manifest.set_manifest(message)
             # S64d — rebuild the system prompt so the LLM sees the new
             # Page's verb list in the CANVAS PAGE section. Without this
@@ -1901,11 +2000,15 @@ async def run_bot_classic(
                     base_system_prompt, canvas_manifest.current()
                 )
                 llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
-                logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
+                logger.info(
+                    "[CANVAS REGISTER] system prompt rebuilt with manifest section"
+                )
             except Exception as exc:
                 logger.warning("[CANVAS REGISTER] prompt rebuild failed: {!r}", exc)
         elif msg_type == "canvas.stateChange":
-            logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")
+            logger.info(
+                f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}"
+            )
             canvas_manifest.update_state(message.get("semanticState") or {})
         elif msg_type == "canvas.sceneChanged":
             # S64c — single refresh trigger for ALL scene navigations,
@@ -1926,12 +2029,16 @@ async def run_bot_classic(
             )
         elif msg_type == "canvas.commandResult":
             cid = message.get("commandId")
-            logger.info(f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}")
+            logger.info(
+                f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}"
+            )
             if cid:
                 canvas_pending.resolve(cid, message.get("result") or {})
         elif msg_type == "canvas.commandError":
             cid = message.get("commandId")
-            logger.warning(f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}")
+            logger.warning(
+                f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}"
+            )
             if cid:
                 canvas_pending.reject(cid, message.get("error") or {})
 
@@ -1995,6 +2102,7 @@ async def run_bot_classic(
 #
 # ======================================================================
 
+
 async def run_bot_relay(
     transport: BaseTransport,
     runner_args: RunnerArguments,
@@ -2032,7 +2140,9 @@ async def run_bot_relay(
             get_scene_image_base64(room_id, api_url),
         )
         if scene_image_b64:
-            logger.info("Fetched scene canvas image ({} chars base64)", len(scene_image_b64))
+            logger.info(
+                "Fetched scene canvas image ({} chars base64)", len(scene_image_b64)
+            )
         else:
             logger.info("No scene image available; vision disabled for this session")
         if scene_snapshot:
@@ -2060,7 +2170,9 @@ async def run_bot_relay(
     async def send_canvas_message(payload: dict) -> None:
         """Send a Canvas Protocol Daily app-message to the frontend."""
         try:
-            await output_transport.send_message(OutputTransportMessageFrame(message=payload))
+            await output_transport.send_message(
+                OutputTransportMessageFrame(message=payload)
+            )
         except Exception as exc:
             logger.warning("Failed to send canvas message: {}", exc)
 
@@ -2093,24 +2205,28 @@ async def run_bot_relay(
         _pending_captures[capture_id] = fut
         logger.info("[VISION] requesting canvas capture {} hint={!r}", capture_id, hint)
         try:
-            await send_canvas_message({
-                "type": "request_canvas_capture",
-                "captureId": capture_id,
-                "hint": hint,
-                "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
-            })
+            await send_canvas_message(
+                {
+                    "type": "request_canvas_capture",
+                    "captureId": capture_id,
+                    "hint": hint,
+                    "maxDim": VISION_MAX_DIM,  # advisory; the shell owns the encode
+                }
+            )
             result = await asyncio.wait_for(
                 fut, timeout=VISION_CAPTURE_TIMEOUT_MS / 1000
             )
             logger.info(
                 "[VISION] capture {} resolved status={!r}",
-                capture_id, (result or {}).get("status"),
+                capture_id,
+                (result or {}).get("status"),
             )
             return capture_id, result
         except asyncio.TimeoutError:
             logger.warning(
                 "[VISION] capture {} timed out after {}ms",
-                capture_id, VISION_CAPTURE_TIMEOUT_MS,
+                capture_id,
+                VISION_CAPTURE_TIMEOUT_MS,
             )
             return capture_id, None
         finally:
@@ -2209,7 +2325,8 @@ async def run_bot_relay(
     )
     logger.info(
         "Canvas Protocol LLM provider={} eager_hook={}",
-        LLM_CANVAS_PROVIDER, eager_hook.__class__.__name__,
+        LLM_CANVAS_PROVIDER,
+        eager_hook.__class__.__name__,
     )
     # NOTE: see run_bot_classic — eager_hook is instantiated but not wired
     # into the streaming loop yet.
@@ -2223,6 +2340,7 @@ async def run_bot_relay(
     initial_messages = []
     if scene_image_b64 and MAIN_LLM_SUPPORTS_VISION:
         from scene_context import build_vision_message
+
         initial_messages.append(build_vision_message(scene_image_b64))
     elif scene_image_b64:
         logger.info(
@@ -2354,7 +2472,10 @@ async def run_bot_relay(
             room_id, api_url, scene_id=target_scene_id or None
         )
         new_base = await build_system_prompt(
-            room_id=room_id, avatar_id=avatar_id, scene_id=scene_id, api_url=api_url,
+            room_id=room_id,
+            avatar_id=avatar_id,
+            scene_id=scene_id,
+            api_url=api_url,
             aliases_out=canvas_ctx.element_alias_map,
             flow_cache=flow_knowledge_cache,
             snapshot_scene_id=target_scene_id or None,
@@ -2368,9 +2489,14 @@ async def run_bot_relay(
         new_prompt = _assemble_full_prompt(new_base, canvas_manifest.current())
         try:
             llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
-            logger.info("[CANVAS SCENECHANGED] system prompt refreshed ({} chars)", len(new_prompt))
+            logger.info(
+                "[CANVAS SCENECHANGED] system prompt refreshed ({} chars)",
+                len(new_prompt),
+            )
         except Exception:
-            logger.warning("[CANVAS SCENECHANGED] could not set system_instruction on llm service")
+            logger.warning(
+                "[CANVAS SCENECHANGED] could not set system_instruction on llm service"
+            )
         t_prompt = time.monotonic()
 
         # S64e — refresh session_context.current_scene_id from the
@@ -2398,11 +2524,16 @@ async def run_bot_relay(
             )
             if new_image:
                 from scene_context import build_vision_message
+
                 context.add_message(build_vision_message(new_image))
                 vision_tracker.mark_loaded(session_context.get_current_scene_id())
-                logger.info("[CANVAS SCENECHANGED] vision context refreshed with new scene image")
+                logger.info(
+                    "[CANVAS SCENECHANGED] vision context refreshed with new scene image"
+                )
             else:
-                logger.warning("[CANVAS SCENECHANGED] could not fetch new scene image after navigation")
+                logger.warning(
+                    "[CANVAS SCENECHANGED] could not fetch new scene image after navigation"
+                )
         else:
             # lazy mode, OR a text-only main LLM (MAIN_LLM_SUPPORTS_VISION=false)
             # where injecting the image would 400 — either way defer to the
@@ -2411,7 +2542,8 @@ async def run_bot_relay(
             logger.info(
                 "[CANVAS SCENECHANGED] vision-refresh deferred (mode={}, main_llm_vision={}) — "
                 "scene image fetched on next canvas_analyze via S67b",
-                VISION_REFRESH_MODE, MAIN_LLM_SUPPORTS_VISION,
+                VISION_REFRESH_MODE,
+                MAIN_LLM_SUPPORTS_VISION,
             )
 
         # S66 Block 0 — vision spans prompt-reassigned → vision-in-context.
@@ -2560,7 +2692,9 @@ async def run_bot_relay(
         if active_human_id == pid:
             active_human_id = None
 
-        logger.info("Ensured SoulX avatar participant is ignored participant_id={}", pid)
+        logger.info(
+            "Ensured SoulX avatar participant is ignored participant_id={}", pid
+        )
 
     async def _start_human_audio_capture(pid: str | None):
         nonlocal captured_audio_participant_id
@@ -2571,13 +2705,19 @@ async def run_bot_relay(
 
         _remove_pending_audio_capture(avatar_participant_id)
 
-        capture_participant_audio = getattr(transport, "capture_participant_audio", None)
+        capture_participant_audio = getattr(
+            transport, "capture_participant_audio", None
+        )
         if callable(capture_participant_audio):
             await capture_participant_audio(pid, "microphone")
 
         input_transport = getattr(transport, "_input", None)
-        start_audio_in_streaming = getattr(input_transport, "start_audio_in_streaming", None)
-        if callable(start_audio_in_streaming) and not getattr(input_transport, "_streaming_started", False):
+        start_audio_in_streaming = getattr(
+            input_transport, "start_audio_in_streaming", None
+        )
+        if callable(start_audio_in_streaming) and not getattr(
+            input_transport, "_streaming_started", False
+        ):
             await start_audio_in_streaming()
             logger.info("Started Daily audio input streaming")
 
@@ -2593,21 +2733,23 @@ async def run_bot_relay(
     relay_processor = AvatarRelayProcessor(output_transport, get_avatar_participant_id)
 
     # ── Pipeline ──
-    pipeline = Pipeline([
-        transport.input(),       # Participant audio (per-track)
-        human_audio_filter,      # Drop avatar/local bot audio
-        stt,                     # Deepgram: speech -> text
-        user_transcript_fwd,     # Forward user STT transcripts to frontend
-        user_aggregator,         # Add user message to conversation history
-        avatar_ready_gate,       # Block until avatar bot is ready
-        llm,                     # OpenAI: generate response
-        thinking_notifier,       # Notify frontend of LLM thinking state
-        avatar_transcript_fwd,   # Forward avatar LLM text to frontend
-        speaking_notifier,       # Notify frontend of speaking state
-        relay_processor,         # Relay text to SoulX avatar bot
-        assistant_aggregator,    # Add bot response to conversation history
-        output_transport,        # Data channel (no audio out)
-    ])
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Participant audio (per-track)
+            human_audio_filter,  # Drop avatar/local bot audio
+            stt,  # Deepgram: speech -> text
+            user_transcript_fwd,  # Forward user STT transcripts to frontend
+            user_aggregator,  # Add user message to conversation history
+            avatar_ready_gate,  # Block until avatar bot is ready
+            llm,  # OpenAI: generate response
+            thinking_notifier,  # Notify frontend of LLM thinking state
+            avatar_transcript_fwd,  # Forward avatar LLM text to frontend
+            speaking_notifier,  # Notify frontend of speaking state
+            relay_processor,  # Relay text to SoulX avatar bot
+            assistant_aggregator,  # Add bot response to conversation history
+            output_transport,  # Data channel (no audio out)
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -2731,18 +2873,22 @@ async def run_bot_relay(
             return
         session_seeded["done"] = True
         if spoke_script:
-            context.add_message({
-                "role": "developer",
-                "content": (
-                    "You just finished presenting the scene scripts to the visitor. "
-                    "They heard your full presentation. Don't repeat what you already said."
-                ),
-            })
+            context.add_message(
+                {
+                    "role": "developer",
+                    "content": (
+                        "You just finished presenting the scene scripts to the visitor. "
+                        "They heard your full presentation. Don't repeat what you already said."
+                    ),
+                }
+            )
         else:
-            context.add_message({
-                "role": "developer",
-                "content": GREETING_TRIGGER_PROMPT,
-            })
+            context.add_message(
+                {
+                    "role": "developer",
+                    "content": GREETING_TRIGGER_PROMPT,
+                }
+            )
             await task.queue_frames([LLMRunFrame()])
 
     async def _narrate_and_complete(
@@ -2780,7 +2926,8 @@ async def run_bot_relay(
             )
             logger.info(
                 "[NARRATION] run complete spoke_script={} trigger={}",
-                spoke_script, trigger,
+                spoke_script,
+                trigger,
             )
             # Seed the session context if the cancelled greeting never
             # got to (script-less flows must still wake the LLM — see
@@ -2799,7 +2946,9 @@ async def run_bot_relay(
         if greeting_sent:
             return
         if not avatar_ready_event.is_set():
-            logger.info("Waiting for avatar relay bot to become ready before greeting visitor")
+            logger.info(
+                "Waiting for avatar relay bot to become ready before greeting visitor"
+            )
             await avatar_ready_event.wait()
         if greeting_sent:
             return
@@ -2909,6 +3058,7 @@ async def run_bot_relay(
                     logger.info("[REQUEST_NARRATE] skipped: no room_id")
                     return
                 from api_client import get_scene_snapshot
+
                 manual_snapshot = await get_scene_snapshot(room_id, api_url)
                 if not manual_snapshot:
                     logger.info("[REQUEST_NARRATE] skipped: snapshot fetch failed")
@@ -2922,9 +3072,7 @@ async def run_bot_relay(
                 _cancel_active_narration_run()
                 await _relay_interrupt_narration_turn()
                 _start_narration_task(
-                    _narrate_and_complete(
-                        manual_snapshot, force=True, trigger="manual"
-                    )
+                    _narrate_and_complete(manual_snapshot, force=True, trigger="manual")
                 )
                 logger.info("[REQUEST_NARRATE] manual replay started")
                 return
@@ -2946,16 +3094,16 @@ async def run_bot_relay(
                         logger.info("[AUTOPLAY] resume skipped: no room_id")
                         return
                     from api_client import get_scene_snapshot
+
                     # By tracked scene id (cursor fallback) — see the
                     # classic resume branch for the P2 rationale.
                     resume_snapshot = await get_scene_snapshot(
-                        room_id, api_url,
+                        room_id,
+                        api_url,
                         scene_id=session_context.get_current_scene_id() or None,
                     )
                     if not resume_snapshot:
-                        logger.info(
-                            "[AUTOPLAY] resume skipped: snapshot fetch failed"
-                        )
+                        logger.info("[AUTOPLAY] resume skipped: snapshot fetch failed")
                         return
                     # Cancel + interrupt BEFORE starting (ordering rule in
                     # _relay_interrupt_narration_turn): a resume racing an
@@ -2987,7 +3135,8 @@ async def run_bot_relay(
 
                 logger.info(
                     "[REQUEST_QUIZ] generating: count={} language={!r}",
-                    quiz_count, quiz_language,
+                    quiz_count,
+                    quiz_language,
                 )
                 try:
                     result = await run_quiz_generation(
@@ -3000,7 +3149,8 @@ async def run_bot_relay(
                     )
                     logger.info(
                         "[REQUEST_QUIZ] complete ok={} error={!r}",
-                        result.ok, result.error,
+                        result.ok,
+                        result.error,
                     )
                     if result.ok:
                         # See classic pipeline for the LLM-wake rationale.
@@ -3010,21 +3160,23 @@ async def run_bot_relay(
                         # unchanged — no RELAY_TURN bookkeeping needed here
                         # (the LLM's output text flows through the relay
                         # forwarder downstream of the assistant aggregator).
-                        context.add_message({
-                            "role": "developer",
-                            "content": (
-                                "A quiz has just been activated on the canvas by the visitor "
-                                "clicking the Quiz action button (not by your tool call). The "
-                                "quiz Page is already showing on screen. Here is the quiz blob "
-                                "you need to drive the session:\n\n"
-                                f"{json.dumps(result.blob)}\n\n"
-                                "Now read the first question aloud and wait for the visitor's "
-                                "answer, exactly as you would after calling "
-                                "generate_quiz_from_knowledge yourself. Use canvas_action "
-                                "verbs (submit_answer / skip_question) to record their answers "
-                                "and let the Quiz Page own the pacing."
-                            ),
-                        })
+                        context.add_message(
+                            {
+                                "role": "developer",
+                                "content": (
+                                    "A quiz has just been activated on the canvas by the visitor "
+                                    "clicking the Quiz action button (not by your tool call). The "
+                                    "quiz Page is already showing on screen. Here is the quiz blob "
+                                    "you need to drive the session:\n\n"
+                                    f"{json.dumps(result.blob)}\n\n"
+                                    "Now read the first question aloud and wait for the visitor's "
+                                    "answer, exactly as you would after calling "
+                                    "generate_quiz_from_knowledge yourself. Use canvas_action "
+                                    "verbs (submit_answer / skip_question) to record their answers "
+                                    "and let the Quiz Page own the pacing."
+                                ),
+                            }
+                        )
                         await task.queue_frames([LLMRunFrame()])
                 except Exception as exc:
                     logger.exception("[REQUEST_QUIZ] unexpected failure")
@@ -3043,8 +3195,10 @@ async def run_bot_relay(
                 logger.info(
                     "[VISION] canvas_capture_result reached on_app_message: captureId={} "
                     "status={!r} pending_future={}",
-                    cid, message.get("status"),
-                    "found" if fut is not None
+                    cid,
+                    message.get("status"),
+                    "found"
+                    if fut is not None
                     else "MISSING (already timed out, unknown id, or this handler never received earlier captures)",
                 )
                 if fut is not None and not fut.done():
@@ -3060,7 +3214,9 @@ async def run_bot_relay(
                 return
 
             if msg_type == "canvas.register":
-                logger.info(f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}")
+                logger.info(
+                    f"[CANVAS REGISTER] pageType={message.get('pageType')!r} version={message.get('version')!r}"
+                )
                 canvas_manifest.set_manifest(message)
                 # S64d — rebuild the system prompt so the LLM learns the new
                 # Page's verbs (see classic pipeline for full rationale).
@@ -3069,12 +3225,16 @@ async def run_bot_relay(
                         base_system_prompt, canvas_manifest.current()
                     )
                     llm._settings.system_instruction = new_prompt  # type: ignore[attr-defined]
-                    logger.info("[CANVAS REGISTER] system prompt rebuilt with manifest section")
+                    logger.info(
+                        "[CANVAS REGISTER] system prompt rebuilt with manifest section"
+                    )
                 except Exception as exc:
                     logger.warning("[CANVAS REGISTER] prompt rebuild failed: {!r}", exc)
                 return
             if msg_type == "canvas.stateChange":
-                logger.info(f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}")
+                logger.info(
+                    f"[CANVAS STATECHANGE] keys={list((message.get('semanticState') or {}).keys())}"
+                )
                 canvas_manifest.update_state(message.get("semanticState") or {})
                 return
             if msg_type == "canvas.sceneChanged":
@@ -3093,13 +3253,17 @@ async def run_bot_relay(
                 return
             if msg_type == "canvas.commandResult":
                 cid = message.get("commandId")
-                logger.info(f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}")
+                logger.info(
+                    f"[CANVAS COMMANDRESULT] commandId={cid!r} result={message.get('result')!r}"
+                )
                 if cid:
                     canvas_pending.resolve(cid, message.get("result") or {})
                 return
             if msg_type == "canvas.commandError":
                 cid = message.get("commandId")
-                logger.warning(f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}")
+                logger.warning(
+                    f"[CANVAS COMMANDERROR] commandId={cid!r} error={message.get('error')!r}"
+                )
                 if cid:
                     canvas_pending.reject(cid, message.get("error") or {})
                 return
@@ -3109,7 +3273,9 @@ async def run_bot_relay(
         avatar_participant_id = str(sender or "").strip() or avatar_participant_id
         avatar_ready_event.set()
         await _ensure_avatar_participant_ignored(avatar_participant_id)
-        logger.info("Avatar relay bot is ready: participant_id={}", avatar_participant_id)
+        logger.info(
+            "Avatar relay bot is ready: participant_id={}", avatar_participant_id
+        )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -3134,7 +3300,9 @@ async def run_bot_relay(
         active_human_id = pid or active_human_id
         await _start_human_audio_capture(active_human_id)
         if not avatar_ready_event.is_set():
-            logger.info("Human joined before avatar relay bot was ready; cloud bot will wait")
+            logger.info(
+                "Human joined before avatar relay bot was ready; cloud bot will wait"
+            )
         # Phase A (A5) — the greeting (session-start narration) runs in
         # the single narration slot so a scene change during the opening
         # narration cancels it instead of letting the old scene's script
@@ -3204,6 +3372,7 @@ async def run_bot_relay(
 # ──────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────
+
 
 async def bot(runner_args: RunnerArguments):
     """Entry point called by Pipecat runner.

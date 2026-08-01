@@ -47,7 +47,9 @@ class OpenAIEagerHook:
 
             if args_chunk:
                 self.tracker.append_args(idx, args_chunk)
-                await maybe_fire_eager(self.tracker, idx, self.pending, self.send_app_message)
+                await maybe_fire_eager(
+                    self.tracker, idx, self.pending, self.send_app_message
+                )
 
     def reset(self):
         self.tracker.reset()

@@ -42,7 +42,9 @@ class GeminiEagerHook:
                 fc = getattr(part, "function_call", None)
                 if not fc:
                     continue
-                idx = (cand_idx << 8) | part_idx  # synthetic index per (candidate, part)
+                idx = (
+                    cand_idx << 8
+                ) | part_idx  # synthetic index per (candidate, part)
                 name = getattr(fc, "name", None) or ""
                 args = getattr(fc, "args", None)
 
@@ -55,13 +57,19 @@ class GeminiEagerHook:
 
                 if isinstance(args, dict):
                     verb = args.get("verb")
-                    if verb and name in ("canvas_control", "canvas_action") and is_arg_less_verb(verb):
+                    if (
+                        verb
+                        and name in ("canvas_control", "canvas_action")
+                        and is_arg_less_verb(verb)
+                    ):
                         # Fire eagerly using the dict directly.
                         call = self.tracker.get_call(idx)
                         if call and not call["eager_fired"]:
                             tool_short = name.split("_", 1)[1]
                             cmd = build_canvas_command(
-                                tool_short, {"verb": verb}, command_id=call["command_id"],
+                                tool_short,
+                                {"verb": verb},
+                                command_id=call["command_id"],
                             )
                             self.pending.open(cmd["commandId"], eager=True)
                             try:
@@ -69,7 +77,9 @@ class GeminiEagerHook:
                                 self.tracker.mark_fired(idx)
                                 logger.info(
                                     "eager_dispatch[gemini]: fired %s verb=%s commandId=%s",
-                                    name, verb, cmd["commandId"],
+                                    name,
+                                    verb,
+                                    cmd["commandId"],
                                 )
                             except Exception:
                                 logger.exception("eager_dispatch[gemini]: send failed")
@@ -77,7 +87,9 @@ class GeminiEagerHook:
                     # Some Gemini SDK versions deliver partial JSON-as-string.
                     # Fall through to the shared partial-JSON path.
                     self.tracker.append_args(idx, json.dumps(args) if args else "")
-                    await maybe_fire_eager(self.tracker, idx, self.pending, self.send_app_message)
+                    await maybe_fire_eager(
+                        self.tracker, idx, self.pending, self.send_app_message
+                    )
 
     def reset(self):
         self.tracker.reset()

@@ -47,7 +47,9 @@ class AnthropicEagerHook:
                 idx = event.get("index", 0)
                 partial = delta.get("partial_json", "")
                 self.tracker.append_args(idx, partial)
-                await maybe_fire_eager(self.tracker, idx, self.pending, self.send_app_message)
+                await maybe_fire_eager(
+                    self.tracker, idx, self.pending, self.send_app_message
+                )
 
         elif etype == "message_stop":
             self.tracker.reset()

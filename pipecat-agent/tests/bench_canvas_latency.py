@@ -50,16 +50,36 @@ async def mock_anthropic_stream(verb: str) -> List[dict]:
     benchmark must use it too or the eager path never fires.
     """
     return [
-        {"type": "content_block_start", "index": 0,
-         "content_block": {"type": "tool_use", "name": "canvas_control", "id": "t1", "input": {}}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": '{"verb"'}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": ":"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": f'"{verb}"'}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": "}"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "name": "canvas_control",
+                "id": "t1",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"verb"'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": ":"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": f'"{verb}"'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "}"},
+        },
         {"type": "content_block_stop", "index": 0},
         {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
         {"type": "message_stop"},
@@ -89,7 +109,9 @@ async def measure_eager_savings(verb: str, iterations: int = 50) -> dict:
         # Add small per-chunk inter-arrival delay simulating network/LLM speed.
         for chunk in chunks:
             await hook.on_stream_event(chunk)
-            await asyncio.sleep(0.020)  # 20ms between chunks (typical streaming cadence)
+            await asyncio.sleep(
+                0.020
+            )  # 20ms between chunks (typical streaming cadence)
         t_end = time.perf_counter()
 
         if sent_time[0] is not None:
@@ -99,11 +121,14 @@ async def measure_eager_savings(verb: str, iterations: int = 50) -> dict:
     return {
         "verb": verb,
         "iterations": iterations,
-        "eager_dispatch_ms_p50": statistics.median(eager_times) if eager_times else None,
+        "eager_dispatch_ms_p50": statistics.median(eager_times)
+        if eager_times
+        else None,
         "stop_reason_ms_p50": statistics.median(nonEager_times),
         "savings_ms_p50": (
             statistics.median(nonEager_times) - statistics.median(eager_times)
-            if eager_times else 0
+            if eager_times
+            else 0
         ),
     }
 

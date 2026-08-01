@@ -32,7 +32,8 @@ class CanvasManifestRegistry:
         self._semantic_state = manifest.get("semanticState")
         logger.info(
             "canvas_manifest: registered pageType=%s version=%s capabilities=%s",
-            manifest.get("pageType"), manifest.get("version"),
+            manifest.get("pageType"),
+            manifest.get("version"),
             list((manifest.get("capabilities") or {}).keys()),
         )
 

@@ -1,4 +1,5 @@
 """HTTP client for fetching data from api.hv.ai."""
+
 import httpx
 from loguru import logger
 
@@ -45,6 +46,7 @@ class BackendError(Exception):
 
 
 # ── Public endpoints (Session 43 — no auth required) ──
+
 
 async def get_avatar_config(room_id: str, api_url: str | None = None) -> dict | None:
     """Fetch structured avatar configuration for a live room.

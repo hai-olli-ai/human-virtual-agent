@@ -87,11 +87,13 @@ def _snap(
 
 def test_plan_classic_resolves_per_segment_voice_with_primary_fallback():
     """voice_id present ⇒ used verbatim; voice_id missing ⇒ primary."""
-    snapshot = _snap(scripts=[
-        {"text": "intro", "order": 0, "voice_id": "voice-clone-A"},
-        {"text": "middle", "order": 1, "voice_id": None},
-        {"text": "outro", "order": 2},  # voice_id key absent entirely
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "intro", "order": 0, "voice_id": "voice-clone-A"},
+            {"text": "middle", "order": 1, "voice_id": None},
+            {"text": "outro", "order": 2},  # voice_id key absent entirely
+        ]
+    )
     plan = plan_narration_segments(
         snapshot, primary_voice_id="primary-V", is_relay=False
     )
@@ -104,10 +106,12 @@ def test_plan_classic_resolves_per_segment_voice_with_primary_fallback():
 
 def test_plan_relay_always_returns_none_voice_id():
     """Relay pipeline narrates in primary SoulX voice — no per-seg switching."""
-    snapshot = _snap(scripts=[
-        {"text": "a", "voice_id": "voice-clone-A"},
-        {"text": "b", "voice_id": "voice-clone-B"},
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "a", "voice_id": "voice-clone-A"},
+            {"text": "b", "voice_id": "voice-clone-B"},
+        ]
+    )
     plan = plan_narration_segments(
         snapshot, primary_voice_id="primary-V", is_relay=True
     )
@@ -117,13 +121,15 @@ def test_plan_relay_always_returns_none_voice_id():
 
 def test_plan_filters_empty_and_whitespace_text():
     """Blank / whitespace-only segments are dropped (mirrors S49 loop)."""
-    snapshot = _snap(scripts=[
-        {"text": "kept", "voice_id": "v1"},
-        {"text": "", "voice_id": "v2"},
-        {"text": "   ", "voice_id": "v3"},
-        {"text": "\n\t", "voice_id": "v4"},
-        {"text": "also-kept", "voice_id": "v5"},
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "kept", "voice_id": "v1"},
+            {"text": "", "voice_id": "v2"},
+            {"text": "   ", "voice_id": "v3"},
+            {"text": "\n\t", "voice_id": "v4"},
+            {"text": "also-kept", "voice_id": "v5"},
+        ]
+    )
     plan = plan_narration_segments(
         snapshot, primary_voice_id="primary-V", is_relay=False
     )
@@ -133,26 +139,34 @@ def test_plan_filters_empty_and_whitespace_text():
 def test_plan_empty_or_missing_scripts_returns_empty():
     """Defensive: empty/missing current_scene OR scripts ⇒ empty plan."""
     assert plan_narration_segments({}, primary_voice_id="p", is_relay=False) == []
-    assert plan_narration_segments(_snap(scripts=[]), primary_voice_id="p", is_relay=False) == []
+    assert (
+        plan_narration_segments(_snap(scripts=[]), primary_voice_id="p", is_relay=False)
+        == []
+    )
     # `current_scene.scripts` explicitly None should also return empty.
     snap_none = _snap()
     snap_none["current_scene"]["scripts"] = None
-    assert plan_narration_segments(snap_none, primary_voice_id="p", is_relay=False) == []
+    assert (
+        plan_narration_segments(snap_none, primary_voice_id="p", is_relay=False) == []
+    )
     # Snapshot without current_scene key at all.
-    assert plan_narration_segments({"live_room": {}}, primary_voice_id="p", is_relay=False) == []
+    assert (
+        plan_narration_segments({"live_room": {}}, primary_voice_id="p", is_relay=False)
+        == []
+    )
 
 
 def test_plan_skips_non_dict_entries():
     """Defensive: tolerate the occasional malformed script row."""
-    snapshot = _snap(scripts=[
-        {"text": "ok", "voice_id": "v"},
-        "not-a-dict",  # malformed entry
-        None,
-        {"text": "also-ok", "voice_id": "v"},
-    ])
-    plan = plan_narration_segments(
-        snapshot, primary_voice_id="p", is_relay=False
+    snapshot = _snap(
+        scripts=[
+            {"text": "ok", "voice_id": "v"},
+            "not-a-dict",  # malformed entry
+            None,
+            {"text": "also-ok", "voice_id": "v"},
+        ]
     )
+    plan = plan_narration_segments(snapshot, primary_voice_id="p", is_relay=False)
     assert [seg.text for seg in plan] == ["ok", "also-ok"]
 
 
@@ -161,14 +175,14 @@ def test_plan_preserves_server_order_does_not_resort():
     # Note the deliberately reversed ``order`` field — if the helper
     # re-sorted, the output would come back as B, A, C; we want the
     # snapshot order preserved.
-    snapshot = _snap(scripts=[
-        {"text": "A", "order": 5, "voice_id": "v"},
-        {"text": "B", "order": 1, "voice_id": "v"},
-        {"text": "C", "order": 3, "voice_id": "v"},
-    ])
-    plan = plan_narration_segments(
-        snapshot, primary_voice_id="p", is_relay=False
+    snapshot = _snap(
+        scripts=[
+            {"text": "A", "order": 5, "voice_id": "v"},
+            {"text": "B", "order": 1, "voice_id": "v"},
+            {"text": "C", "order": 3, "voice_id": "v"},
+        ]
     )
+    plan = plan_narration_segments(snapshot, primary_voice_id="p", is_relay=False)
     assert [seg.text for seg in plan] == ["A", "B", "C"]
 
 
@@ -192,11 +206,13 @@ def _make_classic_narrator(primary_voice_id: str | None = "primary-V"):
 def test_narrate_classic_switches_voice_per_segment_then_resets():
     """Per-segment switch + reset-to-primary before returning."""
     narrator, set_voice, speak = _make_classic_narrator()
-    snapshot = _snap(scripts=[
-        {"text": "intro", "voice_id": "voice-A"},
-        {"text": "middle", "voice_id": "voice-B"},
-        {"text": "outro", "voice_id": "voice-A"},  # back to A
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "intro", "voice_id": "voice-A"},
+            {"text": "middle", "voice_id": "voice-B"},
+            {"text": "outro", "voice_id": "voice-A"},  # back to A
+        ]
+    )
     spoken = _run(narrator.narrate(snapshot))
     assert spoken is True
     # Voice calls: primary→A, A→B, B→A, A→primary (reset at the end).
@@ -215,11 +231,13 @@ def test_narrate_classic_switches_voice_per_segment_then_resets():
 def test_narrate_classic_skips_voice_call_when_already_active():
     """Adjacent segments on the same voice ⇒ only one switch call."""
     narrator, set_voice, speak = _make_classic_narrator(primary_voice_id="primary-V")
-    snapshot = _snap(scripts=[
-        {"text": "first", "voice_id": "voice-A"},
-        {"text": "second", "voice_id": "voice-A"},  # same as previous
-        {"text": "third", "voice_id": "voice-A"},
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "first", "voice_id": "voice-A"},
+            {"text": "second", "voice_id": "voice-A"},  # same as previous
+            {"text": "third", "voice_id": "voice-A"},
+        ]
+    )
     _run(narrator.narrate(snapshot))
     # One switch primary→A at the start, then one reset A→primary at end.
     assert set_voice.await_args_list == [call("voice-A"), call("primary-V")]
@@ -229,10 +247,12 @@ def test_narrate_classic_skips_voice_call_when_already_active():
 def test_narrate_classic_no_reset_when_already_on_primary():
     """All segments use primary voice ⇒ zero set_voice calls."""
     narrator, set_voice, speak = _make_classic_narrator(primary_voice_id="primary-V")
-    snapshot = _snap(scripts=[
-        {"text": "a", "voice_id": "primary-V"},  # matches primary
-        {"text": "b", "voice_id": None},  # falls back to primary
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "a", "voice_id": "primary-V"},  # matches primary
+            {"text": "b", "voice_id": None},  # falls back to primary
+        ]
+    )
     _run(narrator.narrate(snapshot))
     set_voice.assert_not_awaited()
     assert speak.await_count == 2
@@ -328,7 +348,9 @@ def test_narrate_no_scene_id_does_not_persist_idempotency():
 def test_followup_returns_none_when_no_script_was_spoken():
     """No-script scenes: existing conversational greeting handles intro."""
     snapshot = _snap(
-        auto_advance=False, scene_index=0, total_scenes=3,
+        auto_advance=False,
+        scene_index=0,
+        total_scenes=3,
         narration={
             "invitation_line": "Any questions?",
             "transition_cue": "Onward.",
@@ -340,7 +362,9 @@ def test_followup_returns_none_when_no_script_was_spoken():
 def test_followup_returns_invitation_when_manual_flow():
     """auto_advance=False ⇒ invitation regardless of scene index."""
     snapshot = _snap(
-        auto_advance=False, scene_index=1, total_scenes=4,
+        auto_advance=False,
+        scene_index=1,
+        total_scenes=4,
         narration={
             "invitation_line": "What would you like to know?",
             "transition_cue": "Onward.",
@@ -355,22 +379,25 @@ def test_followup_returns_invitation_when_manual_flow():
 def test_followup_returns_cue_when_auto_advance_and_not_last():
     """auto_advance=True + not last ⇒ cue, never invitation."""
     snapshot = _snap(
-        auto_advance=True, scene_index=1, total_scenes=4,
+        auto_advance=True,
+        scene_index=1,
+        total_scenes=4,
         narration={
             "invitation_line": "Any questions?",
             "transition_cue": "Let's continue.",
         },
     )
     assert (
-        plan_post_narration_followup(snapshot, spoke_script=True)
-        == "Let's continue."
+        plan_post_narration_followup(snapshot, spoke_script=True) == "Let's continue."
     )
 
 
 def test_followup_returns_none_when_auto_advance_and_cue_blank():
     """auto_advance branch with blank cue ⇒ None (NOT invitation)."""
     snapshot = _snap(
-        auto_advance=True, scene_index=0, total_scenes=3,
+        auto_advance=True,
+        scene_index=0,
+        total_scenes=3,
         narration={
             "invitation_line": "Any questions?",
             "transition_cue": "",  # blank — caller should skip the cue speak
@@ -383,7 +410,8 @@ def test_followup_returns_none_when_auto_advance_and_cue_blank():
 def test_followup_returns_invitation_on_last_scene_even_with_auto_advance():
     """Last scene with auto_advance ⇒ invitation (nothing to advance TO)."""
     snapshot = _snap(
-        auto_advance=True, scene_index=2,  # last (0-indexed)
+        auto_advance=True,
+        scene_index=2,  # last (0-indexed)
         total_scenes=3,
         narration={
             "invitation_line": "What questions do you have?",
@@ -416,8 +444,7 @@ def test_followup_treats_missing_flow_state_fields_as_single_scene():
         "current_scene": {"narration": {"invitation_line": "Ask me anything."}},
     }
     assert (
-        plan_post_narration_followup(snapshot, spoke_script=True)
-        == "Ask me anything."
+        plan_post_narration_followup(snapshot, spoke_script=True) == "Ask me anything."
     )
 
 
@@ -430,26 +457,46 @@ def test_script_complete_payload_with_spoken_script():
     """sceneIndex sourced from flow_state.scene_index; hadScript reflects arg."""
     snapshot = _snap(scene_index=2, total_scenes=5)
     payload = build_script_complete_payload(snapshot, spoke_script=True)
-    assert payload == {"type": "script_complete", "sceneIndex": 2, "hadScript": True, "trigger": "auto"}
+    assert payload == {
+        "type": "script_complete",
+        "sceneIndex": 2,
+        "hadScript": True,
+        "trigger": "auto",
+    }
 
 
 def test_script_complete_payload_with_no_script():
     snapshot = _snap(scene_index=0, total_scenes=1)
     payload = build_script_complete_payload(snapshot, spoke_script=False)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}
+    assert payload == {
+        "type": "script_complete",
+        "sceneIndex": 0,
+        "hadScript": False,
+        "trigger": "auto",
+    }
 
 
 def test_script_complete_payload_defaults_to_index_zero_for_no_snapshot():
     """Defensive: degraded session with no snapshot still produces a valid msg."""
     payload = build_script_complete_payload(None, spoke_script=False)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}
+    assert payload == {
+        "type": "script_complete",
+        "sceneIndex": 0,
+        "hadScript": False,
+        "trigger": "auto",
+    }
 
 
 def test_script_complete_payload_defaults_when_flow_state_missing():
     """Snapshot present but no flow_state block ⇒ sceneIndex defaults to 0."""
     snapshot = {"live_room": {}, "current_scene": {"scene_id": "s1"}}
     payload = build_script_complete_payload(snapshot, spoke_script=True)
-    assert payload == {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"}
+    assert payload == {
+        "type": "script_complete",
+        "sceneIndex": 0,
+        "hadScript": True,
+        "trigger": "auto",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -489,8 +536,9 @@ def test_scripts_section_empty_when_no_scripts():
 # ──────────────────────────────────────────────────────────────────────
 
 
-async def _drive_classic_scene_entry(snapshot: dict | None, narrator: SceneNarrator,
-                                     speak: AsyncMock, send: AsyncMock) -> bool:
+async def _drive_classic_scene_entry(
+    snapshot: dict | None, narrator: SceneNarrator, speak: AsyncMock, send: AsyncMock
+) -> bool:
     """Mirror the orchestration in bot.py's run_bot_classic.on_client_connected.
 
     Calls the production ``run_scene_narration`` orchestrator so a
@@ -536,7 +584,9 @@ def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
     snapshot = _snap(
         scene_id="s1",
         scripts=[{"text": "hello world", "voice_id": "voice-A"}],
-        auto_advance=True, scene_index=0, total_scenes=3,
+        auto_advance=True,
+        scene_index=0,
+        total_scenes=3,
         narration={
             "invitation_line": "Any questions?",
             "transition_cue": "Let's keep going.",
@@ -552,7 +602,15 @@ def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
         ("speak", "hello world"),
         ("set_voice", "primary"),
         ("speak", "Let's keep going."),
-        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"}),
+        (
+            "send",
+            {
+                "type": "script_complete",
+                "sceneIndex": 0,
+                "hadScript": True,
+                "trigger": "auto",
+            },
+        ),
     ]
     # Explicit: the invitation_line MUST NOT appear in the speak history.
     spoken_texts = [evt[1] for evt in events if evt[0] == "speak"]
@@ -566,7 +624,8 @@ def test_scenario_script_complete_emitted_once_after_invitation_with_payload():
         scene_id="s1",
         scripts=[{"text": "intro", "voice_id": "voice-A"}],
         auto_advance=False,  # manual ⇒ invitation branch
-        scene_index=1, total_scenes=4,
+        scene_index=1,
+        total_scenes=4,
         narration={
             "invitation_line": "What would you like to explore?",
             "transition_cue": "Onward.",
@@ -581,7 +640,12 @@ def test_scenario_script_complete_emitted_once_after_invitation_with_payload():
     assert events[-1] == send_events[0]
     assert events[-1] == (
         "send",
-        {"type": "script_complete", "sceneIndex": 1, "hadScript": True, "trigger": "auto"},
+        {
+            "type": "script_complete",
+            "sceneIndex": 1,
+            "hadScript": True,
+            "trigger": "auto",
+        },
     )
 
     # The invitation was spoken BEFORE script_complete (find both, compare indices).
@@ -603,7 +667,9 @@ def test_scenario_no_script_scene_skips_narration_and_invitation_emits_payload()
     snapshot = _snap(
         scene_id="s-empty",
         scripts=[],
-        auto_advance=True, scene_index=0, total_scenes=3,
+        auto_advance=True,
+        scene_index=0,
+        total_scenes=3,
         narration={
             "invitation_line": "Any questions?",
             "transition_cue": "Onward.",
@@ -618,7 +684,15 @@ def test_scenario_no_script_scene_skips_narration_and_invitation_emits_payload()
     # scenes). Exactly one send for script_complete with
     # hadScript=False.
     assert events == [
-        ("send", {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"}),
+        (
+            "send",
+            {
+                "type": "script_complete",
+                "sceneIndex": 0,
+                "hadScript": False,
+                "trigger": "auto",
+            },
+        ),
     ]
 
 
@@ -642,7 +716,9 @@ def test_scenario_scene_change_rerruns_narration_with_new_scene_id():
     snap1 = _snap(
         scene_id="s1",
         scripts=[{"text": "scene one"}],
-        auto_advance=True, scene_index=0, total_scenes=3,
+        auto_advance=True,
+        scene_index=0,
+        total_scenes=3,
         narration={
             "invitation_line": "Q?",
             "transition_cue": "moving on",
@@ -651,7 +727,9 @@ def test_scenario_scene_change_rerruns_narration_with_new_scene_id():
     snap2 = _snap(
         scene_id="s2",
         scripts=[{"text": "scene two"}],
-        auto_advance=True, scene_index=1, total_scenes=3,
+        auto_advance=True,
+        scene_index=1,
+        total_scenes=3,
         narration={
             "invitation_line": "Q?",
             "transition_cue": "moving on again",
@@ -672,8 +750,18 @@ def test_scenario_scene_change_rerruns_narration_with_new_scene_id():
     assert "moving on" in speaks
     assert "moving on again" in speaks
     assert sends == [
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"},
-        {"type": "script_complete", "sceneIndex": 1, "hadScript": True, "trigger": "auto"},
+        {
+            "type": "script_complete",
+            "sceneIndex": 0,
+            "hadScript": True,
+            "trigger": "auto",
+        },
+        {
+            "type": "script_complete",
+            "sceneIndex": 1,
+            "hadScript": True,
+            "trigger": "auto",
+        },
     ]
 
 
@@ -687,7 +775,9 @@ def test_scenario_scene_change_idempotency_skips_repeat_for_same_scene():
     snap = _snap(
         scene_id="s1",
         scripts=[{"text": "intro"}],
-        auto_advance=False, scene_index=0, total_scenes=1,
+        auto_advance=False,
+        scene_index=0,
+        total_scenes=1,
         narration={"invitation_line": "Q?", "transition_cue": "—"},
     )
     spoke1 = _run(_drive_classic_scene_entry(snap, narrator, speak, send))
@@ -703,8 +793,18 @@ def test_scenario_scene_change_idempotency_skips_repeat_for_same_scene():
     sends = [evt[1] for evt in events if evt[0] == "send"]
     assert speaks.count("intro") == 1
     assert sends == [
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": True, "trigger": "auto"},
-        {"type": "script_complete", "sceneIndex": 0, "hadScript": False, "trigger": "auto"},
+        {
+            "type": "script_complete",
+            "sceneIndex": 0,
+            "hadScript": True,
+            "trigger": "auto",
+        },
+        {
+            "type": "script_complete",
+            "sceneIndex": 0,
+            "hadScript": False,
+            "trigger": "auto",
+        },
     ]
 
 
@@ -721,10 +821,12 @@ def test_narrate_relay_never_calls_set_voice():
         set_voice=None,
         speak=speak,
     )
-    snapshot = _snap(scripts=[
-        {"text": "a", "voice_id": "voice-A"},
-        {"text": "b", "voice_id": "voice-B"},
-    ])
+    snapshot = _snap(
+        scripts=[
+            {"text": "a", "voice_id": "voice-A"},
+            {"text": "b", "voice_id": "voice-B"},
+        ]
+    )
     spoken = _run(narrator.narrate(snapshot))
     assert spoken is True
     # No set_voice callable to assert against — but verify the speak
