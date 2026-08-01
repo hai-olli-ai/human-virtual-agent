@@ -481,9 +481,7 @@ class SceneNarrator:
             try:
                 await self._prefetch(plan)
             except Exception as exc:
-                logger.warning(
-                    "[NARRATION] prefetch failed; live fallback: {!r}", exc
-                )
+                logger.warning("[NARRATION] prefetch failed; live fallback: {!r}", exc)
 
         try:
             for idx, seg in enumerate(plan):

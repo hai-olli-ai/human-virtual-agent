@@ -84,7 +84,12 @@ def _build_prompt(mode: str, scene_context: str) -> str:
     else:  # describe (default / fallback)
         task = "Describe what is currently on screen, concisely."
     ctx = f"\nScene context: {scene_context}" if scene_context else ""
-    return base + task + ctx + "\nRespond in 1-3 short sentences for the voice agent to speak."
+    return (
+        base
+        + task
+        + ctx
+        + "\nRespond in 1-3 short sentences for the voice agent to speak."
+    )
 
 
 def derive_vision_mode(utterance: str) -> str:
@@ -96,17 +101,43 @@ def derive_vision_mode(utterance: str) -> str:
     through to 'describe'.
     """
     u = (utterance or "").lower()
-    if any(k in u for k in (
-        "is this right", "is this correct", "is that right", "is that correct",
-        "am i right", "am i correct", "did i get", "is my answer", "correct?",
-        "right answer", "wrong",
-    )):
+    if any(
+        k in u
+        for k in (
+            "is this right",
+            "is this correct",
+            "is that right",
+            "is that correct",
+            "am i right",
+            "am i correct",
+            "did i get",
+            "is my answer",
+            "correct?",
+            "right answer",
+            "wrong",
+        )
+    ):
         return "assess"
-    if any(k in u for k in (
-        "pointing at", "point at", "what am i", "what's this", "what is this",
-        "what did i", "circled", "circle", "drew", "drawing", "marked",
-        "highlighted", "underlined", "this here", "right here",
-    )):
+    if any(
+        k in u
+        for k in (
+            "pointing at",
+            "point at",
+            "what am i",
+            "what's this",
+            "what is this",
+            "what did i",
+            "circled",
+            "circle",
+            "drew",
+            "drawing",
+            "marked",
+            "highlighted",
+            "underlined",
+            "this here",
+            "right here",
+        )
+    ):
         return "point"
     return "describe"
 
@@ -125,7 +156,9 @@ class VisionClient:
         # (e.g. ``VisionClient(api_key="")`` exercises the stub path with no
         # monkeypatching and no SDK installed).
         self.model = model or os.getenv("VISION_MODEL", _DEFAULT_VISION_MODEL)
-        self._api_key = os.getenv("GOOGLE_AI_API_KEY", "") if api_key is None else api_key
+        self._api_key = (
+            os.getenv("GOOGLE_AI_API_KEY", "") if api_key is None else api_key
+        )
         self._client = None
 
     @property
@@ -136,7 +169,10 @@ class VisionClient:
         """Lazily construct + cache the genai client. Import is deferred here
         so the module loads even when ``google-genai`` isn't installed."""
         if self._client is None:
-            from google import genai  # google-genai SDK (A-AG-4: google-genai<2,>=1.68.0)
+            from google import (
+                genai,
+            )  # google-genai SDK (A-AG-4: google-genai<2,>=1.68.0)
+
             self._client = genai.Client(api_key=self._api_key)
         return self._client
 
@@ -218,7 +254,7 @@ class VisionClient:
         prompt = (
             "Return ONLY JSON locating this target in the image: " + description + ". "
             'Format: {"box_2d": [ymin, xmin, ymax, xmax]} with integers normalized '
-            '0-1000 (top-left origin). If the target is not visible, return '
+            "0-1000 (top-left origin). If the target is not visible, return "
             '{"box_2d": null}.'
         )
         try:
@@ -243,7 +279,9 @@ class VisionClient:
             data = json.loads((getattr(resp, "text", "") or "").strip())
             box = data.get("box_2d") if isinstance(data, dict) else None
             if not box or len(box) != 4:
-                logger.info("[VISION] locate found nothing description={!r}", description)
+                logger.info(
+                    "[VISION] locate found nothing description={!r}", description
+                )
                 return None
             # Normalize 0-1000 → 0-1 fractions. box_2d order is [ymin, xmin, ymax, xmax].
             ymin, xmin, ymax, xmax = (float(v) / 1000.0 for v in box)
@@ -252,11 +290,16 @@ class VisionClient:
             if w <= 0 or h <= 0:
                 logger.info(
                     "[VISION] locate degenerate box description={!r} box_2d={}",
-                    description, box,
+                    description,
+                    box,
                 )
                 return None
-            logger.info("[VISION] locate ok description={!r} box_2d={}", description, box)
+            logger.info(
+                "[VISION] locate ok description={!r} box_2d={}", description, box
+            )
             return {"x": x, "y": y, "w": w, "h": h}
         except Exception as exc:
-            logger.warning("[VISION] locate failed description={!r}: {!r}", description, exc)
+            logger.warning(
+                "[VISION] locate failed description={!r}: {!r}", description, exc
+            )
             return None

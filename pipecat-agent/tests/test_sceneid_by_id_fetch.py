@@ -134,9 +134,7 @@ def test_snapshot_with_none_scene_id_treated_as_omitted():
 def test_snapshot_with_empty_string_scene_id_treated_as_omitted():
     with _patched_client():
         _run(
-            api_client.get_scene_snapshot(
-                "room-1", api_url="http://x/api", scene_id=""
-            )
+            api_client.get_scene_snapshot("room-1", api_url="http://x/api", scene_id="")
         )
     _, params = _FakeAsyncClient.last_calls[-1]
     assert "scene_id" not in params
@@ -180,8 +178,10 @@ def test_build_system_prompt_threads_snapshot_scene_id_to_fetch():
     mock_get_snapshot = _mock_snapshot_fetch()
     mock_get_persona = AsyncMock(return_value=None)
 
-    with patch.object(persona, "get_scene_snapshot", mock_get_snapshot), \
-         patch.object(persona, "get_persona_prompt", mock_get_persona):
+    with (
+        patch.object(persona, "get_scene_snapshot", mock_get_snapshot),
+        patch.object(persona, "get_persona_prompt", mock_get_persona),
+    ):
         _run(
             persona.build_system_prompt(
                 room_id="room-1",
@@ -206,8 +206,10 @@ def test_build_system_prompt_legacy_scene_id_does_NOT_drive_snapshot_fetch():
     mock_get_snapshot = _mock_snapshot_fetch()
     mock_get_persona = AsyncMock(return_value=None)
 
-    with patch.object(persona, "get_scene_snapshot", mock_get_snapshot), \
-         patch.object(persona, "get_persona_prompt", mock_get_persona):
+    with (
+        patch.object(persona, "get_scene_snapshot", mock_get_snapshot),
+        patch.object(persona, "get_persona_prompt", mock_get_persona),
+    ):
         _run(
             persona.build_system_prompt(
                 room_id="room-1",
@@ -233,8 +235,10 @@ def test_build_system_prompt_without_any_scene_id_passes_none():
     mock_get_snapshot = _mock_snapshot_fetch()
     mock_get_persona = AsyncMock(return_value=None)
 
-    with patch.object(persona, "get_scene_snapshot", mock_get_snapshot), \
-         patch.object(persona, "get_persona_prompt", mock_get_persona):
+    with (
+        patch.object(persona, "get_scene_snapshot", mock_get_snapshot),
+        patch.object(persona, "get_persona_prompt", mock_get_persona),
+    ):
         _run(
             persona.build_system_prompt(
                 room_id="room-1",
@@ -258,8 +262,10 @@ def test_build_system_prompt_both_args_snapshot_wins():
     mock_get_snapshot = _mock_snapshot_fetch()
     mock_get_persona = AsyncMock(return_value=None)
 
-    with patch.object(persona, "get_scene_snapshot", mock_get_snapshot), \
-         patch.object(persona, "get_persona_prompt", mock_get_persona):
+    with (
+        patch.object(persona, "get_scene_snapshot", mock_get_snapshot),
+        patch.object(persona, "get_persona_prompt", mock_get_persona),
+    ):
         _run(
             persona.build_system_prompt(
                 room_id="room-1",

@@ -47,7 +47,9 @@ class FakeVisionClient:
         self.answer = answer
         self.calls: list[tuple] = []
 
-    async def analyze_image(self, image_bytes, mode, scene_context="", mime_type="image/jpeg"):
+    async def analyze_image(
+        self, image_bytes, mode, scene_context="", mime_type="image/jpeg"
+    ):
         self.calls.append((mode, scene_context, mime_type, image_bytes))
         return self.answer
 
@@ -101,7 +103,9 @@ async def _request_capture_mirror(hint, *, send, pending, timeout_ms=4000):
     fut = loop.create_future()
     pending[capture_id] = fut
     try:
-        await send({"type": "request_canvas_capture", "captureId": capture_id, "hint": hint})
+        await send(
+            {"type": "request_canvas_capture", "captureId": capture_id, "hint": hint}
+        )
         return capture_id, await asyncio.wait_for(fut, timeout=timeout_ms / 1000)
     except asyncio.TimeoutError:
         return capture_id, None
@@ -136,13 +140,25 @@ def test_capture_round_trip_resolves_by_id():
         assert sent and sent[0]["type"] == "request_canvas_capture"
         cid = sent[0]["captureId"]
         _handle_capture_result_mirror(
-            {"type": "canvas_capture_result", "captureId": cid, "status": "ready", "w": 800, "h": 600},
+            {
+                "type": "canvas_capture_result",
+                "captureId": cid,
+                "status": "ready",
+                "w": 800,
+                "h": 600,
+            },
             pending=pending,
         )
         return await task
 
     capture_id, result = _run(_drive())
-    assert result == {"type": "canvas_capture_result", "captureId": capture_id, "status": "ready", "w": 800, "h": 600}
+    assert result == {
+        "type": "canvas_capture_result",
+        "captureId": capture_id,
+        "status": "ready",
+        "w": 800,
+        "h": 600,
+    }
 
 
 def test_capture_round_trip_timeout_returns_none():
@@ -183,7 +199,11 @@ def test_stale_capture_result_is_ignored():
 def test_fetch_live_bytes_ready_returns_jpeg():
     """ready + bytes in backend → the live JPEG, fetched by (slug, captureId)."""
     backend = FakeBackend(capture_bytes=b"JPEGBYTES")
-    img = _run(_fetch_live_bytes("cap-1", {"status": "ready", "w": 800}, backend, "demo-slug", None))
+    img = _run(
+        _fetch_live_bytes(
+            "cap-1", {"status": "ready", "w": 800}, backend, "demo-slug", None
+        )
+    )
     assert img == b"JPEGBYTES"
     assert backend.get_vision_capture_calls == [("demo-slug", "cap-1", None)]
 
@@ -192,15 +212,27 @@ def test_fetch_live_bytes_not_ready_returns_none_without_fetching():
     """Non-ready capture → None, and no backend fetch attempted."""
     backend = FakeBackend(capture_bytes=b"unused")
     assert _run(_fetch_live_bytes("cap-1", None, backend, "demo-slug", None)) is None
-    assert _run(_fetch_live_bytes("cap-1", {"status": "error"}, backend, "demo-slug", None)) is None
+    assert (
+        _run(
+            _fetch_live_bytes("cap-1", {"status": "error"}, backend, "demo-slug", None)
+        )
+        is None
+    )
     assert backend.get_vision_capture_calls == []  # never fetched on a non-ready result
 
 
 def test_fetch_live_bytes_ready_but_missing_bytes_returns_none():
     """ready but the backend has no bytes (404/expired) → None (caller retries)."""
     backend = FakeBackend(capture_bytes=None)
-    assert _run(_fetch_live_bytes("cap-1", {"status": "ready"}, backend, "demo-slug", None)) is None
-    assert backend.get_vision_capture_calls == [("demo-slug", "cap-1", None)]  # it DID try
+    assert (
+        _run(
+            _fetch_live_bytes("cap-1", {"status": "ready"}, backend, "demo-slug", None)
+        )
+        is None
+    )
+    assert backend.get_vision_capture_calls == [
+        ("demo-slug", "cap-1", None)
+    ]  # it DID try
 
 
 def test_fetch_pillow_decodes_png():
@@ -230,33 +262,43 @@ def test_run_vision_query_live_capture_never_touches_pillow():
     msg = _run(
         run_vision_query(
             "what am I pointing at?",
-            request_capture=rc, vision_client=vc, backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"), room_id="room-1", api_url=None,
+            request_capture=rc,
+            vision_client=vc,
+            backend_client=backend,
+            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"),
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert vc.calls[0][2] == "image/jpeg"          # reasoned over the live capture
+    assert vc.calls[0][2] == "image/jpeg"  # reasoned over the live capture
     assert "circled the lead actor" in msg["content"]
-    assert "NOT visible" not in msg["content"]     # no blind-spot note on a live capture
-    assert backend.scene_image_calls == 0          # Pillow NEVER fetched
-    assert rc.calls == 1                            # no retry needed
+    assert "NOT visible" not in msg["content"]  # no blind-spot note on a live capture
+    assert backend.scene_image_calls == 0  # Pillow NEVER fetched
+    assert rc.calls == 1  # no retry needed
 
 
 def test_run_vision_query_ready_no_bytes_retries_then_succeeds():
     """ready but bytes missing → retry the capture once → live Gemini (still no Pillow)."""
     vc = FakeVisionClient(answer="A highlighted paragraph.")
-    backend = FakeBackend(capture_bytes=[None, b"JPEG"], png_b64="must-not-be-used")  # miss then hit
+    backend = FakeBackend(
+        capture_bytes=[None, b"JPEG"], png_b64="must-not-be-used"
+    )  # miss then hit
     rc = _capture_returning({"status": "ready"})
     _run(
         run_vision_query(
             "what did I highlight?",
-            request_capture=rc, vision_client=vc, backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"), room_id="room-1", api_url=None,
+            request_capture=rc,
+            vision_client=vc,
+            backend_client=backend,
+            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"),
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert rc.calls == 2                            # retried once
+    assert rc.calls == 2  # retried once
     assert len(backend.get_vision_capture_calls) == 2
-    assert vc.calls[0][2] == "image/jpeg"          # live capture on the retry
-    assert backend.scene_image_calls == 0          # still no Pillow
+    assert vc.calls[0][2] == "image/jpeg"  # live capture on the retry
+    assert backend.scene_image_calls == 0  # still no Pillow
 
 
 def test_run_vision_query_timeout_no_retry_returns_retry_note():
@@ -267,11 +309,15 @@ def test_run_vision_query_timeout_no_retry_returns_retry_note():
     msg = _run(
         run_vision_query(
             "what am I pointing at?",
-            request_capture=rc, vision_client=vc, backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"), room_id="room-1", api_url=None,
+            request_capture=rc,
+            vision_client=vc,
+            backend_client=backend,
+            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"),
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert rc.calls == 1                            # a timeout is not retried
+    assert rc.calls == 1  # a timeout is not retried
     assert vc.calls == [] and backend.scene_image_calls == 0
     assert "try again" in msg["content"].lower()
 
@@ -284,11 +330,15 @@ def test_run_vision_query_error_retries_then_retry_note():
     msg = _run(
         run_vision_query(
             "what did I draw?",
-            request_capture=rc, vision_client=vc, backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"), room_id="room-1", api_url=None,
+            request_capture=rc,
+            vision_client=vc,
+            backend_client=backend,
+            session_context=SessionContext(slug="demo-slug", current_scene_id="s1"),
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert rc.calls == 2                            # retried the fast error once
+    assert rc.calls == 2  # retried the fast error once
     assert vc.calls == [] and backend.scene_image_calls == 0
     assert "try again" in msg["content"].lower()
 
@@ -315,7 +365,9 @@ def test_run_vision_query_assess_passes_scene_context():
             request_capture=_capture_returning({"status": "ready"}),
             vision_client=vc,
             backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="scene-1"),
+            session_context=SessionContext(
+                slug="demo-slug", current_scene_id="scene-1"
+            ),
             room_id="room-1",
             api_url=None,
         )
@@ -340,7 +392,9 @@ def test_run_vision_query_client_degrade_yields_unavailable_note():
             request_capture=_capture_returning({"status": "ready"}),
             vision_client=vc,
             backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="scene-1"),
+            session_context=SessionContext(
+                slug="demo-slug", current_scene_id="scene-1"
+            ),
             room_id="room-1",
             api_url=None,
         )
@@ -356,17 +410,21 @@ def test_run_vision_query_permission_point_fast_path():
     msg = _run(
         run_vision_query(
             "what am I pointing at?",
-            request_capture=_capture_returning({"status": "error", "error": "permission_required"}),
+            request_capture=_capture_returning(
+                {"status": "error", "error": "permission_required"}
+            ),
             vision_client=vc,
             backend_client=backend,
-            session_context=SessionContext(slug="demo-slug", current_scene_id="scene-1"),
+            session_context=SessionContext(
+                slug="demo-slug", current_scene_id="scene-1"
+            ),
             room_id="room-1",
             api_url=None,
         )
     )
-    assert vc.calls == []                          # Gemini skipped
+    assert vc.calls == []  # Gemini skipped
     assert backend.get_vision_capture_calls == []  # no live-bytes fetch
-    assert backend.scene_image_calls == 0          # no Pillow fetch either
+    assert backend.scene_image_calls == 0  # no Pillow fetch either
     assert "share" in msg["content"].lower() and "screen" in msg["content"].lower()
 
 
@@ -379,14 +437,21 @@ def test_run_vision_query_describe_off_first_nudges_button():
     msg = _run(
         run_vision_query(
             "what is on screen right now?",
-            request_capture=_capture_returning({"status": "error", "error": "permission_required"}),
-            vision_client=vc, backend_client=backend,
-            session_context=sc, room_id="room-1", api_url=None,
+            request_capture=_capture_returning(
+                {"status": "error", "error": "permission_required"}
+            ),
+            vision_client=vc,
+            backend_client=backend,
+            session_context=sc,
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert vc.calls == [] and backend.scene_image_calls == 0       # no Pillow, no Gemini
-    assert "Let the Assistant see your screen" in msg["content"]   # names the button verbatim
-    assert sc.get_describe_share_nudged() is True                 # flag set
+    assert vc.calls == [] and backend.scene_image_calls == 0  # no Pillow, no Gemini
+    assert (
+        "Let the Assistant see your screen" in msg["content"]
+    )  # names the button verbatim
+    assert sc.get_describe_share_nudged() is True  # flag set
 
 
 def test_run_vision_query_describe_off_repeat_uses_pillow():
@@ -400,14 +465,21 @@ def test_run_vision_query_describe_off_repeat_uses_pillow():
     msg = _run(
         run_vision_query(
             "what is on screen right now?",
-            request_capture=_capture_returning({"status": "error", "error": "permission_required"}),
-            vision_client=vc, backend_client=backend,
-            session_context=sc, room_id="room-1", api_url=None,
+            request_capture=_capture_returning(
+                {"status": "error", "error": "permission_required"}
+            ),
+            vision_client=vc,
+            backend_client=backend,
+            session_context=sc,
+            room_id="room-1",
+            api_url=None,
         )
     )
-    assert len(vc.calls) == 1 and vc.calls[0][2] == "image/png"   # Gemini on the base scene
-    assert backend.scene_image_calls == 1                         # Pillow fetched
-    assert "NOT visible" in msg["content"]                        # blind-spot note
+    assert (
+        len(vc.calls) == 1 and vc.calls[0][2] == "image/png"
+    )  # Gemini on the base scene
+    assert backend.scene_image_calls == 1  # Pillow fetched
+    assert "NOT visible" in msg["content"]  # blind-spot note
 
 
 def test_run_vision_query_describe_nudge_resets_on_ready():
@@ -417,23 +489,50 @@ def test_run_vision_query_describe_nudge_resets_on_ready():
     perm = _capture_returning({"status": "error", "error": "permission_required"})
 
     # 1st describe while off → nudge (flag set).
-    _run(run_vision_query("what is on screen?", request_capture=perm,
-                          vision_client=FakeVisionClient(), backend_client=FakeBackend(png_b64="x"),
-                          session_context=sc, room_id="room-1", api_url=None))
+    _run(
+        run_vision_query(
+            "what is on screen?",
+            request_capture=perm,
+            vision_client=FakeVisionClient(),
+            backend_client=FakeBackend(png_b64="x"),
+            session_context=sc,
+            room_id="room-1",
+            api_url=None,
+        )
+    )
     assert sc.get_describe_share_nudged() is True
 
     # Screen-share back on → a ready capture resets the flag.
-    _run(run_vision_query("what is on screen?", request_capture=_capture_returning({"status": "ready"}),
-                          vision_client=FakeVisionClient(), backend_client=FakeBackend(capture_bytes=b"JPEG"),
-                          session_context=sc, room_id="room-1", api_url=None))
+    _run(
+        run_vision_query(
+            "what is on screen?",
+            request_capture=_capture_returning({"status": "ready"}),
+            vision_client=FakeVisionClient(),
+            backend_client=FakeBackend(capture_bytes=b"JPEG"),
+            session_context=sc,
+            room_id="room-1",
+            api_url=None,
+        )
+    )
     assert sc.get_describe_share_nudged() is False
 
     # Off again → first describe of the NEW off-period nudges again (no Pillow).
     be = FakeBackend(png_b64="must-not-be-fetched")
-    msg = _run(run_vision_query("what is on screen?", request_capture=perm,
-                                vision_client=FakeVisionClient(answer="x"), backend_client=be,
-                                session_context=sc, room_id="room-1", api_url=None))
-    assert be.scene_image_calls == 0 and "Let the Assistant see your screen" in msg["content"]
+    msg = _run(
+        run_vision_query(
+            "what is on screen?",
+            request_capture=perm,
+            vision_client=FakeVisionClient(answer="x"),
+            backend_client=be,
+            session_context=sc,
+            room_id="room-1",
+            api_url=None,
+        )
+    )
+    assert (
+        be.scene_image_calls == 0
+        and "Let the Assistant see your screen" in msg["content"]
+    )
 
 
 def test_is_permission_error_tolerates_both_shapes():
@@ -470,13 +569,16 @@ def test_run_vision_query_brackets_gemini_with_vision_state():
         run_vision_query(
             "what do you see?",
             request_capture=_capture_returning({"status": "ready"}),
-            vision_client=vc, backend_client=FakeBackend(capture_bytes=b"JPEG"),
+            vision_client=vc,
+            backend_client=FakeBackend(capture_bytes=b"JPEG"),
             session_context=SessionContext(slug="s", current_scene_id="x"),
-            room_id="room-1", api_url=None, on_vision_state=rec,
+            room_id="room-1",
+            api_url=None,
+            on_vision_state=rec,
         )
     )
-    assert rec.states == ["analyzing", "idle"]   # bracketed the analyze call
-    assert len(vc.calls) == 1                     # and the Gemini call happened
+    assert rec.states == ["analyzing", "idle"]  # bracketed the analyze call
+    assert len(vc.calls) == 1  # and the Gemini call happened
 
 
 def test_run_vision_query_no_vision_state_on_fast_path():
@@ -486,13 +588,18 @@ def test_run_vision_query_no_vision_state_on_fast_path():
     _run(
         run_vision_query(
             "what am I pointing at?",
-            request_capture=_capture_returning({"status": "error", "error": "permission_required"}),
-            vision_client=FakeVisionClient(), backend_client=FakeBackend(),
+            request_capture=_capture_returning(
+                {"status": "error", "error": "permission_required"}
+            ),
+            vision_client=FakeVisionClient(),
+            backend_client=FakeBackend(),
             session_context=SessionContext(slug="s", current_scene_id="x"),
-            room_id="room-1", api_url=None, on_vision_state=rec,
+            room_id="room-1",
+            api_url=None,
+            on_vision_state=rec,
         )
     )
-    assert rec.states == []   # no analyze → no indicator
+    assert rec.states == []  # no analyze → no indicator
 
 
 def test_run_vision_query_vision_state_clears_on_degrade():
@@ -505,10 +612,12 @@ def test_run_vision_query_vision_state_clears_on_degrade():
             vision_client=FakeVisionClient(answer=VISION_UNAVAILABLE),
             backend_client=FakeBackend(capture_bytes=b"JPEG"),
             session_context=SessionContext(slug="s", current_scene_id="x"),
-            room_id="room-1", api_url=None, on_vision_state=rec,
+            room_id="room-1",
+            api_url=None,
+            on_vision_state=rec,
         )
     )
-    assert rec.states == ["analyzing", "idle"]   # cleared despite the degrade
+    assert rec.states == ["analyzing", "idle"]  # cleared despite the degrade
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -545,10 +654,16 @@ def test_canvas_capture_result_routed_before_canvas_dispatch():
     # early-returns — so the canvas/relay dispatch never sees the message.
     # Anchor on the branch condition (not the bare string, which also appears
     # in request_canvas_capture's docstring).
-    blocks = re.findall(r'msg_type == "canvas_capture_result"(.*?)canvas\.register', src, re.S)
-    assert len(blocks) == 2, "capture branch must precede canvas.register in both handlers"
+    blocks = re.findall(
+        r'msg_type == "canvas_capture_result"(.*?)canvas\.register', src, re.S
+    )
+    assert len(blocks) == 2, (
+        "capture branch must precede canvas.register in both handlers"
+    )
     for b in blocks:
-        assert "return" in b, "capture branch must early-return before the canvas dispatch"
+        assert "return" in b, (
+            "capture branch must early-return before the canvas dispatch"
+        )
 
 
 def test_canvas_capture_result_not_in_relay_payload_path():

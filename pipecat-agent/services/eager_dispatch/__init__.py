@@ -33,7 +33,11 @@ import re
 import uuid
 from typing import Optional
 
-from tools.canvas_protocol_tools import EAGER_DISPATCH_VERBS, PendingCommandRegistry, build_canvas_command
+from tools.canvas_protocol_tools import (
+    EAGER_DISPATCH_VERBS,
+    PendingCommandRegistry,
+    build_canvas_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +131,15 @@ async def maybe_fire_eager(
         tracker.mark_fired(idx)
         logger.info(
             "eager_dispatch: fired %s verb=%s commandId=%s",
-            tool_full_name, verb, cmd["commandId"],
+            tool_full_name,
+            verb,
+            cmd["commandId"],
         )
     except Exception as exc:
-        logger.exception("eager_dispatch: send_app_message failed for %s verb=%s: %r", tool_full_name, verb, exc)
+        logger.exception(
+            "eager_dispatch: send_app_message failed for %s verb=%s: %r",
+            tool_full_name,
+            verb,
+            exc,
+        )
         # Don't mark fired — let the regular handler retry.

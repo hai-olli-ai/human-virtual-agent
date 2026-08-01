@@ -103,6 +103,7 @@ def test_hit_emits_started_audio_stopped_envelope():
     """Primed call yields TTSStartedFrame → TTSAudioRawFrame(s) → TTSStoppedFrame
     with ``context_id`` propagated through every frame, and the audio
     frames' sample_rate / num_channels match the primed segment."""
+
     async def body():
         svc = _make_service()
         svc.prime_cached(_make_segment(num_samples=480))  # 1 chunk @ 24kHz mono
@@ -134,6 +135,7 @@ def test_hit_never_emits_bare_output_audio_raw_frame():
     the TTSStoppedFrame lifecycle for cached chunks and the gate's
     expect_next_stop() future hangs forever — narration would stall
     after the first segment."""
+
     async def body():
         svc = _make_service()
         svc.prime_cached(_make_segment(num_samples=480 * 3))  # 3 chunks
@@ -191,6 +193,7 @@ def test_prime_consumed_once():
     segment N could play instead of segment N+1's text — a correctness
     bug the narrator's per-segment prime/speak invariant relies on
     not happening."""
+
     async def fake_run_tts(self, text, context_id):
         yield TTSStoppedFrame(context_id=context_id)
 
@@ -219,6 +222,7 @@ def test_prime_cached_with_none_clears():
     """``prime_cached(None)`` explicitly clears any stashed segment so a
     caller that wants to abort a planned hit (e.g. an in-flight
     interruption) doesn't have to reach into ``_primed`` directly."""
+
     async def fake_run_tts(self, text, context_id):
         yield TTSStoppedFrame(context_id=context_id)
 
@@ -328,6 +332,7 @@ def test_empty_pcm_emits_envelope_no_audio():
     corrupt/empty cache entry (e.g. a 0-byte response from CDN that
     the prefetch didn't catch) would stall the per-segment narration
     loop indefinitely."""
+
     async def body():
         svc = _make_service()
         svc.prime_cached(CachedSegment(pcm=b"", sample_rate=24000, num_channels=1))
@@ -373,7 +378,9 @@ def test_hit_defers_tts_stopped_by_playback_duration():
 
     async def body():
         svc = _make_service()
-        svc.prime_cached(_make_segment(num_samples=num_samples, sample_rate=sample_rate))
+        svc.prime_cached(
+            _make_segment(num_samples=num_samples, sample_rate=sample_rate)
+        )
         t0 = time.monotonic()
         frames = await _collect(svc.run_tts("hello", "ctx"))
         return frames, time.monotonic() - t0

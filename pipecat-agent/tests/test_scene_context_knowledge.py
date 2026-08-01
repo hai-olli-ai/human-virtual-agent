@@ -3,11 +3,12 @@ from scene_context import build_knowledge_context
 
 # Minimal fixtures
 
+
 def _scope(faqs=None, sources=None, urls=None):
     return {
-        "faqs":    faqs    or [],
+        "faqs": faqs or [],
         "sources": sources or [],
-        "urls":    urls    or [],
+        "urls": urls or [],
     }
 
 
@@ -40,7 +41,7 @@ def test_only_flow_scope():
 
 def test_flow_first_then_scene():
     knowledge = {
-        "flow":  _scope(faqs=[{"question": "FQ", "answer": "FA"}]),
+        "flow": _scope(faqs=[{"question": "FQ", "answer": "FA"}]),
         "scene": _scope(faqs=[{"question": "SQ", "answer": "SA"}]),
     }
     out = build_knowledge_context(knowledge)
@@ -54,7 +55,9 @@ def test_faq_before_documents_before_urls_within_scope():
         "scene": _scope(
             faqs=[{"question": "Q", "answer": "A"}],
             sources=[{"file_name": "doc.pdf", "extracted_text": "DOC TEXT"}],
-            urls=[{"url": "https://x", "title": "Xpage", "markdown_content": "URL TEXT"}],
+            urls=[
+                {"url": "https://x", "title": "Xpage", "markdown_content": "URL TEXT"}
+            ],
         ),
         "flow": None,
     }
@@ -81,7 +84,13 @@ def test_empty_text_items_are_skipped():
 def test_missing_title_falls_back_to_url():
     knowledge = {
         "scene": _scope(
-            urls=[{"url": "https://fallback.example", "title": None, "markdown_content": "content"}],
+            urls=[
+                {
+                    "url": "https://fallback.example",
+                    "title": None,
+                    "markdown_content": "content",
+                }
+            ],
         ),
         "flow": None,
     }

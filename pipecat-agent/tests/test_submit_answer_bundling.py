@@ -42,13 +42,19 @@ def _make_ctx(semantic_state: dict | None, send_responses: list):
       - other BaseException → rejects with a synthetic TEST_ERROR
     """
     manifest_registry = MagicMock()
-    manifest_registry.current = MagicMock(return_value={
-        "pageType": "quiz",
-        "capabilities": {
-            "action": {"verbs": ["submit_answer", "request_hint", "show_explanation"]},
-            "control": {"verbs": ["next_question", "previous_question", "restart", "clear"]},
-        },
-    })
+    manifest_registry.current = MagicMock(
+        return_value={
+            "pageType": "quiz",
+            "capabilities": {
+                "action": {
+                    "verbs": ["submit_answer", "request_hint", "show_explanation"]
+                },
+                "control": {
+                    "verbs": ["next_question", "previous_question", "restart", "clear"]
+                },
+            },
+        }
+    )
     manifest_registry.state = MagicMock(return_value=semantic_state)
 
     pending = PendingCommandRegistry()
@@ -63,11 +69,14 @@ def _make_ctx(semantic_state: dict | None, send_responses: list):
                 f"unexpected dispatch — exhausted send_responses; payload={payload!r}"
             )
         if isinstance(resp, CanvasCommandError):
-            pending.reject(cmd_id, {
-                "code": resp.code,
-                "message": resp.message,
-                "details": resp.details,
-            })
+            pending.reject(
+                cmd_id,
+                {
+                    "code": resp.code,
+                    "message": resp.message,
+                    "details": resp.details,
+                },
+            )
         elif isinstance(resp, BaseException):
             pending.reject(cmd_id, {"code": "TEST_ERROR", "message": str(resp)})
         else:

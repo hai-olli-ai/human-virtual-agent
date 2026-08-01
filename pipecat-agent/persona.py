@@ -3,6 +3,7 @@
 Session 45: Uses Session 43's persona-prompt endpoint for the base prompt,
 then enriches with scene snapshot data for instruction + display mode awareness.
 """
+
 import asyncio
 
 from loguru import logger
@@ -143,8 +144,12 @@ async def build_system_prompt(
     if room_id:
         if snapshot is None:
             snapshot, persona_prompt = await asyncio.gather(
-                get_scene_snapshot(room_id, api_url, scene_id=snapshot_scene_id or None),
-                get_persona_prompt(room_id, api_url, scene_id=snapshot_scene_id or None),
+                get_scene_snapshot(
+                    room_id, api_url, scene_id=snapshot_scene_id or None
+                ),
+                get_persona_prompt(
+                    room_id, api_url, scene_id=snapshot_scene_id or None
+                ),
             )
         else:
             persona_scene_id = (
@@ -153,7 +158,9 @@ async def build_system_prompt(
                 or None
             )
             persona_prompt = await get_persona_prompt(
-                room_id, api_url, scene_id=str(persona_scene_id) if persona_scene_id else None
+                room_id,
+                api_url,
+                scene_id=str(persona_scene_id) if persona_scene_id else None,
             )
 
     live_room_block = (snapshot or {}).get("live_room") or {}
@@ -167,7 +174,9 @@ async def build_system_prompt(
     # and the agent's translation map are guaranteed in sync.
     element_aliases: dict[str, str] = {}
     if snapshot:
-        element_aliases = compute_element_aliases(current_scene_block.get("elements") or [])
+        element_aliases = compute_element_aliases(
+            current_scene_block.get("elements") or []
+        )
     if aliases_out is not None:
         aliases_out.clear()
         aliases_out.update(element_aliases)
@@ -187,13 +196,17 @@ async def build_system_prompt(
 
             if snapshot:
                 # Knowledge section (S56) — after persona/audience, before tools
-                knowledge_block = _build_knowledge_block(snapshot, flow_cache=flow_cache)
+                knowledge_block = _build_knowledge_block(
+                    snapshot, flow_cache=flow_cache
+                )
                 if knowledge_block:
                     body_parts.append(knowledge_block)
 
                 # LINK NARRATION (S63 Block 7) — after KNOWLEDGE.
                 # S65 (Option B) — link nested under current_scene.
-                link_narration = build_link_narration_directive(current_scene_block.get("link"))
+                link_narration = build_link_narration_directive(
+                    current_scene_block.get("link")
+                )
                 if link_narration:
                     body_parts.append(link_narration)
 

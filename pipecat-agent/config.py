@@ -1,4 +1,5 @@
 """Configuration for the Human Virtual Pipecat agent."""
+
 import os
 from dotenv import load_dotenv
 
@@ -24,7 +25,9 @@ DEFAULT_SCENE_ID = os.getenv("DEFAULT_SCENE_ID", "")
 DEFAULT_ROOM_ID = os.getenv("DEFAULT_ROOM_ID", "")
 
 # TTS voice configuration
-CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121")
+CARTESIA_VOICE_ID = os.getenv(
+    "CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"
+)
 # Default: "British Reading Lady" — will be customizable per avatar later
 
 # ──────────────────────────────────────────────────────────────────────
@@ -82,7 +85,7 @@ AGENT_ANNOTATE_TIMEOUT_MS = int(os.getenv("AGENT_ANNOTATE_TIMEOUT_MS", "2000"))
 
 # LLM model — must support vision for scene understanding (Session 46)
 # gpt-4.1 and gpt-4o both support vision
-#LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
+# LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
 
 

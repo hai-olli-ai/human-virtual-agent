@@ -44,7 +44,9 @@ def test_vision_client_live_describes_image():
     answer = asyncio.run(vc.analyze_image(make_probe_image(), "describe"))
 
     # The real call must NOT degrade to the fallback sentinel.
-    assert answer != VISION_UNAVAILABLE, "real Gemini call degraded to VISION_UNAVAILABLE"
+    assert answer != VISION_UNAVAILABLE, (
+        "real Gemini call degraded to VISION_UNAVAILABLE"
+    )
     assert answer.strip(), "vision returned empty text"
 
     # Proof it actually saw the pixels (not just that the API answered).

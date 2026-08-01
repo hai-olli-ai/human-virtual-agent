@@ -96,9 +96,7 @@ class CachedFirstTTSService(CartesiaTTSService):
             self._primed = None
         await super().process_frame(frame, direction)
 
-    async def run_tts(
-        self, text: str, context_id: str
-    ) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         seg = self._consume()
         if seg is None:
             # Cache miss — live path. Cartesia's ``run_tts`` itself only
@@ -114,7 +112,10 @@ class CachedFirstTTSService(CartesiaTTSService):
 
         log.info(
             "[narration-cache] HIT bytes=%d sr=%d nch=%d ctx=%s",
-            len(seg.pcm), seg.sample_rate, seg.num_channels, context_id,
+            len(seg.pcm),
+            seg.sample_rate,
+            seg.num_channels,
+            context_id,
         )
         # Metric parity with the live path: without these, Grafana TTFB
         # graphs would step-function at the cache boundary (no TTFB
@@ -132,7 +133,7 @@ class CachedFirstTTSService(CartesiaTTSService):
 
         for i in range(0, len(seg.pcm), chunk_bytes):
             yield TTSAudioRawFrame(
-                audio=seg.pcm[i:i + chunk_bytes],
+                audio=seg.pcm[i : i + chunk_bytes],
                 sample_rate=seg.sample_rate,
                 num_channels=seg.num_channels,
                 context_id=context_id,

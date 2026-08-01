@@ -32,7 +32,15 @@ from dotenv import load_dotenv
 # Broad on purpose: the goal is "the model actually saw the image", not exact
 # phrasing — Gemini said "blue square" for the rectangle in the A-* probe.
 EXPECTED_TOKENS = (
-    "circle", "red", "blue", "square", "rectangle", "probe", "7q", "shape", "text",
+    "circle",
+    "red",
+    "blue",
+    "square",
+    "rectangle",
+    "probe",
+    "7q",
+    "shape",
+    "text",
 )
 
 
@@ -42,12 +50,14 @@ def make_probe_image() -> bytes:
 
     img = Image.new("RGB", (480, 280), "white")
     d = ImageDraw.Draw(img)
-    d.ellipse([40, 60, 200, 220], fill=(220, 30, 30))     # red circle (left)
+    d.ellipse([40, 60, 200, 220], fill=(220, 30, 30))  # red circle (left)
     d.rectangle([260, 60, 440, 220], fill=(30, 60, 220))  # blue rectangle (right)
     try:
         from PIL import ImageFont
 
-        fnt = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 40)
+        fnt = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf", 40
+        )
     except Exception:
         fnt = None  # default bitmap font — shapes/colors carry the signal anyway
     d.text((150, 12), "PROBE 7Q", fill=(0, 0, 0), font=fnt)
@@ -79,7 +89,9 @@ async def _amain() -> int:
         return 0
 
     # ── Layer 2: direct SDK call to surface the raw failure ───────────
-    print("[direct] production path degraded; calling google-genai directly to surface the error…")
+    print(
+        "[direct] production path degraded; calling google-genai directly to surface the error…"
+    )
     try:
         from google import genai
         from google.genai import types
@@ -104,17 +116,23 @@ async def _amain() -> int:
         r = await client.aio.models.generate_content(
             model=model,
             contents=parts,
-            config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_level="low")),
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="low")
+            ),
         )
         print(f"[direct +thinking] OK model={model!r} -> {_text(r)!r}")
     except Exception as e:
         print(f"[direct +thinking] ERROR {type(e).__name__}: {str(e)[:600]}")
         try:
             r2 = await client.aio.models.generate_content(model=model, contents=parts)
-            print(f"[direct  plain  ] OK model={model!r} (thinking_config was the issue) -> {_text(r2)!r}")
+            print(
+                f"[direct  plain  ] OK model={model!r} (thinking_config was the issue) -> {_text(r2)!r}"
+            )
         except Exception as e2:
             print(f"[direct  plain  ] ERROR {type(e2).__name__}: {str(e2)[:600]}")
-    return 1  # production path degraded — a failure signal even if the direct call worked
+    return (
+        1  # production path degraded — a failure signal even if the direct call worked
+    )
 
 
 def main() -> int:

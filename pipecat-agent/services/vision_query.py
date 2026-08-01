@@ -81,7 +81,9 @@ def _is_permission_error(capture_result) -> bool:
     """
     if not capture_result:
         return False
-    blob = f"{capture_result.get('status', '')} {capture_result.get('error', '')}".lower()
+    blob = (
+        f"{capture_result.get('status', '')} {capture_result.get('error', '')}".lower()
+    )
     return "permission" in blob
 
 
@@ -191,8 +193,10 @@ async def run_vision_query(
         (capture_id, capture_result), scene_context = await asyncio.gather(
             request_capture(question),
             _fetch_assess_scene_context(
-                backend_client=backend_client, scene_id=scene_id,
-                room_id=room_id, api_url=api_url,
+                backend_client=backend_client,
+                scene_id=scene_id,
+                room_id=room_id,
+                api_url=api_url,
             ),
         )
     else:
@@ -204,11 +208,19 @@ async def run_vision_query(
     # denial is a stable state (no retry); a timeout (capture_result is None)
     # already waited the full budget, so don't double the dead-air — fall through
     # to the retry note instead.
-    img = await _fetch_live_bytes(capture_id, capture_result, backend_client, slug, api_url)
-    if img is None and capture_result is not None and not _is_permission_error(capture_result):
+    img = await _fetch_live_bytes(
+        capture_id, capture_result, backend_client, slug, api_url
+    )
+    if (
+        img is None
+        and capture_result is not None
+        and not _is_permission_error(capture_result)
+    ):
         logger.info("[VISION] live capture transient miss → retrying once")
         capture_id, capture_result = await request_capture(question)
-        img = await _fetch_live_bytes(capture_id, capture_result, backend_client, slug, api_url)
+        img = await _fetch_live_bytes(
+            capture_id, capture_result, backend_client, slug, api_url
+        )
 
     # Screen-share is confirmed ON whenever a capture comes back 'ready' — reset
     # the describe nudge so the NEXT off-period asks once more before Pillow
@@ -224,7 +236,9 @@ async def run_vision_query(
         if on_vision_state is not None:
             await on_vision_state("analyzing")
         try:
-            return await vision_client.analyze_image(image_bytes, mode, scene_context, mime_type=mime)
+            return await vision_client.analyze_image(
+                image_bytes, mode, scene_context, mime_type=mime
+            )
         finally:
             if on_vision_state is not None:
                 await on_vision_state("idle")
@@ -245,7 +259,8 @@ async def run_vision_query(
             # base scene can't show what they drew anyway.
             logger.info(
                 "[VISION] capture {} permission-denied + mode={} → screen-share fast-path",
-                capture_id, mode,
+                capture_id,
+                mode,
             )
             return {"role": "developer", "content": _SHARE_SCREEN_NOTE}
         # 'describe' — two-stage (decision 2: describe-specific). The FIRST
@@ -254,7 +269,9 @@ async def run_vision_query(
         # falls back to the base-scene Pillow render.
         if not session_context.get_describe_share_nudged():
             session_context.set_describe_share_nudged(True)
-            logger.info("[VISION] describe + screen-share off (first) → nudge to enable screen-share")
+            logger.info(
+                "[VISION] describe + screen-share off (first) → nudge to enable screen-share"
+            )
             return {"role": "developer", "content": _DESCRIBE_SHARE_NUDGE_NOTE}
         logger.info("[VISION] describe + screen-share off (repeat) → Pillow base scene")
         png = await _fetch_pillow(backend_client, room_id, api_url)
@@ -263,7 +280,10 @@ async def run_vision_query(
         answer = await _analyze(png, "image/png")
         if answer == VISION_UNAVAILABLE:
             return {"role": "developer", "content": _UNAVAILABLE_NOTE}
-        return {"role": "developer", "content": f"[vision: {mode}] {answer}{_BLIND_SPOT_NOTE}"}
+        return {
+            "role": "developer",
+            "content": f"[vision: {mode}] {answer}{_BLIND_SPOT_NOTE}",
+        }
 
     # 3. Transient failure with screen-share ON (timeout, or both attempts missed)
     #    — never substitute the annotation-less Pillow scene; ask for a retry.

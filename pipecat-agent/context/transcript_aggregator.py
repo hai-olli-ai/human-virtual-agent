@@ -46,7 +46,7 @@ class WordBoundaryAggregator:
         if last_ws < 0:
             return ""
         ready = self._buf[:last_ws].strip()
-        self._buf = self._buf[last_ws + 1:]
+        self._buf = self._buf[last_ws + 1 :]
         return ready
 
     def flush(self) -> str:

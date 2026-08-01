@@ -13,6 +13,7 @@ from scene_context import (
 # build_recipient_context
 # -----------------------
 
+
 def test_recipient_context_none_returns_empty():
     assert build_recipient_context(None) == ""
 
@@ -47,6 +48,7 @@ def test_recipient_context_includes_preamble():
 # -----------------------
 # build_language_directive
 # -----------------------
+
 
 @pytest.mark.parametrize(
     "code,expected_name",
@@ -98,6 +100,7 @@ def test_language_reminder_unknown_falls_back():
 # build_system_prompt assembly
 # -----------------------
 
+
 def test_system_prompt_includes_language_at_top_and_bottom():
     # S65 (Option B) — snapshot is nested under live_room / current_scene.
     # persona is a test-only top-level field (not in production snapshot).
@@ -125,9 +128,16 @@ def test_system_prompt_includes_language_at_top_and_bottom():
     assert "Remember" in last_section or "remember" in last_section.lower()
 
 
-def _nested_snap(*, language="en", recipient_prompt=None, persona="Assistant.",
-                  knowledge=None, instruction="Help.", display_mode="normal",
-                  elements=None) -> dict:
+def _nested_snap(
+    *,
+    language="en",
+    recipient_prompt=None,
+    persona="Assistant.",
+    knowledge=None,
+    instruction="Help.",
+    display_mode="normal",
+    elements=None,
+) -> dict:
     """Helper for the S65 (Option B) nested snapshot fixture."""
     return {
         "live_room": {"language": language, "recipient_prompt": recipient_prompt},
@@ -200,6 +210,7 @@ def test_system_prompt_handles_all_nine_languages():
 # Deepgram language resolver (Block 5)
 # -----------------------
 
+
 def test_deepgram_language_resolver_known_codes():
     from config import resolve_deepgram_language
 
@@ -209,14 +220,17 @@ def test_deepgram_language_resolver_known_codes():
 
 def test_deepgram_language_resolver_unknown_falls_back_to_multi():
     from config import resolve_deepgram_language
+
     assert resolve_deepgram_language("klingon") == "multi"
 
 
 def test_deepgram_language_resolver_none_defaults_to_en():
     from config import resolve_deepgram_language
+
     assert resolve_deepgram_language(None) == "en"
 
 
 def test_deepgram_language_resolver_empty_defaults_to_en():
     from config import resolve_deepgram_language
+
     assert resolve_deepgram_language("") == "en"
