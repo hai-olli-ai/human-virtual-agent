@@ -4,4 +4,4 @@ secret_set = "human-virtual-agent-secrets"
 agent_profile = "agent-2x"
 
 [scaling]
-  min_agents = 0
+  min_agents = 1
