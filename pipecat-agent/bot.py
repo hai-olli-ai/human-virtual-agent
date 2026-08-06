@@ -23,6 +23,7 @@ import json
 import os
 import time
 import uuid
+from urllib.parse import urlparse
 
 import httpx
 
@@ -193,6 +194,25 @@ if CLOUD_OUTPUT_MODE not in VALID_OUTPUT_MODES:
         CLOUD_OUTPUT_MODE,
     )
     CLOUD_OUTPUT_MODE = "cartesia"
+
+# ── SoulX renderer, soulx-audio.v1 (avatar-production branch) ────────────────
+# When SOULX_WS_URL is set, the relay pipeline runs TTS locally and streams PCM to the
+# Modal renderer over a WebSocket instead of forwarding TEXT over Daily app-messages
+# (avatar-relay.v1). Unset => the legacy text-relay path is untouched.
+SOULX_WS_URL = os.getenv("SOULX_WS_URL", "").strip()
+SOULX_AUTH_TOKEN = os.getenv("SOULX_AUTH_TOKEN", "").strip()
+# The renderer must join the room within this long or the session degrades to voice-only.
+# The pre-existing code waits on an UN-TIMED asyncio.Event here, which is the silent-bot
+# deadlock: if the renderer never arrives the visitor gets a bot that never speaks.
+#
+# 300s because a COLD Modal container was measured at 134s once and 204s after a full
+# scaledown (schedule + image pull + 15GB volume mount + Lite load + warmup) — the spread
+# matters more than the median, so this is set above the worst observed case. At the
+# original 60s default every cold session silently degraded to voice-only. This is a
+# deliberate correctness-over-UX trade for the current phase: a visitor may wait a long
+# time on a cold start. The real fix is warm containers (min_containers /
+# buffer_containers / memory snapshots) in Week 3, after which this drops back down.
+AVATAR_READY_TIMEOUT_S = float(os.getenv("AVATAR_READY_TIMEOUT_S", "300"))
 
 # Bot names
 CLOUD_BOT_NAME = (
@@ -498,11 +518,19 @@ class HumanOnlyAudioInputFilter(FrameProcessor):
 
 
 class AvatarReadyGateProcessor(FrameProcessor):
-    """Blocks relay-mode LLM traffic until the avatar bot reports ready."""
+    """Blocks relay-mode LLM traffic until the avatar bot reports ready.
 
-    def __init__(self, ready_event: asyncio.Event):
+    The wait is BOUNDED. It used to be an un-timed `Event.wait()`, which is the
+    silent-bot deadlock: if the avatar never arrives — the box is down, the invite
+    failed (the backend logs that as non-fatal and continues) — this blocks forever and
+    the visitor sits with a bot that never speaks and no error anywhere. On timeout we
+    open the gate and let the session run voice-only instead.
+    """
+
+    def __init__(self, ready_event: asyncio.Event, timeout_s: float | None = None):
         super().__init__()
         self._ready_event = ready_event
+        self._timeout_s = timeout_s
         self._waiting_logged = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -519,8 +547,20 @@ class AvatarReadyGateProcessor(FrameProcessor):
                     frame.__class__.__name__,
                 )
                 self._waiting_logged = True
-            await self._ready_event.wait()
-            logger.info("Avatar relay bot ready; resuming queued pipeline traffic")
+            try:
+                if self._timeout_s:
+                    await asyncio.wait_for(self._ready_event.wait(), timeout=self._timeout_s)
+                else:
+                    await self._ready_event.wait()
+                logger.info("Avatar relay bot ready; resuming queued pipeline traffic")
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Avatar never became ready after {}s — opening the gate and "
+                    "continuing WITHOUT the avatar. Never leave the visitor with a "
+                    "silent bot.",
+                    self._timeout_s,
+                )
+                self._ready_event.set()
             self._waiting_logged = False
 
         await self.push_frame(frame, direction)
@@ -2132,13 +2172,29 @@ async def run_bot_relay(
     # snapshot AGAIN for scripts). See run_bot_classic's mirror.
     scene_snapshot = None
     scene_image_b64 = None
+    # avatar_config joins the gather on this branch too (classic already fetched it —
+    # bot.py:851). The relay pipeline now runs Cartesia locally, so it needs the
+    # per-user cloned `voiceModelId`; without it every avatar would speak in the
+    # default stock voice.
+    avatar_config = None
     if room_id:
-        from api_client import get_scene_image_base64, get_scene_snapshot
+        from api_client import (
+            get_avatar_config,
+            get_scene_image_base64,
+            get_scene_snapshot,
+        )
 
-        scene_snapshot, scene_image_b64 = await asyncio.gather(
+        scene_snapshot, avatar_config, scene_image_b64 = await asyncio.gather(
             get_scene_snapshot(room_id, api_url),
+            get_avatar_config(room_id, api_url),
             get_scene_image_base64(room_id, api_url),
         )
+        if avatar_config:
+            logger.info(
+                "Avatar config: name={} voiceModelId={}",
+                avatar_config.get("name"),
+                avatar_config.get("voiceModelId"),
+            )
         if scene_image_b64:
             logger.info(
                 "Fetched scene canvas image ({} chars base64)", len(scene_image_b64)
@@ -2729,8 +2785,71 @@ async def run_bot_relay(
         get_avatar_participant_id,
         get_local_participant_id,
     )
-    avatar_ready_gate = AvatarReadyGateProcessor(avatar_ready_event)
+    avatar_ready_gate = AvatarReadyGateProcessor(
+        avatar_ready_event, timeout_s=AVATAR_READY_TIMEOUT_S
+    )
     relay_processor = AvatarRelayProcessor(output_transport, get_avatar_participant_id)
+
+    # ── soulx-audio.v1: TTS moves INTO the agent ──────────────────────────────
+    # Legacy path (SOULX_WS_URL unset) is untouched: forward TEXT over Daily
+    # app-messages and let SoulX synthesize. New path: synthesize here with Cartesia
+    # (so per-user cloned voices work exactly as in the classic pipeline) and stream
+    # PCM to the Modal renderer, which returns synced video.
+    soulx_client = None
+    soulx_sink = None
+    soulx_tail: list = [relay_processor]
+
+    if SOULX_WS_URL:
+        from services.soulx_audio import SoulXAudioClient, SoulXAudioSink
+
+        relay_voice_id = (avatar_config or {}).get("voiceModelId") or CARTESIA_VOICE_ID
+        # Same construction as the classic pipeline (bot.py:1046) — pinned to the
+        # narration cache's sample_rate + model so cached segments stay replayable.
+        relay_tts = CachedFirstTTSService(
+            api_key=CARTESIA_API_KEY,
+            sample_rate=NARRATION_AUDIO_SAMPLE_RATE,
+            text_filters=[MarkdownTextFilter()],
+            settings=CartesiaTTSService.Settings(
+                voice=relay_voice_id,
+                model=NARRATION_TTS_MODEL_ID,
+            ),
+        )
+
+        avatar_token = await _mint_avatar_token(getattr(runner_args, "room_url", ""))
+        # The renderer REQUIRES the room avatar's photo (no-fallback policy,
+        # 2026-08-06): it conditions the model on this image per session, so
+        # the room shows the SELECTED avatar or errors — never a default face.
+        avatar_photo_url = (avatar_config or {}).get("profilePhotoUrl") or ""
+        soulx_client = SoulXAudioClient(
+            ws_url=SOULX_WS_URL,
+            auth_token=SOULX_AUTH_TOKEN,
+            room_url=getattr(runner_args, "room_url", ""),
+            room_token=avatar_token or "",
+            sample_rate=NARRATION_AUDIO_SAMPLE_RATE,
+            ready_timeout_s=AVATAR_READY_TIMEOUT_S,
+            avatar_ref=avatar_photo_url,
+        )
+        if avatar_photo_url:
+            connected = await soulx_client.connect()
+        else:
+            # Don't burn a GPU cold start on a session the renderer will
+            # refuse anyway — same outcome (voice-only + loud error), decided
+            # here instead of after a 2-minute container spin-up.
+            logger.error(
+                "SoulX: avatar config has no profilePhotoUrl — no-fallback "
+                "policy forbids a default identity; running voice-only"
+            )
+            connected = False
+        # Release the gate either way. Connected => the avatar is in the room. Failed =>
+        # voice-only fallback, which is still infinitely better than a silent bot.
+        avatar_ready_event.set()
+        logger.info(
+            "SoulX renderer {} — relay pipeline running in {} mode",
+            "connected" if connected else "UNAVAILABLE",
+            "avatar" if connected else "voice-only fallback",
+        )
+        soulx_sink = SoulXAudioSink(soulx_client)
+        soulx_tail = [relay_tts, soulx_sink]
 
     # ── Pipeline ──
     pipeline = Pipeline(
@@ -2745,9 +2864,9 @@ async def run_bot_relay(
             thinking_notifier,  # Notify frontend of LLM thinking state
             avatar_transcript_fwd,  # Forward avatar LLM text to frontend
             speaking_notifier,  # Notify frontend of speaking state
-            relay_processor,  # Relay text to SoulX avatar bot
+            *soulx_tail,  # TTS -> WS to renderer, or the legacy text relay
             assistant_aggregator,  # Add bot response to conversation history
-            output_transport,  # Data channel (no audio out)
+            output_transport,  # Data channel (+ audio only on fallback)
         ]
     )
 
@@ -2775,12 +2894,12 @@ async def run_bot_relay(
         except Exception:
             logger.exception("Failed to send relay message type={}", msg_type)
 
-    # ── Scene narrator (S65 G3 — relay pipeline, primary SoulX voice only) ──
-    # The relay pipeline doesn't drive a local TTS, so per-segment voice
-    # switching is not exposed — SoulX renders narration in its single
-    # configured voice (the script-avatar voice clone is a v0.2 punt per
-    # CLAUDE.md S65). The narrator still owns scene-script iteration +
-    # idempotency so the relay and classic paths share the same loop.
+    # ── Scene narrator (S65 G3 — relay pipeline) ──
+    # LEGACY path (SOULX_WS_URL unset): the pipeline drives no local TTS, so
+    # narration text is forwarded over `avatar-relay.v1` and SoulX synthesizes it
+    # in its single configured voice (per-script-avatar voice = the v0.2 punt per
+    # CLAUDE.md S65). The narrator owns scene-script iteration + idempotency so
+    # the relay and classic paths share the same loop.
     #
     # `relay_turn_state` is the single mutable holder for the
     # currently-open RELAY_TURN. _relay_speak lazily opens the turn on
@@ -2813,23 +2932,59 @@ async def run_bot_relay(
         relay_turn_state["turn_id"] = None
         relay_turn_state["seq"] = 0
 
+    async def _soulx_narration_speak(text: str) -> None:
+        """Narrate one segment through the pipeline's own TTS (soulx-audio.v1).
+
+        The legacy `_relay_speak` forwards TEXT to a SoulX bot that ran its own
+        TTS. The Modal renderer consumes PCM, not text, so on this path those
+        app-messages go nowhere and a scripted scene is SILENT — worse, the
+        run still reports success, so `_seed_session_context_once` takes the
+        `spoke_script` branch and suppresses the greeting too.
+
+        Queuing a TTSSpeakFrame is exactly what the classic pipeline does
+        (`_classic_speak`); the audio then takes the identical route a
+        conversational turn already takes — relay_tts -> SoulXAudioSink -> WS
+        -> renderer -> synced video.
+
+        No per-segment await (the classic path's NarrationCompletionGate):
+        `plan_narration_segments` pins every relay segment to voice_id=None and
+        the narrator is built with set_voice/prefetch/prime all None, so the
+        gate's two jobs — voice switching and cache priming — are both inert
+        here. Ordering is already guaranteed: the segments are frames in one
+        pipeline. `script_complete` therefore still fires at queue-time rather
+        than playout, which is the pre-existing relay behaviour (CLAUDE.md
+        "Known v1 relay limitations"), not a new regression.
+        """
+        await task.queue_frames([TTSSpeakFrame(text=text)])
+
+    # In soulx-audio mode the pipeline owns a real Cartesia service, so narration
+    # speaks in the SAME (per-user cloned) voice as conversation. Legacy text
+    # relay keeps its old behaviour untouched.
+    _narration_speak = _soulx_narration_speak if soulx_client is not None else _relay_speak
+
     narrator = SceneNarrator(
         primary_voice_id=None,
         set_voice=None,
-        speak=_relay_speak,
+        speak=_narration_speak,
     )
 
     # ── Auto Play Phase A — narration-run machinery (relay) ──
     # Known v1 limitations (recorded per the Phase A brief, alongside the
-    # existing relay narration punts): _relay_speak is fire-and-forget
-    # text to SoulX, so there is NO drain-wait (script_complete still
-    # fires at text-forwarded, not at SoulX playout-complete) and NO
-    # speech-interruption awareness for narration turns (the narration
-    # turn bypasses AvatarRelayProcessor, whose InterruptionFrame
-    # handling only covers LLM turns). "stop" is a best-effort cancel:
-    # the run task is cancelled and the open narration turn is
-    # RELAY_INTERRUPTed so SoulX stops rendering what it already
-    # received.
+    # existing relay narration punts): narration speak is fire-and-forget,
+    # so there is NO drain-wait (script_complete fires when the segment is
+    # handed off, not at playout-complete) and NO speech-interruption
+    # awareness for narration turns (the narration turn bypasses
+    # AvatarRelayProcessor, whose InterruptionFrame handling only covers
+    # LLM turns). "stop" is a best-effort cancel: the run task is
+    # cancelled and the open narration turn is RELAY_INTERRUPTed so SoulX
+    # stops rendering what it already received.
+    #
+    # soulx-audio.v1 narrows both punts without closing them. Narration now
+    # rides the pipeline's own TTS, so an InterruptionFrame DOES flush the
+    # queued narration audio (it never reached the legacy text relay at
+    # all). The drain-wait still needs the classic path's
+    # NarrationCompletionGate, which is deliberately not wired here — see
+    # _soulx_narration_speak.
 
     async def _relay_interrupt_narration_turn() -> None:
         """Best-effort SoulX-side flush of the open narration turn.
@@ -2903,11 +3058,25 @@ async def run_bot_relay(
         """
         spoke_script = False
         try:
+            # Turn grouping: the renderer must see the whole script (all
+            # segments + invitation) as ONE turn, or its finalize/idle race
+            # injects silent video between segments (the 2026-08-05 desync).
+            # The group is CLOSED by the frames themselves (debounced in the
+            # sink) — NOT here: narration speak is fire-and-forget, so this
+            # coroutine returns while envelopes are still in flight, and an
+            # eager close would re-create the per-segment boundaries. No
+            # cancellation cleanup either: a superseding run re-arms the
+            # group (merging turns, which is boundary-free and safe), and
+            # barge-in clears the open turn via the sink's interrupt path.
+            if soulx_sink is not None and (snap.get("current_scene") or {}).get(
+                "has_script"
+            ):
+                soulx_sink.begin_turn_group()
             try:
                 spoke_script = await run_scene_narration(
                     snap,
                     narrator=narrator,
-                    speak_followup=_relay_speak,
+                    speak_followup=_narration_speak,
                     force=force,
                 )
             except Exception as exc:
@@ -2949,7 +3118,19 @@ async def run_bot_relay(
             logger.info(
                 "Waiting for avatar relay bot to become ready before greeting visitor"
             )
-            await avatar_ready_event.wait()
+            # Bounded, for the same reason as AvatarReadyGateProcessor: an un-timed
+            # wait here means the greeting never fires and the visitor is met by
+            # silence with nothing surfaced.
+            try:
+                await asyncio.wait_for(
+                    avatar_ready_event.wait(), timeout=AVATAR_READY_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Avatar not ready after {}s — greeting the visitor anyway",
+                    AVATAR_READY_TIMEOUT_S,
+                )
+                avatar_ready_event.set()
         if greeting_sent:
             return
 
@@ -2971,11 +3152,18 @@ async def run_bot_relay(
             # mid-narration never strands SoulX on a dangling turn; the
             # propagating CancelledError then suppresses the
             # script_complete emit below (wire rule 2b).
+            # Same turn-grouping as _narrate_and_complete: session-start
+            # narration is THE path a scripted room takes, and the whole
+            # script must reach the renderer as one boundary-free turn.
+            if soulx_sink is not None and (
+                scene_snapshot.get("current_scene") or {}
+            ).get("has_script"):
+                soulx_sink.begin_turn_group()
             try:
                 spoke_script = await run_scene_narration(
                     scene_snapshot,
                     narrator=narrator,
-                    speak_followup=_relay_speak,
+                    speak_followup=_narration_speak,
                 )
             finally:
                 await asyncio.shield(_relay_close_turn())
@@ -3047,10 +3235,12 @@ async def run_bot_relay(
 
             # ── S65c Block 5 — manual visitor-action triggers ──
             # See classic pipeline for full rationale. Relay-pipeline
-            # specifics: ``request_narrate`` uses ``_relay_speak`` and
-            # MUST close the open RELAY_TURN before emitting
+            # specifics: ``request_narrate`` speaks via ``_narration_speak``
+            # and MUST close any open RELAY_TURN before emitting
             # ``script_complete``, otherwise SoulX waits forever for
-            # TURN_END (S65 Bug #2 lesson, applied to manual replay).
+            # TURN_END (S65 Bug #2 lesson, applied to manual replay). On
+            # soulx-audio.v1 no RELAY_TURN is opened, so that close is a
+            # no-op — kept because the legacy text path still needs it.
             # ``request_quiz`` is identical to classic — quiz generation
             # doesn't touch the SoulX turn lifecycle.
             if msg_type == "request_narrate":
@@ -3440,6 +3630,40 @@ async def bot(runner_args: RunnerArguments):
         )
 
 
+async def _mint_avatar_token(room_url: str) -> str | None:
+    """Mint an owner Daily token so the renderer can join this room as the avatar.
+
+    The agent mints it rather than the backend so this whole feature needs ZERO backend
+    changes — the renderer receives it in `session_init`. When the token source moves
+    server-side later, only where it comes from changes; the renderer is unaffected.
+    """
+    daily_api_key = os.getenv("DAILY_API_KEY", "").strip()
+    if not daily_api_key or not room_url:
+        logger.warning("Cannot mint avatar token: DAILY_API_KEY or room_url missing")
+        return None
+
+    room_name = urlparse(room_url).path.strip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.daily.co/v1/meeting-tokens",
+                headers={"Authorization": f"Bearer {daily_api_key}"},
+                json={
+                    "properties": {
+                        "room_name": room_name,
+                        "is_owner": True,
+                        "exp": int(time.time()) + 7200,
+                        "user_name": "Digital Twin Avatar",
+                    }
+                },
+            )
+            resp.raise_for_status()
+            return resp.json().get("token")
+    except Exception as exc:  # noqa: BLE001 — failure means fall back, not crash
+        logger.error("Avatar token mint failed ({}): {}", type(exc).__name__, exc)
+        return None
+
+
 def _daily_params(output_mode: str = "cartesia"):
     """Lazy import DailyParams so the daily extra isn't required for local dev."""
     from pipecat.transports.daily.transport import DailyParams
@@ -3449,7 +3673,13 @@ def _daily_params(output_mode: str = "cartesia"):
             audio_in_enabled=True,
             audio_in_user_tracks=True,
             audio_in_stream_on_start=False,
-            audio_out_enabled=False,
+            # audio_out was False because SoulX owned all audio. It must be True now so
+            # the VOICE-ONLY FALLBACK can actually speak when the renderer is
+            # unavailable. Nothing is published in the happy path: SoulXAudioSink
+            # swallows audio frames while the renderer is healthy (it publishes them
+            # itself, already synced to the video) and only lets them through on
+            # fallback.
+            audio_out_enabled=True,
             video_out_enabled=False,
         )
 
