@@ -1,5 +1,7 @@
 # pipecat-agent — CLAUDE.md
 
+> **S76 (2026-08-04→08) — V2 arc CLOSED · hv.ai LIVE 2026-08-06T07:21:31Z · announce 2026-09-04.** Prod `pcc-deploy.toml` `min_agents 0→1` (PR #11, same tag 0.9, deployment 22af6789) — warm join **< 5 s** vs the 19 s cold baseline; standing cost ~$43.80/mo (agent-2x reserved $0.0010/min); `max_agents` 10 platform-confirmed (the capacity census's binding ceiling — watch concurrent sessions at the announce). **Staging toml stays 0.** Rollback = flip to 0 + the same `pcc deploy` line. No production branch — image-tag promotion unchanged. Arc record: backend `guidelines/SESSION_76_COMPLETION.md`.
+
 > **S75 (2026-08-01→04):** hygiene only — the 34-file `ruff format` backlog cleared and `format --check` now enforced INSIDE the `lint` job (job name unchanged — protection contract); `.DS_Store` untracked with the repo's first ignore entry. No behavioral change, no image redeploy (tag-promotion model). The prod launch baseline recorded T_agent p95 434 ms (classic pipeline, lazy vision) — backend runbook §12.
 
 
