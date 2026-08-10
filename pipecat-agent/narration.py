@@ -104,6 +104,10 @@ class NarrationInterrupted(Exception):
 
 SpeakFn = Callable[[str], Awaitable[None]]
 SetVoiceFn = Callable[[str], Awaitable[None]]
+# S77 B5 — per-line TTS language switch (classic pipeline only; the
+# relay pipeline has no Cartesia TTS). Same delta mechanism as
+# SetVoiceFn: bot.py queues a TTSUpdateSettingsFrame(language=...).
+SetLanguageFn = Callable[[str], Awaitable[None]]
 # Block 13 — narration cache callables, both optional.
 #  * PrefetchFn runs ONCE at the top of the per-scene narration loop
 #    with the full plan; implementation stashes any cacheable PCM bytes
@@ -142,12 +146,20 @@ class NarrationSegment:
     replay pre-rendered PCM instead of synthesizing. Both are ``None``
     for pre-Block-8 snapshots and for the relay pipeline (SoulX renders
     speech itself, so the bytes wouldn't be useful).
+
+    S77 B5 — ``text`` here is what gets SPOKEN: the snapshot's
+    ``narration_text`` (a room-language translation when the backend
+    served one, the authored base text otherwise), falling back to the
+    legacy ``text`` field on pre-S77 snapshots. ``language`` is the
+    line's ``narration_language`` (fallback: the room language) — the
+    narrator switches the Cartesia service to it before live synthesis.
     """
 
     text: str
     voice_id: str | None
     id: str | None = None
     audio: dict | None = None
+    language: str | None = None
 
 
 def plan_post_narration_followup(
@@ -161,15 +173,17 @@ def plan_post_narration_followup(
     after the per-segment narration loop, or ``None`` if nothing
     should be spoken (no-script scene, or auto-advance with no cue).
 
-    Decision tree (matches the S65 plan):
+    Decision tree (S65 plan, amended by S77 B6/Q10):
 
       * ``spoke_script=False`` ⇒ ``None`` — no-script scenes use the
         existing conversational greeting trigger; no invitation, no cue.
       * ``spoke_script=True`` AND ``live_room.auto_advance=True`` AND
-        not last scene ⇒ optional ``current_scene.narration.transition_cue``
-        (e.g. "Let's move on" in the room's language). The shell
-        auto-advances on ``script_complete`` immediately after — no
-        invitation here because the visitor isn't asked to take a turn.
+        not last scene ⇒ ``None``. **S77 B6 — scene advance is SILENT
+        and IMMEDIATE**: the spoken ``transition_cue`` is gone at its
+        source (the backend no longer localizes or emits it); the gap
+        between scenes is :data:`SCENE_TRANSITION_PAUSE_MS` of silence
+        (see :func:`plan_scene_transition_pause_s`). Never re-add
+        spoken filler here.
       * Otherwise (``spoke_script=True`` AND (no auto_advance OR last
         scene)) ⇒ ``current_scene.narration.invitation_line`` (e.g.
         "What questions do you have?" in the room's language). If the
@@ -198,9 +212,8 @@ def plan_post_narration_followup(
     narr = current_scene.get("narration") or {}
 
     if auto and not is_last:
-        # Auto-advance branch: optional cue, never an invitation.
-        cue = (narr.get("transition_cue") or "").strip()
-        return cue or None
+        # S77 B6 — the auto-advance path speaks NOTHING between scenes.
+        return None
 
     # Manual branch (last scene, or auto_advance disabled): invitation.
     line = (narr.get("invitation_line") or "").strip()
@@ -209,6 +222,35 @@ def plan_post_narration_followup(
     # Pre-S65 backend snapshot ⇒ legacy hardcoded English fallback so
     # the visitor isn't left in silence after the presentation.
     return "Please feel free to ask me if you have any questions."
+
+
+# S77 B6 (Q10, D-9 disposition) — the inter-scene gap. After the final
+# narration line of a scene finishes PLAYOUT (the A1 drain wait), the
+# agent holds this much silence BEFORE emitting ``script_complete`` —
+# the shell's advance follows that emission, so the pause IS the gap
+# the visitor hears. Applies only where the spoken cue used to live:
+# auto-advance, not-last-scene, something actually narrated.
+SCENE_TRANSITION_PAUSE_MS = 600
+
+
+def plan_scene_transition_pause_s(snapshot: dict, *, spoke_script: bool) -> float:
+    """Seconds of post-playout silence before ``script_complete`` (S77 B6).
+
+    Pure: no I/O. Returns ``SCENE_TRANSITION_PAUSE_MS / 1000`` exactly
+    when the removed transition_cue would have been spoken (auto-advance
+    AND not last scene AND the scene actually narrated); ``0.0``
+    everywhere else — manual rooms, last scenes, and script-less scenes
+    keep their immediate emission (frozen wire rule 4).
+    """
+    if not spoke_script:
+        return 0.0
+    live_room = snapshot.get("live_room") or {}
+    flow_state = snapshot.get("flow_state") or {}
+    auto = bool(live_room.get("auto_advance"))
+    idx = int(flow_state.get("scene_index", 0) or 0)
+    total = int(flow_state.get("total_scenes", 1) or 1)
+    is_last = idx >= total - 1
+    return SCENE_TRANSITION_PAUSE_MS / 1000.0 if (auto and not is_last) else 0.0
 
 
 def build_script_complete_payload(
@@ -325,29 +367,54 @@ def plan_narration_segments(
     snapshot returns an empty plan rather than crashing.
     """
     current_scene = snapshot.get("current_scene") or {}
+    room_language = (
+        (snapshot.get("live_room") or {}).get("language") or "en"
+    ).strip() or "en"
     raw = current_scene.get("scripts") or []
     plan: list[NarrationSegment] = []
     for seg in raw:
         if not isinstance(seg, dict):
             continue
-        text = (seg.get("text") or "").strip()
-        if not text:
+        base_text = (seg.get("text") or "").strip()
+        # S77 B5 — speak narration_text (room-language resolution done
+        # server-side); legacy snapshots lack the field → base text +
+        # room language (the agent must tolerate a pre-B4 backend during
+        # rollout — remove-by-default is NOT allowed this arc).
+        spoken = (seg.get("narration_text") or base_text).strip()
+        if not spoken:
             continue
+        language = (
+            seg.get("narration_language") or room_language
+        ).strip() or room_language
         # Block 13 — propagate id + audio for the cache layer. Both stay
         # None on pre-Block-8 snapshots and on relay (where SoulX renders
         # speech itself, so cached PCM is moot).
         seg_id = seg.get("id")
         audio = seg.get("audio") if isinstance(seg.get("audio"), dict) else None
+        # S77 B5 — the S65b cache holds BASE-text renders (its key has no
+        # language input). When the spoken line is a translation, the
+        # cached bytes are the WRONG language — drop them so the cache
+        # layer misses cleanly and the line synthesizes live.
+        if spoken != base_text:
+            audio = None
         if is_relay:
             # Relay pipeline narrates in the primary SoulX voice; the
             # per-segment voice clone is a v0.2 punt (CLAUDE.md S65).
             plan.append(
-                NarrationSegment(text=text, voice_id=None, id=seg_id, audio=None)
+                NarrationSegment(
+                    text=spoken, voice_id=None, id=seg_id, audio=None, language=language
+                )
             )
         else:
             voice = seg.get("voice_id") or primary_voice_id
             plan.append(
-                NarrationSegment(text=text, voice_id=voice, id=seg_id, audio=audio)
+                NarrationSegment(
+                    text=spoken,
+                    voice_id=voice,
+                    id=seg_id,
+                    audio=audio,
+                    language=language,
+                )
             )
     return plan
 
@@ -384,6 +451,8 @@ class SceneNarrator:
         speak: SpeakFn,
         prefetch: PrefetchFn | None = None,
         prime: PrimeFn | None = None,
+        set_language: SetLanguageFn | None = None,
+        room_language: str | None = None,
     ):
         self._primary_voice_id = primary_voice_id
         self._set_voice = set_voice
@@ -398,6 +467,17 @@ class SceneNarrator:
         # primary, which is the common "fallback" case from the backend's
         # _resolve_segment_voice).
         self._current_voice = primary_voice_id
+        # S77 B5 — per-line TTS language. The Cartesia service is
+        # constructed at the ROOM language; a line whose
+        # narration_language differs gets a settings delta before its
+        # live synthesis, and _reset_to_primary restores the room
+        # language so conversational turns are never left in a script
+        # line's language. Voice and language are independent fields on
+        # the same Settings dataclass — a language delta never touches
+        # the voice (Q8: same voice, per-line language).
+        self._set_language = set_language
+        self._room_language = room_language
+        self._current_language = room_language
         self._narrated_scene_id: str | None = None
 
     @property
@@ -407,6 +487,10 @@ class SceneNarrator:
     @property
     def current_voice(self) -> str | None:
         return self._current_voice
+
+    @property
+    def current_language(self) -> str | None:
+        return self._current_language
 
     async def narrate(self, snapshot: dict, *, force: bool = False) -> bool:
         """Narrate the snapshot's scripts.
@@ -503,6 +587,23 @@ class SceneNarrator:
                     )
                     await self._set_voice(seg.voice_id)
                     self._current_voice = seg.voice_id
+                # S77 B5 — per-line language switch, mirroring the voice
+                # delta. Skipped on cache hits (pre-rendered PCM plays
+                # back as-is; only live synthesis reads the setting).
+                if (
+                    not is_hit
+                    and self._set_language is not None
+                    and seg.language
+                    and seg.language != self._current_language
+                ):
+                    logger.info(
+                        "[NARRATION] segment={} language switch {!r} -> {!r}",
+                        idx,
+                        self._current_language,
+                        seg.language,
+                    )
+                    await self._set_language(seg.language)
+                    self._current_language = seg.language
                 logger.info(
                     "[NARRATION] segment={} speak (voice={!r}, chars={}, hit={})",
                     idx,
@@ -552,6 +653,20 @@ class SceneNarrator:
             )
             await self._set_voice(self._primary_voice_id)
             self._current_voice = self._primary_voice_id
+        # S77 B5 — conversational (non-narration) turns keep the ROOM
+        # language; restore it whenever a narration run ends, is
+        # interrupted, or is cancelled (same paths as the voice reset).
+        if (
+            self._set_language is not None
+            and self._room_language
+            and self._current_language != self._room_language
+        ):
+            logger.info(
+                "[NARRATION] resetting language to room {!r}",
+                self._room_language,
+            )
+            await self._set_language(self._room_language)
+            self._current_language = self._room_language
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -620,6 +735,14 @@ async def run_scene_narration(
         await speak_followup(followup)
     if wait_playout is not None and (spoke_script or followup):
         await wait_playout(compute_playout_drain_timeout(snapshot))
+    # S77 B6 — the silent inter-scene gap: 600 ms AFTER the final line's
+    # playout, BEFORE the caller emits script_complete (whose reception
+    # triggers the shell's advance). Replaces the spoken transition_cue.
+    # The T_visual/T_agent instrumentation points are untouched — both
+    # measure from the advance intent onward, which this precedes.
+    pause_s = plan_scene_transition_pause_s(snapshot or {}, spoke_script=spoke_script)
+    if pause_s > 0:
+        await asyncio.sleep(pause_s)
     return spoke_script
 
 

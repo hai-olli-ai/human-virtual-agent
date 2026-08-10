@@ -97,10 +97,12 @@ def test_plan_classic_resolves_per_segment_voice_with_primary_fallback():
     plan = plan_narration_segments(
         snapshot, primary_voice_id="primary-V", is_relay=False
     )
+    # S77 B5 — segments carry the narration language (room "en" fallback
+    # on these legacy-shaped fixtures).
     assert plan == [
-        NarrationSegment(text="intro", voice_id="voice-clone-A"),
-        NarrationSegment(text="middle", voice_id="primary-V"),
-        NarrationSegment(text="outro", voice_id="primary-V"),
+        NarrationSegment(text="intro", voice_id="voice-clone-A", language="en"),
+        NarrationSegment(text="middle", voice_id="primary-V", language="en"),
+        NarrationSegment(text="outro", voice_id="primary-V", language="en"),
     ]
 
 
@@ -376,20 +378,20 @@ def test_followup_returns_invitation_when_manual_flow():
     )
 
 
-def test_followup_returns_cue_when_auto_advance_and_not_last():
-    """auto_advance=True + not last ⇒ cue, never invitation."""
+def test_followup_silent_when_auto_advance_and_not_last():
+    """S77 B6 — auto_advance=True + not last ⇒ None, ALWAYS. Even a
+    legacy snapshot still carrying a transition_cue is never spoken
+    (scene advance is silent and immediate; the gap is the 600 ms pause)."""
     snapshot = _snap(
         auto_advance=True,
         scene_index=1,
         total_scenes=4,
         narration={
             "invitation_line": "Any questions?",
-            "transition_cue": "Let's continue.",
+            "transition_cue": "Let's continue.",  # legacy field — ignored
         },
     )
-    assert (
-        plan_post_narration_followup(snapshot, spoke_script=True) == "Let's continue."
-    )
+    assert plan_post_narration_followup(snapshot, spoke_script=True) is None
 
 
 def test_followup_returns_none_when_auto_advance_and_cue_blank():
@@ -572,13 +574,11 @@ def _make_event_log_narrator(primary_voice_id: str | None = "primary"):
     return narrator, speak, send, events
 
 
-def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
-    """Item 3: auto_advance + not last ⇒ cue spoken, invitation NOT spoken.
-
-    This is the end-to-end version of
-    ``test_followup_returns_cue_when_auto_advance_and_not_last``: that
-    one verifies the decision helper; this one verifies the
-    bot.py-style composition actually skips the invitation speak.
+def test_scenario_auto_advance_not_last_is_silent_no_cue_no_invitation():
+    """Item 3 (S77 B6): auto_advance + not last ⇒ NOTHING spoken after
+    the script — no cue, no invitation. The gap is the silent 600 ms
+    pause (see test_scene_transitions.py); script_complete still fires
+    LAST. A legacy transition_cue in the snapshot is ignored.
     """
     narrator, speak, send, events = _make_event_log_narrator()
     snapshot = _snap(
@@ -589,19 +589,18 @@ def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
         total_scenes=3,
         narration={
             "invitation_line": "Any questions?",
-            "transition_cue": "Let's keep going.",
+            "transition_cue": "Let's keep going.",  # legacy — ignored
         },
     )
     spoke = _run(_drive_classic_scene_entry(snapshot, narrator, speak, send))
     assert spoke is True
 
     # Expected ordering: voice→A, speak script, voice→primary (reset),
-    # speak cue (NOT the invitation), then script_complete.
+    # then script_complete — with NO follow-up speak in between.
     assert events == [
         ("set_voice", "voice-A"),
         ("speak", "hello world"),
         ("set_voice", "primary"),
-        ("speak", "Let's keep going."),
         (
             "send",
             {
@@ -612,9 +611,10 @@ def test_scenario_auto_advance_not_last_suppresses_invitation_speaks_cue_only():
             },
         ),
     ]
-    # Explicit: the invitation_line MUST NOT appear in the speak history.
+    # Explicit: neither the invitation nor the cue appears in speech.
     spoken_texts = [evt[1] for evt in events if evt[0] == "speak"]
     assert "Any questions?" not in spoken_texts
+    assert "Let's keep going." not in spoken_texts
 
 
 def test_scenario_script_complete_emitted_once_after_invitation_with_payload():
@@ -741,14 +741,15 @@ def test_scenario_scene_change_rerruns_narration_with_new_scene_id():
 
     assert spoke1 is True
     assert spoke2 is True
-    # Both scenes' scripts were spoken; the transition_cue from each
-    # also fired; two script_complete events with their own sceneIndex.
+    # Both scenes' scripts were spoken; S77 B6 — the legacy cues are
+    # NEVER spoken (silent advance); two script_complete events with
+    # their own sceneIndex.
     speaks = [evt[1] for evt in events if evt[0] == "speak"]
     sends = [evt[1] for evt in events if evt[0] == "send"]
     assert "scene one" in speaks
     assert "scene two" in speaks
-    assert "moving on" in speaks
-    assert "moving on again" in speaks
+    assert "moving on" not in speaks
+    assert "moving on again" not in speaks
     assert sends == [
         {
             "type": "script_complete",
