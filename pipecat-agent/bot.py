@@ -61,6 +61,7 @@ from pipecat.runner.types import DailyRunnerArguments, RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.transcriptions.language import Language
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -685,6 +686,23 @@ async def _resolve_output_mode(room_id: str, api_url: str | None = None) -> str:
 # LLM_CANVAS_PROVIDER env var after installing the corresponding extra.
 
 
+def _cartesia_language(code: str | None) -> Language | str:
+    """S77 B5 — map an ISO 639-1 room/narration code to what pipecat
+    0.0.108's Cartesia service accepts.
+
+    Prefer the :class:`Language` enum member (so the service's
+    ``language_to_cartesia_language`` conversion applies on both the
+    constructor path and ``TTSUpdateSettingsFrame`` deltas); unknown
+    codes fall back to the raw lowercase base code, which Cartesia
+    accepts as a bare ISO 639-1 string.
+    """
+    base = (code or "en").split("-")[0].lower() or "en"
+    try:
+        return Language(base)
+    except ValueError:
+        return base
+
+
 def _assemble_full_prompt(base: str, manifest: dict | None) -> str:
     """Concatenate base persona prompt, CANVAS PAGE, AGENT PLAYBOOK, VOICE OUTPUT.
 
@@ -1053,9 +1071,14 @@ async def run_bot_classic(
         # upstream of this filter). Flows through CachedFirstTTSService /
         # CartesiaTTSService **kwargs to the base TTSService.
         text_filters=[MarkdownTextFilter()],
+        # S77 B5 — the service boots at the ROOM language; per-line
+        # narration_language switches ride TTSUpdateSettingsFrame deltas
+        # (_classic_set_language) and SceneNarrator restores the room
+        # language after every narration run.
         settings=CartesiaTTSService.Settings(
             voice=voice_id,
             model=NARRATION_TTS_MODEL_ID,
+            language=_cartesia_language(snapshot_language),
         ),
     )
 
@@ -1464,6 +1487,13 @@ async def run_bot_classic(
         delta = CartesiaTTSService.Settings(voice=target_voice_id)
         await task.queue_frames([TTSUpdateSettingsFrame(delta=delta)])
 
+    async def _classic_set_language(language_code: str) -> None:
+        # S77 B5 — same delta mechanism as the voice switch; language
+        # and voice are independent Settings fields, so this never
+        # disturbs the active voice (Q8: same voice, per-line language).
+        delta = CartesiaTTSService.Settings(language=_cartesia_language(language_code))
+        await task.queue_frames([TTSUpdateSettingsFrame(delta=delta)])
+
     async def _classic_speak(text: str) -> None:
         # Register the completion future BEFORE queuing the speak — a
         # short utterance can fire TTSStoppedFrame before we register
@@ -1563,6 +1593,8 @@ async def run_bot_classic(
         speak=_classic_speak,
         prefetch=_narration_prefetch,
         prime=_narration_prime,
+        set_language=_classic_set_language,  # S77 B5
+        room_language=(snapshot_language or "en"),
     )
 
     # ── Auto Play Phase A — narration-run machinery (classic) ──
@@ -2047,9 +2079,10 @@ async def run_bot_classic(
         logger.info("Visitor connected to live room")
 
         # S65 G3+G4 — narrate scene scripts via SceneNarrator (per-segment
-        # voice switching, idempotent per scene_id), then speak the
-        # localized invitation OR transition_cue, then emit
-        # script_complete LAST.
+        # voice + S77 language switching, idempotent per scene_id), then
+        # speak the localized invitation on the manual branch (S77 B6:
+        # the auto-advance branch is SILENT — 600 ms pause, no cue),
+        # then emit script_complete LAST.
         #
         # Auto Play Phase A (A5) — this used to run INLINE, outside the
         # single-slot task, so a scene change during the opening
@@ -2817,6 +2850,10 @@ async def run_bot_relay(
         primary_voice_id=None,
         set_voice=None,
         speak=_relay_speak,
+        # S77 B5 — the relay pipeline has no Cartesia TTS, so there is
+        # no set_language either; room_language rides along for the
+        # narrator's bookkeeping only.
+        room_language=(snapshot_language or "en"),
     )
 
     # ── Auto Play Phase A — narration-run machinery (relay) ──
