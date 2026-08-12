@@ -225,13 +225,23 @@ The SCRIPT prompt directive (above) keeps the LLM silent during narration.
 
 ### Auto-advance signalling (D8)
 
-If `live_room.auto_advance && scene_index < total - 1`: optionally speak `transition_cue`, **skip** the invitation, emit `script_complete`. Else: speak `invitation_line`, emit `script_complete`. No-script scenes: neither branch (the existing conversational greeting stands; the shell knows `hadScript=false` and won't schedule an advance). **(S65c)** entry narration emits `trigger:'auto'`; a manual Script-button replay emits `trigger:'manual'` and the shell ignores `'manual'` for auto-advance — so a replay never moves the flow.
+If `live_room.auto_advance && scene_index < total - 1`: **speak NOTHING** (S77 — the spoken `transition_cue` is gone at its source; a legacy cue in an old snapshot is ignored), hold `SCENE_TRANSITION_PAUSE_MS = 600` of silence after playout drain, then emit `script_complete`. Else: speak `invitation_line`, emit `script_complete` (immediate — no pause on manual/last/script-less paths, frozen wire rule 4). No-script scenes: neither branch (the existing conversational greeting stands; the shell knows `hadScript=false` and won't schedule an advance). **(S65c)** entry narration emits `trigger:'auto'`; a manual Script-button replay emits `trigger:'manual'` and the shell ignores `'manual'` for auto-advance — so a replay never moves the flow.
 
 ### Tests
 
 `test_scene_narration.py`: voice resolution picks clone vs fallback; invitation suppressed on non-final auto-advance scene, present on final / non-auto-advance; narration runs once per entry; relay path emits `script_complete`.
 
 ---
+
+## Per-line narration language + silent transitions (S77)
+
+Q8's law: **same voice, per-line language.** The backend serves, per script line, `narration_text` (a room-language translation when one is fresh, else the authored base text) + `narration_language`, alongside additive `base_language`/`adaptable`.
+
+- **Parsing (`plan_narration_segments`):** the SPOKEN text is `narration_text`; **legacy fallback** to `text` + room language when the fields are absent (a pre-B4 backend during rollout — remove-by-default is NOT allowed). Segments carry `language`.
+- **Cached-audio drop rule (load-bearing):** the S65b cache holds BASE-text renders (its key has no language input) — `audio` is dropped whenever `narration_text != text`, so translated lines synthesize live in the right language; base-text lines keep their cache. Guarded by `test_plan_drops_cached_audio_for_translated_lines`.
+- **Switching:** the Cartesia service boots at the ROOM language (`Settings(language=_cartesia_language(snapshot_language))`); a line whose `language` differs gets a `TTSUpdateSettingsFrame(delta=Settings(language=…))` via `_classic_set_language` (the `_classic_set_voice` twin — pipecat 0.0.108 applies it before the next `TTSSpeakFrame`, no reconnect); skipped on cache hits; `_reset_to_primary` restores the room language on EVERY exit path (normal / interrupted / cancelled) so conversational turns never inherit a script line's language. Voice and language are independent `Settings` fields — a language delta never touches the voice. Relay pipeline: no Cartesia TTS ⇒ no switching.
+- **Silent transitions (Q10/B6):** the auto-advance followup branch returns `None` ALWAYS; `SCENE_TRANSITION_PAUSE_MS = 600` (narration.py) runs after final-line playout drain, BEFORE `script_complete` — the pause IS the inter-scene gap the visitor hears (the shell's advance follows the emission). Never re-add spoken filler; the transcript-probe test (`test_scene_transitions.py`) pins ZERO transition tokens.
+- Tests: `test_narration_language.py` + `test_scene_transitions.py` (285 total).
 
 ## Cached narration audio (S65b) — `CachedFirstTTSService`
 
@@ -305,7 +315,7 @@ There's no automated test that asserts the two repos agree — the gate is conve
 
 ### What's NOT changed in S65b on the agent side
 
-- Voice resolution logic, S65's per-segment voice switching, the invitation/`transition_cue` flow, and `script_complete` payload shape are all unchanged.
+- Voice resolution logic, S65's per-segment voice switching, the invitation flow, and `script_complete` payload shape are all unchanged. *(S77 later removed the `transition_cue` half of the followup and added per-line language switching — see the S77 section.)*
 - The relay (`talking`) pipeline. SoulX renders its own audio — caching doesn't apply.
 - The LLM provider branching, eager-dispatch infrastructure, and canvas tools.
 - Every existing S65 test continues to pass — the cache path is invisible to its assertions (miss path = identical behavior).
@@ -404,7 +414,7 @@ The agent fetches `GET /live-rooms/{room_id}/scene-snapshot` on session start an
 The snapshot includes:
 
 - `live_room`: language, persona, recipient_prompt, **`auto_advance`** *(S65)*.
-- `current_scene`: name, instruction, display_mode, background_url, **elements (with `id`)**, link_url, link_source, `canvas_page_type`, **`has_script`** *(S65)*, **`narration.{invitation_line, transition_cue}`** *(S65)*, **`scripts[*]`** *(S65 — with resolved per-segment voice + S65b `audio` sub-object)*, **`actions`** *(S65c — informational for the agent; the shell consumes it)*.
+- `current_scene`: name, instruction, display_mode, background_url, **elements (with `id`)**, link_url, link_source, `canvas_page_type`, **`has_script`** *(S65)*, **`narration.{invitation_line}`** *(S65; **S77 removed `transition_cue`**)*, **`scripts[*]`** *(S65 voice + S65b `audio` + **S77 `base_language · adaptable · narration_text · narration_language`** — 12 snake_case keys; read defensively, tolerate absence)*, **`actions`** *(S65c — informational for the agent; the shell consumes it)*.
 - `flow_state`: scene_index, total_scenes, scene_ids array.
 - `knowledge`: text content (flow scope = aggregated all-scene set) **+ a version token (S66)** the agent uses to skip re-stitching the flow-knowledge prompt section when unchanged.
 - `faqs`: per-scope array.
