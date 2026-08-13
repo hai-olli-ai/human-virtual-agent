@@ -755,3 +755,7 @@ Local parity (from `pipecat-agent/`): `uvx ruff@0.15.7 check .` · `uv run pytes
 - **Promotion model — the agent has NO `production` branch.** It promotes by image tag: build/push a new tag → deploy to STAGING first (`pcc deploy --config-file pcc-deploy.staging.toml`) → verify via the staging smoke → then `pcc deploy` with the prod toml at that same tag (the backend `scripts/promote_production.sh` tail prints this reminder).
 - The staging backend summons this agent via `PIPECAT_AGENT_NAME=human-virtual-agent-staging` (settings-backed on the backend since S69-era config; the staging Railway matrix carries the value).
 - Ops detail: backend `docs/deploy/PRODUCTION_RUNBOOK.md` §11; evidence: backend `guidelines/SESSION_74B_COMPLETION.md`.
+
+## S78 (2026-08-13/14): zero changes
+
+Live-room access control + greet-by-name shipped entirely backend/frontend/mcp-side. The greet block rides the backend persona prompt (`## Audience`, appended last — adjacent to this repo's own AUDIENCE section in the composite; verified LLM-generated greeting, no hardcoded literal, at the S78 A5 gate). The access gate covers only the by-slug room lookup and start-session — neither of which this agent calls — so it cannot be stranded; the by-uuid and slug-scoped surfaces it consumes stay public. Record: backend `guidelines/SESSION_78_COMPLETION.md`.
