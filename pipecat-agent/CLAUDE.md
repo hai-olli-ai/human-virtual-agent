@@ -759,3 +759,7 @@ Local parity (from `pipecat-agent/`): `uvx ruff@0.15.7 check .` · `uv run pytes
 ## S78 (2026-08-13/14): zero changes
 
 Live-room access control + greet-by-name shipped entirely backend/frontend/mcp-side. The greet block rides the backend persona prompt (`## Audience`, appended last — adjacent to this repo's own AUDIENCE section in the composite; verified LLM-generated greeting, no hardcoded literal, at the S78 A5 gate). The access gate covers only the by-slug room lookup and start-session — neither of which this agent calls — so it cannot be stranded; the by-uuid and slug-scoped surfaces it consumes stay public. Record: backend `guidelines/SESSION_78_COMPLETION.md`.
+
+## The combined S77+S78 GO (2026-08-14/15): image 0.10 — the S77 agent code's first deploy
+
+The GO's discrepancy check found BOTH tiers still on `0.9` (staging untouched since 2026-07-29) — the S77 agent code was merged but **never built into an image**; S77's staging narration "verification" had heard the base-text fallback, not translations. Remediation at the GO: `haiolli/human-virtual-agent:0.10` built from main `87b8421` (arm64, digest `sha256:144bc7…`) → staging deploy → **the real translation ear-check (PASS — room-language narration heard for the first time)** → prod deploy. Both tomls now pin `0.10`; prod scaling min 1 / max 10 (the S76 warm floor) survived. Record: backend `guidelines/SESSION_78_COMPLETION.md` §H.
