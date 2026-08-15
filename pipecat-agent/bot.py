@@ -550,7 +550,9 @@ class AvatarReadyGateProcessor(FrameProcessor):
                 self._waiting_logged = True
             try:
                 if self._timeout_s:
-                    await asyncio.wait_for(self._ready_event.wait(), timeout=self._timeout_s)
+                    await asyncio.wait_for(
+                        self._ready_event.wait(), timeout=self._timeout_s
+                    )
                 else:
                     await self._ready_event.wait()
                 logger.info("Avatar relay bot ready; resuming queued pipeline traffic")
@@ -2993,7 +2995,25 @@ async def run_bot_relay(
     # In soulx-audio mode the pipeline owns a real Cartesia service, so narration
     # speaks in the SAME (per-user cloned) voice as conversation. Legacy text
     # relay keeps its old behaviour untouched.
-    _narration_speak = _soulx_narration_speak if soulx_client is not None else _relay_speak
+    _narration_speak = (
+        _soulx_narration_speak if soulx_client is not None else _relay_speak
+    )
+
+    async def _soulx_wait_playout(timeout_s: float) -> None:
+        """Relay drain-wait: script_complete must mean "the visitor finished
+        HEARING it", or an auto-advance shell navigates ~1s after each scene
+        loads and every script is cut off at its first syllable. The classic
+        NarrationCompletionGate can't serve here — narration audio plays out on
+        the RENDERER (the sink swallows it), so BotStoppedSpeakingFrame never
+        fires agent-side. The renderer's playout_completed is the drain signal;
+        the sink also falls back to a sent-audio estimate for renderer builds
+        that predate the emission.
+        """
+        await soulx_sink.wait_group_playout(timeout_s)
+
+    # Legacy text relay (SOULX_WS_URL unset) keeps queue-time emission — its
+    # renderer consumed text and offered no playout signal at all.
+    _relay_wait_playout = _soulx_wait_playout if soulx_client is not None else None
 
     narrator = SceneNarrator(
         primary_voice_id=None,
@@ -3101,17 +3121,28 @@ async def run_bot_relay(
             # cancellation cleanup either: a superseding run re-arms the
             # group (merging turns, which is boundary-free and safe), and
             # barge-in clears the open turn via the sink's interrupt path.
-            if soulx_sink is not None and (snap.get("current_scene") or {}).get(
-                "has_script"
-            ):
-                soulx_sink.begin_turn_group()
+            if soulx_sink is not None:
+                soulx_sink.begin_narration_watch()
+                if (snap.get("current_scene") or {}).get("has_script"):
+                    soulx_sink.begin_turn_group()
             try:
                 spoke_script = await run_scene_narration(
                     snap,
                     narrator=narrator,
                     speak_followup=_narration_speak,
                     force=force,
+                    wait_playout=_relay_wait_playout,
                 )
+            except NarrationInterrupted:
+                # Mirror of the classic call site (wire rule 2b): the visitor
+                # barged in — no script_complete, no greeting.
+                session_seeded["done"] = True
+                logger.info(
+                    "[NARRATION] run interrupted by visitor speech — "
+                    "script_complete suppressed (trigger={})",
+                    trigger,
+                )
+                return
             except Exception as exc:
                 logger.warning("[NARRATION] narration failed: {!r}", exc)
             finally:
@@ -3188,16 +3219,25 @@ async def run_bot_relay(
             # Same turn-grouping as _narrate_and_complete: session-start
             # narration is THE path a scripted room takes, and the whole
             # script must reach the renderer as one boundary-free turn.
-            if soulx_sink is not None and (
-                scene_snapshot.get("current_scene") or {}
-            ).get("has_script"):
-                soulx_sink.begin_turn_group()
+            if soulx_sink is not None:
+                soulx_sink.begin_narration_watch()
+                if (scene_snapshot.get("current_scene") or {}).get("has_script"):
+                    soulx_sink.begin_turn_group()
             try:
                 spoke_script = await run_scene_narration(
                     scene_snapshot,
                     narrator=narrator,
                     speak_followup=_narration_speak,
+                    wait_playout=_relay_wait_playout,
                 )
+            except NarrationInterrupted:
+                # Mirror of the classic session-start site (wire rule 2b).
+                session_seeded["done"] = True
+                logger.info(
+                    "[NARRATION] session-start narration interrupted — "
+                    "script_complete suppressed"
+                )
+                return
             finally:
                 await asyncio.shield(_relay_close_turn())
 

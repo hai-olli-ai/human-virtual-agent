@@ -38,6 +38,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from narration import NarrationInterrupted
+
 PROTOCOL = "soulx-audio.v1"
 
 SESSION_INIT = "session_init"
@@ -51,6 +53,7 @@ ROOM_JOINED = "room_joined"
 AUDIO_ACK = "audio_ack"
 PLAYOUT_STARTED = "playout_started"
 PLAYOUT_COMPLETED = "playout_completed"
+TURN_FAILED = "turn_failed"
 ERROR = "error"
 
 SEQ_STRUCT = ">I"
@@ -65,6 +68,14 @@ FLOW_WINDOW_SECONDS = 2.0
 # the follow-up request is ~0.3-1.0s, so 1.5s coalesces adjacent narration segments into
 # ONE renderer turn while a genuinely final stop still closes promptly.
 TURN_GROUP_DEBOUNCE_S = 1.5
+
+# Playout-estimate margin: when the renderer never sends `playout_completed` for a turn
+# (version skew — an older renderer deploy predating the signal), the wait falls back to
+# an estimate from the audio WE sent: playout can't end before the turn's audio duration
+# has elapsed from its first PCM send. The margin absorbs renderer TTFF (~0.3-1s) plus
+# transport buffering. Deliberately small: overshooting delays every scene advance by
+# this much in the skew case; the truth signal makes it moot when both sides are current.
+PLAYOUT_EST_MARGIN_S = 2.0
 
 
 class SoulXAudioClient:
@@ -105,6 +116,16 @@ class SoulXAudioClient:
         self._acked_bytes = 0
         self._ack_cond = asyncio.Condition()
         self._bytes_per_second = sample_rate * 2  # s16le mono
+        # Playout tracking (narration drain-wait): turns the renderer has finished
+        # playing (playout_completed / turn_failed / interrupted), plus per-turn
+        # estimated playout-end times derived from the audio we sent — the fallback
+        # when the renderer predates the playout_completed emission.
+        self._playout_cond = asyncio.Condition()
+        self._playout_done: set[str] = set()
+        self._est_playout_end: dict[str, float] = {}
+        self._turn_pcm_first_at: Optional[float] = None
+        self._turn_pcm_last_at: Optional[float] = None
+        self._turn_pcm_bytes = 0
 
     @property
     def healthy(self) -> bool:
@@ -119,7 +140,11 @@ class SoulXAudioClient:
         try:
             import websockets
 
-            headers = {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else {}
+            headers = (
+                {"Authorization": f"Bearer {self._auth_token}"}
+                if self._auth_token
+                else {}
+            )
             # open_timeout is load-bearing and easy to miss: it defaults to 10s, but a
             # COLD Modal container takes ~134s to accept the handshake (schedule + image
             # pull + 15GB volume + model load + warmup). Without this, raising the ready
@@ -137,7 +162,11 @@ class SoulXAudioClient:
             if hello.get("type") != READY:
                 logger.error("SoulX: expected ready, got {}", hello)
                 return False
-            logger.info("SoulX renderer ready: gpu={} model={}", hello.get("gpu"), hello.get("model_type"))
+            logger.info(
+                "SoulX renderer ready: gpu={} model={}",
+                hello.get("gpu"),
+                hello.get("model_type"),
+            )
 
             await self._ws.send(
                 json.dumps(
@@ -155,7 +184,9 @@ class SoulXAudioClient:
             self._reader = asyncio.create_task(self._read_loop())
 
             # THE fix for the silent bot: bounded wait, never an un-timed Event.
-            await asyncio.wait_for(self._room_joined.wait(), timeout=self._ready_timeout_s)
+            await asyncio.wait_for(
+                self._room_joined.wait(), timeout=self._ready_timeout_s
+            )
             self._healthy = True
             return True
         except Exception as exc:  # noqa: BLE001 — every failure means "fall back"
@@ -169,7 +200,9 @@ class SoulXAudioClient:
                 msg = json.loads(raw)
                 kind = msg.get("type")
                 if kind == ROOM_JOINED:
-                    logger.info("SoulX avatar joined the room as {}", msg.get("participant_id"))
+                    logger.info(
+                        "SoulX avatar joined the room as {}", msg.get("participant_id")
+                    )
                     self._room_joined.set()
                 elif kind == AUDIO_ACK:
                     async with self._ack_cond:
@@ -184,7 +217,17 @@ class SoulXAudioClient:
                             self._acked_bytes = max(self._acked_bytes, int(acked))
                         self._ack_cond.notify_all()
                 elif kind == PLAYOUT_COMPLETED:
-                    logger.debug("SoulX playout completed turn={}", msg.get("turn_id"))
+                    logger.info("SoulX playout completed turn={}", msg.get("turn_id"))
+                    await self._mark_playout_done(msg.get("turn_id"))
+                elif kind == TURN_FAILED:
+                    # A failed turn will never play out — release any waiter so
+                    # narration can't hang on a render failure.
+                    logger.error(
+                        "SoulX turn failed turn={} error={}",
+                        msg.get("turn_id"),
+                        msg.get("error"),
+                    )
+                    await self._mark_playout_done(msg.get("turn_id"))
                 elif kind == ERROR:
                     logger.error("SoulX renderer error: {}", msg.get("error"))
                     if msg.get("fatal"):
@@ -196,11 +239,39 @@ class SoulXAudioClient:
             self._healthy = False
             async with self._ack_cond:
                 self._ack_cond.notify_all()
+            async with self._playout_cond:
+                self._playout_cond.notify_all()
+
+    async def _mark_playout_done(self, turn_id: Optional[str]) -> None:
+        if not turn_id:
+            return
+        async with self._playout_cond:
+            self._playout_done.add(str(turn_id))
+            self._playout_cond.notify_all()
 
     async def turn_start(self, turn_id: str):
+        self._turn_pcm_first_at = None
+        self._turn_pcm_last_at = None
+        self._turn_pcm_bytes = 0
         await self._send_json({"type": TURN_START, "turn_id": turn_id})
 
     async def turn_end(self, turn_id: Optional[str]):
+        # Freeze the playout estimate now that the turn's audio total is known.
+        # max(first_send + duration, last_send): a fast burst finishes playing at
+        # first + duration; a synthesis-stalled turn can't finish before its last
+        # chunk was even sent. The margin covers renderer TTFF + transport buffer.
+        if turn_id and self._turn_pcm_first_at is not None:
+            est_end = (
+                max(
+                    self._turn_pcm_first_at
+                    + self._turn_pcm_bytes / self._bytes_per_second,
+                    self._turn_pcm_last_at or self._turn_pcm_first_at,
+                )
+                + PLAYOUT_EST_MARGIN_S
+            )
+            async with self._playout_cond:
+                self._est_playout_end[str(turn_id)] = est_end
+                self._playout_cond.notify_all()
         await self._send_json({"type": TURN_END, "turn_id": turn_id})
 
     async def interrupt(self, turn_id: Optional[str]):
@@ -209,6 +280,8 @@ class SoulXAudioClient:
         async with self._ack_cond:
             self._acked_bytes = self._sent_bytes
             self._ack_cond.notify_all()
+        # An interrupted turn never completes playout — release any waiter.
+        await self._mark_playout_done(turn_id)
         await self._send_json({"type": INTERRUPT, "turn_id": turn_id})
 
     async def send_pcm(self, pcm: bytes):
@@ -232,16 +305,67 @@ class SoulXAudioClient:
                 "SoulX flow window stalled ({} bytes unacked) — sending anyway",
                 self._sent_bytes - self._acked_bytes,
             )
-            self._acked_bytes = self._sent_bytes  # don't re-stall on every subsequent chunk
+            self._acked_bytes = (
+                self._sent_bytes
+            )  # don't re-stall on every subsequent chunk
 
         # Only a genuine socket failure means the transport is dead.
         try:
             self._seq += 1
             await self._ws.send(struct.pack(SEQ_STRUCT, self._seq & 0xFFFFFFFF) + pcm)
             self._sent_bytes += len(pcm)
+            now = asyncio.get_running_loop().time()
+            if self._turn_pcm_first_at is None:
+                self._turn_pcm_first_at = now
+            self._turn_pcm_last_at = now
+            self._turn_pcm_bytes += len(pcm)
         except Exception as exc:  # noqa: BLE001
             logger.warning("SoulX send failed ({}): {}", type(exc).__name__, exc)
             self._healthy = False
+
+    async def wait_playout_completed(self, turn_id: str, timeout_s: float) -> bool:
+        """Block until the renderer has finished playing ``turn_id``'s audio.
+
+        Resolution order: the renderer's ``playout_completed`` (truth), else the
+        sent-audio estimate frozen at ``turn_end`` (version-skew fallback), else
+        the caller's timeout budget. Returns ``True`` when the turn is done
+        (either signal), ``False`` on timeout or a dead session — the caller
+        proceeds either way; this wait must never strand narration.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout_s)
+        async with self._playout_cond:
+            while True:
+                if turn_id in self._playout_done:
+                    return True
+                if not self._healthy:
+                    return False
+                now = loop.time()
+                est_end = self._est_playout_end.get(turn_id)
+                if est_end is not None and now >= est_end:
+                    logger.info(
+                        "SoulX playout estimate elapsed for {} — treating as "
+                        "complete (no playout_completed from the renderer)",
+                        turn_id,
+                    )
+                    return True
+                if now >= deadline:
+                    logger.warning(
+                        "SoulX playout wait timed out for {} after {:.1f}s",
+                        turn_id,
+                        timeout_s,
+                    )
+                    return False
+                # Wake on notify, or in <=1s to re-evaluate the estimate — the
+                # est_end for this turn may only appear mid-wait (turn_end fires
+                # after the group debounce, while we are already waiting).
+                target = min(deadline, est_end if est_end is not None else deadline)
+                try:
+                    await asyncio.wait_for(
+                        self._playout_cond.wait(), timeout=min(target - now, 1.0)
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
     async def _send_json(self, payload: dict):
         if not self._healthy or self._ws is None:
@@ -249,7 +373,9 @@ class SoulXAudioClient:
         try:
             await self._ws.send(json.dumps(payload))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("SoulX control send failed ({}): {}", type(exc).__name__, exc)
+            logger.warning(
+                "SoulX control send failed ({}): {}", type(exc).__name__, exc
+            )
             self._healthy = False
 
     async def close(self):
@@ -298,10 +424,26 @@ class SoulXAudioSink(FrameProcessor):
         # cancellation-path cleanup, not the normal close.
         self._grouping = False
         self._group_close_task: Optional[asyncio.Task] = None
+        # Narration playout watch (the relay drain-wait): which renderer turn the
+        # current narration run rides, and whether the visitor barged in on it.
+        self._await_turn_id: Optional[str] = None
+        self._watch_interrupted = False
 
     @property
     def fallback(self) -> bool:
         return not self._client.healthy
+
+    def begin_narration_watch(self) -> None:
+        """Arm the playout watch for a narration run about to be queued.
+
+        Called BEFORE the run's frames are queued. Resets the barge-in latch
+        and pins the watch to the currently-open turn (a merged group carries
+        it) or to whichever turn the run's first envelope opens next — without
+        the reset, ``wait_group_playout`` could latch onto a stale
+        conversational turn that already completed.
+        """
+        self._watch_interrupted = False
+        self._await_turn_id = self._turn_id
 
     def begin_turn_group(self) -> None:
         """All TTS envelopes until the group closes ride ONE renderer turn."""
@@ -355,6 +497,7 @@ class SoulXAudioSink(FrameProcessor):
             # The interrupt already ends the renderer turn; a pending debounced
             # close would otherwise fire turn_end for a dead turn id.
             self._cancel_group_close()
+            self._watch_interrupted = True
             await self._client.interrupt(self._turn_id)
             self._turn_id = None
             await self.push_frame(frame, direction)
@@ -362,7 +505,9 @@ class SoulXAudioSink(FrameProcessor):
 
         if self.fallback:
             if not self._fallback_logged:
-                logger.warning("SoulX unavailable — voice-only fallback for this session")
+                logger.warning(
+                    "SoulX unavailable — voice-only fallback for this session"
+                )
                 self._fallback_logged = True
             await self.push_frame(frame, direction)
             return
@@ -372,6 +517,7 @@ class SoulXAudioSink(FrameProcessor):
             if self._turn_id is None:
                 self._turn += 1
                 self._turn_id = f"turn-{self._turn}"
+                self._await_turn_id = self._turn_id
                 await self._client.turn_start(self._turn_id)
             # else: grouped — the previous segment's stop was held back, so
             # this envelope continues the SAME renderer turn (no boundary).
@@ -386,3 +532,45 @@ class SoulXAudioSink(FrameProcessor):
                 self._turn_id = None
 
         await self.push_frame(frame, direction)
+
+    async def wait_group_playout(self, timeout_s: float) -> None:
+        """Drain-wait for a narration run (the relay ``wait_playout`` hook).
+
+        On this pipeline the narration audio plays out on the RENDERER, not the
+        agent's transport, so the classic ``NarrationCompletionGate`` has nothing
+        to observe — the drain signal is the renderer's ``playout_completed``
+        (with the client's sent-audio estimate as the version-skew fallback).
+
+        Arm with :meth:`begin_narration_watch` BEFORE queueing the run. Raises
+        :class:`NarrationInterrupted` on visitor barge-in (the caller suppresses
+        ``script_complete``, wire rule 2b). Returns normally on completion,
+        fallback mode, or budget exhaustion — narration must never hang here.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout_s)
+
+        # Phase 1: the run's first envelope lags queue-time by Cartesia TTFB, so
+        # the turn we must watch may not exist yet. Poll briefly until it opens.
+        while self._await_turn_id is None:
+            if self._watch_interrupted:
+                raise NarrationInterrupted()
+            if self.fallback or loop.time() >= deadline:
+                return
+            await asyncio.sleep(0.1)
+
+        # Phase 2: wait out the watched turn; if a later envelope opened a fresh
+        # renderer turn (a >debounce synthesis stall split the group), roll the
+        # watch forward and wait that one out too.
+        while True:
+            if self._watch_interrupted:
+                raise NarrationInterrupted()
+            if self.fallback:
+                return
+            turn_id = self._await_turn_id
+            await self._client.wait_playout_completed(turn_id, deadline - loop.time())
+            if self._watch_interrupted:
+                raise NarrationInterrupted()
+            if self._await_turn_id == turn_id and self._turn_id is None:
+                return
+            if loop.time() >= deadline:
+                return
