@@ -126,6 +126,9 @@ PrimeFn = Callable[["NarrationSegment"], bool]
 # pipeline passes None (SoulX owns its own playout — v1 punt, see
 # CLAUDE.md).
 WaitPlayoutFn = Callable[[float], Awaitable[None]]
+# S79 — cued-animation playback: (line_index, segment) → completes when the
+# shell finished the clip (or the controller's TTS fallback finished).
+CueFn = Callable[[int, "NarrationSegment"], Awaitable[None]]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -160,6 +163,11 @@ class NarrationSegment:
     id: str | None = None
     audio: dict | None = None
     language: str | None = None
+    # S79 — the snapshot's per-line cached-animation pointer
+    # ({url, duration_seconds}) for rooms with Avatar animations enabled.
+    # None everywhere else — and None keeps every pre-S79 path byte-alike
+    # (the off-path diff-zero lock).
+    animation: dict | None = None
 
 
 def plan_post_narration_followup(
@@ -397,12 +405,27 @@ def plan_narration_segments(
         # layer misses cleanly and the line synthesizes live.
         if spoken != base_text:
             audio = None
+        # S79 — per-line cached animation ({url, duration_seconds}); the
+        # backend already keyed it on the SPOKEN text + language, so no
+        # translation-drift check is needed here (drift ⇒ the backend
+        # served null). Carried on BOTH pipelines — the tile plays MP4s
+        # in normal and talking display modes alike.
+        animation = (
+            seg.get("animation") if isinstance(seg.get("animation"), dict) else None
+        )
+        if animation and not animation.get("url"):
+            animation = None
         if is_relay:
             # Relay pipeline narrates in the primary SoulX voice; the
             # per-segment voice clone is a v0.2 punt (CLAUDE.md S65).
             plan.append(
                 NarrationSegment(
-                    text=spoken, voice_id=None, id=seg_id, audio=None, language=language
+                    text=spoken,
+                    voice_id=None,
+                    id=seg_id,
+                    audio=None,
+                    language=language,
+                    animation=animation,
                 )
             )
         else:
@@ -414,6 +437,7 @@ def plan_narration_segments(
                     id=seg_id,
                     audio=audio,
                     language=language,
+                    animation=animation,
                 )
             )
     return plan
@@ -453,10 +477,15 @@ class SceneNarrator:
         prime: PrimeFn | None = None,
         set_language: SetLanguageFn | None = None,
         room_language: str | None = None,
+        cue: "CueFn | None" = None,
     ):
         self._primary_voice_id = primary_voice_id
         self._set_voice = set_voice
         self._speak = speak
+        # S79 — cued-animation playback. None (every pre-S79 construction)
+        # ⇒ animated lines fall through to `speak` — the off-path is
+        # diff-zero by construction.
+        self._cue = cue
         # Block 13 — narration cache. Both None ⇒ behaves exactly like
         # the pre-cache narrator; the relay pipeline always passes None
         # because SoulX renders speech itself.
@@ -569,6 +598,22 @@ class SceneNarrator:
 
         try:
             for idx, seg in enumerate(plan):
+                # S79 — animated line + a wired cue controller: the SHELL
+                # plays the pre-rendered MP4 (which carries its own audio —
+                # the agent must NOT also TTS it; double audio is the
+                # cardinal bug). The cue callable owns completion/timeout/
+                # barge-in and falls back to TTS itself (never-block), so
+                # from this loop's view the line is simply "done" when it
+                # returns. Voice/language switching is skipped — nothing
+                # is synthesized on the happy path.
+                if seg.animation is not None and self._cue is not None:
+                    logger.info(
+                        "[NARRATION] segment={} cue (duration={}s)",
+                        idx,
+                        seg.animation.get("duration_seconds"),
+                    )
+                    await self._cue(idx, seg)
+                    continue
                 # Prime is sync — keeps zero awaits between the prime call
                 # and the TTSSpeakFrame queue so no other run_tts can sneak
                 # in and consume the primed segment.
