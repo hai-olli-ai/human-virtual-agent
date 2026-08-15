@@ -2998,7 +2998,7 @@ async def run_bot_relay(
     narrator = SceneNarrator(
         primary_voice_id=None,
         set_voice=None,
-        speak=_relay_speak,
+        speak=_narration_speak,
     )
 
     # ── Auto Play Phase A — narration-run machinery (relay) ──
