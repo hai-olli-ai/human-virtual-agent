@@ -136,12 +136,17 @@ from tools.quiz_generation import (
 # (scene change — S65 Bug #2 fix) so both moments narrate identically.
 from narration import (
     NARRATION_INTERRUPTED,
+    PLAYOUT_DRAIN_FALLBACK_S,
     NarrationCompletionGate,
     NarrationInterrupted,
     SceneNarrator,
     build_script_complete_payload,
     run_scene_narration,
 )
+
+# S79 — the animated-narration cue controller (shell plays cached MP4s;
+# the agent cues, times out into TTS, pauses/resumes across barge-ins).
+from services.narration_cue import NarrationCueController
 
 # Block 12 — cache-first Cartesia TTS service (replay of pre-rendered
 # narration PCM via single-shot prime). The narrator's prefetch+prime
@@ -1629,6 +1634,37 @@ async def run_bot_classic(
         tts.prime_cached(cached)
         return cached is not None
 
+    # ── S79 — animated-narration cue path (§2.6, classic) ───────────────
+    # The classic mirror of the relay wiring: the gate supplies both the
+    # barge-in futures and the bot-speaking signal; the pre-cue drain rides
+    # the existing _classic_wait_playout (the gate resolves immediately
+    # when nothing is pending, so no dirty-tracking is needed here).
+    async def _send_cue_message_classic(payload: dict) -> None:
+        await output_transport.send_message(
+            OutputTransportMessageFrame(message=payload)
+        )
+
+    narration_cue_classic = NarrationCueController(
+        send_message=_send_cue_message_classic,
+        speak_fallback=_classic_speak,
+        expect_interruption=narration_gate.expect_interruption,
+        bot_is_speaking=lambda: narration_gate.bot_is_speaking,
+    )
+
+    async def _classic_cue_line(idx: int, seg) -> None:
+        # Drain any earlier TTS'd lines' playout before the clip's own
+        # audio starts (the §3 one-audible-source law); immediate when
+        # nothing is pending. NarrationInterrupted propagates — a barge-in
+        # during the TTS tail keeps today's abort semantics.
+        await _classic_wait_playout(PLAYOUT_DRAIN_FALLBACK_S)
+        anim = seg.animation or {}
+        await narration_cue_classic.cue(
+            line_index=idx,
+            url=anim.get("url") or "",
+            duration_seconds=float(anim.get("duration_seconds") or 0.0),
+            text=seg.text,
+        )
+
     narrator = SceneNarrator(
         primary_voice_id=primary_voice_id_classic,
         set_voice=_classic_set_voice,
@@ -1637,6 +1673,7 @@ async def run_bot_classic(
         prime=_narration_prime,
         set_language=_classic_set_language,  # S77 B5
         room_language=(snapshot_language or "en"),
+        cue=_classic_cue_line,
     )
 
     # ── Auto Play Phase A — narration-run machinery (classic) ──
@@ -1755,6 +1792,10 @@ async def run_bot_classic(
             # Clear the gate's interruption latch + any stale futures
             # from a superseded run (see NarrationCompletionGate.begin_run).
             narration_gate.begin_run()
+            # S79 — arm the cue path (scene id scopes stale completions).
+            narration_cue_classic.begin_run(
+                (snap.get("current_scene") or {}).get("scene_id")
+            )
             try:
                 spoke_script = await run_scene_narration(
                     snap,
@@ -1808,6 +1849,10 @@ async def run_bot_classic(
         """
         try:
             narration_gate.begin_run()
+            # S79 — same cue arming as the scene-change site.
+            narration_cue_classic.begin_run(
+                (scene_snapshot.get("current_scene") or {}).get("scene_id")
+            )
             try:
                 spoke_script = await run_scene_narration(
                     scene_snapshot,
@@ -1858,6 +1903,14 @@ async def run_bot_classic(
         if not isinstance(message, dict):
             return
         msg_type = message.get("type")
+
+        # ── S79 — shell→agent cue completion (Canvas Protocol v0.3) ──
+        # The shell emits `script_complete` when a cued animation clip
+        # ends; the controller resolves the active cue. Legacy shells
+        # never send this — the branch is diff-zero.
+        if msg_type == "script_complete":
+            narration_cue_classic.on_script_complete(message)
+            return
 
         # ── S65c Block 5 — manual visitor-action triggers ──
         # Sit BEFORE the canvas.* dispatch as early-return branches: an
@@ -3015,10 +3068,72 @@ async def run_bot_relay(
     # renderer consumed text and offered no playout signal at all.
     _relay_wait_playout = _soulx_wait_playout if soulx_client is not None else None
 
+    # ── S79 — animated-narration cue path (§2.6, relay) ─────────────────
+    # Lines whose snapshot entry carries `animation.url` are PLAYED BY THE
+    # SHELL (the MP4 carries its own audio); the agent cues, times out into
+    # TTS (never-block), and pauses/resumes across barge-ins. Rooms without
+    # animated lines never construct a cue — the off-path is diff-zero.
+    #
+    # `cue_tts_dirty` tracks whether any TTS was queued since the last
+    # drain: a cue must never start while a TTS'd line's tail still plays
+    # (the §3 one-audible-source law), and the run-level wait_playout must
+    # SKIP entirely on an all-cued run (nothing was ever queued — waiting
+    # on the sink's empty watch would stall to its budget).
+    cue_tts_dirty = {"spoken": False}
+
+    async def _narration_speak_tracked(text: str) -> None:
+        cue_tts_dirty["spoken"] = True
+        await _narration_speak(text)
+
+    async def _relay_wait_playout_s79(timeout_s: float) -> None:
+        if _relay_wait_playout is None:
+            return
+        if not cue_tts_dirty["spoken"]:
+            return  # all-cued run: nothing queued, nothing to drain
+        await _relay_wait_playout(timeout_s)
+        cue_tts_dirty["spoken"] = False
+
+    async def _send_cue_message(payload: dict) -> None:
+        await output_transport.send_message(
+            OutputTransportMessageFrame(message=payload)
+        )
+
+    if soulx_sink is not None:
+        narration_cue = NarrationCueController(
+            send_message=_send_cue_message,
+            speak_fallback=_narration_speak_tracked,
+            expect_interruption=soulx_sink.expect_interruption,
+            bot_is_speaking=lambda: soulx_sink._turn_id is not None,  # noqa: SLF001
+        )
+
+        async def _relay_cue_line(idx: int, seg) -> None:
+            # Drain any TTS'd lines queued before this cue, then re-arm the
+            # sink watch + turn group for the TTS lines that may follow —
+            # the debounced close that fired during the drain ended the
+            # group, and ungrouped consecutive TTS lines would re-create
+            # the 2026-08-05 idle-race desync.
+            if cue_tts_dirty["spoken"]:
+                await _relay_wait_playout_s79(PLAYOUT_DRAIN_FALLBACK_S)
+                soulx_sink.begin_narration_watch()
+                soulx_sink.begin_turn_group()
+            anim = seg.animation or {}
+            await narration_cue.cue(
+                line_index=idx,
+                url=anim.get("url") or "",
+                duration_seconds=float(anim.get("duration_seconds") or 0.0),
+                text=seg.text,
+            )
+    else:
+        # Legacy text relay: no renderer, no cue surface — animated lines
+        # fall through to the (inert) text relay exactly as any line does.
+        narration_cue = None
+        _relay_cue_line = None
+
     narrator = SceneNarrator(
         primary_voice_id=None,
         set_voice=None,
-        speak=_narration_speak,
+        speak=_narration_speak_tracked,
+        cue=_relay_cue_line,
     )
 
     # ── Auto Play Phase A — narration-run machinery (relay) ──
@@ -3125,13 +3240,21 @@ async def run_bot_relay(
                 soulx_sink.begin_narration_watch()
                 if (snap.get("current_scene") or {}).get("has_script"):
                     soulx_sink.begin_turn_group()
+            # S79 — arm the cue path for this run (scene id scopes stale
+            # completions; the dirty flag resets so an all-cued run skips
+            # the sink drain entirely).
+            cue_tts_dirty["spoken"] = False
+            if narration_cue is not None:
+                narration_cue.begin_run(
+                    (snap.get("current_scene") or {}).get("scene_id")
+                )
             try:
                 spoke_script = await run_scene_narration(
                     snap,
                     narrator=narrator,
-                    speak_followup=_narration_speak,
+                    speak_followup=_narration_speak_tracked,
                     force=force,
-                    wait_playout=_relay_wait_playout,
+                    wait_playout=_relay_wait_playout_s79,
                 )
             except NarrationInterrupted:
                 # Mirror of the classic call site (wire rule 2b): the visitor
@@ -3223,12 +3346,18 @@ async def run_bot_relay(
                 soulx_sink.begin_narration_watch()
                 if (scene_snapshot.get("current_scene") or {}).get("has_script"):
                     soulx_sink.begin_turn_group()
+            # S79 — same cue arming as the scene-change site.
+            cue_tts_dirty["spoken"] = False
+            if narration_cue is not None:
+                narration_cue.begin_run(
+                    (scene_snapshot.get("current_scene") or {}).get("scene_id")
+                )
             try:
                 spoke_script = await run_scene_narration(
                     scene_snapshot,
                     narrator=narrator,
-                    speak_followup=_narration_speak,
-                    wait_playout=_relay_wait_playout,
+                    speak_followup=_narration_speak_tracked,
+                    wait_playout=_relay_wait_playout_s79,
                 )
             except NarrationInterrupted:
                 # Mirror of the classic session-start site (wire rule 2b).
@@ -3305,6 +3434,17 @@ async def run_bot_relay(
         # so the canvas message types short-circuit cleanly.
         if isinstance(message, dict):
             msg_type = message.get("type")
+
+            # ── S79 — shell→agent cue completion (Canvas Protocol v0.3) ──
+            # The shell emits `script_complete` when a cued animation clip
+            # ends; the controller resolves the active cue (stale lineIndex
+            # mismatches are ignored). Never one of our own run-level
+            # emissions — Daily doesn't loop app-messages back to sender.
+            # Legacy shells never send this, so the branch is diff-zero.
+            if msg_type == "script_complete":
+                if narration_cue is not None:
+                    narration_cue.on_script_complete(message)
+                return
 
             # ── S65c Block 5 — manual visitor-action triggers ──
             # See classic pipeline for full rationale. Relay-pipeline

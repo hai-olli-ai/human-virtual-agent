@@ -428,6 +428,9 @@ class SoulXAudioSink(FrameProcessor):
         # current narration run rides, and whether the visitor barged in on it.
         self._await_turn_id: Optional[str] = None
         self._watch_interrupted = False
+        # S79 — cue-path barge-in futures (the relay mirror of the classic
+        # gate's expect_interruption): resolved on every InterruptionFrame.
+        self._interruption_waiters: list[asyncio.Future] = []
 
     @property
     def fallback(self) -> bool:
@@ -444,6 +447,14 @@ class SoulXAudioSink(FrameProcessor):
         """
         self._watch_interrupted = False
         self._await_turn_id = self._turn_id
+
+    def expect_interruption(self) -> asyncio.Future:
+        """S79 — a Future resolving on the NEXT InterruptionFrame (the relay
+        mirror of NarrationCompletionGate.expect_interruption). Used by the
+        cue controller's pause/resume path; cancel it when done waiting."""
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._interruption_waiters.append(waiter)
+        return waiter
 
     def begin_turn_group(self) -> None:
         """All TTS envelopes until the group closes ride ONE renderer turn."""
@@ -498,6 +509,10 @@ class SoulXAudioSink(FrameProcessor):
             # close would otherwise fire turn_end for a dead turn id.
             self._cancel_group_close()
             self._watch_interrupted = True
+            for waiter in self._interruption_waiters:
+                if not waiter.done():
+                    waiter.set_result(True)
+            self._interruption_waiters.clear()
             await self._client.interrupt(self._turn_id)
             self._turn_id = None
             await self.push_frame(frame, direction)
