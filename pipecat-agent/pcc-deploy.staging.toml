@@ -2,7 +2,7 @@
 # staging agent is the promotion-verification twin, never a different build.
 # Deploy: pcc deploy --config-file pcc-deploy.staging.toml
 agent_name = "human-virtual-agent-staging"
-image = "haiolli/human-virtual-agent:0.14"
+image = "haiolli/human-virtual-agent:0.15"
 secret_set = "human-virtual-agent-staging-secrets"
 agent_profile = "agent-2x"
 

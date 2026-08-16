@@ -26,6 +26,7 @@ handler skips re-dispatching when stop_reason finally arrives.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -189,6 +190,8 @@ def make_tool_schemas(manifest: Optional[dict] = None) -> list[FunctionSchema]:
             description=(
                 f"Invoke a control verb on the active Canvas Page. Supported verbs: {verbs_str('control')}. "
                 "Control verbs are state transitions (navigation, media playback, clearing). "
+                "Use next_scene ONLY when the visitor explicitly asks for the next scene/slide; "
+                "for 'continue'/'resume'/'keep going', call continue_presentation instead — never both. "
                 "Verb-specific fields MUST be nested inside `args`, not placed at the top level alongside `verb`."
             ),
             properties={
@@ -306,6 +309,13 @@ class CanvasToolContext:
     # aliases_out parameter.
     element_alias_map: dict[str, str] = field(default_factory=dict)
     command_timeout_s: float = 6.0
+    # S79 continue-guard — monotonic deadline; while in the future, scene-nav
+    # verbs arriving through canvas_control are suppressed with a corrective
+    # tool result (continue_presentation owns navigation for the turn it ran
+    # in, incl. the follow-up chaining window). The continue tool's OWN
+    # next_scene dispatch bypasses this (it calls dispatch_canvas_command
+    # directly, not handle_control).
+    nav_guard_until: float = 0.0
     # S66 Block 5a / S67b — lazy vision. handle_analyze calls this before
     # dispatching `analyze`; the closure runs the vision query and RETURNS the
     # vision answer text (or None). handle_analyze folds that text into the
@@ -462,6 +472,27 @@ def make_handlers(ctx: CanvasToolContext):
         verb = args.get("verb")
         verb_args = args.get("args") or {}
         logger.info(f"[CANVAS_CONTROL] called: verb={verb!r} args={verb_args!r}")
+        # S79 continue-guard (field fix 2026-08-16): continue_presentation
+        # owns navigation for its turn — an LLM that ALSO calls a scene-nav
+        # verb gets a corrective result instead of a dispatch (the observed
+        # double-action: narration restarted AND the room advanced).
+        if verb in SCENE_NAV_VERBS and time.monotonic() < ctx.nav_guard_until:
+            logger.info(
+                f"[CANVAS_CONTROL] NAV_SUPPRESSED verb={verb!r} — "
+                "continue_presentation owns navigation this turn"
+            )
+            await params.result_callback(
+                {
+                    "error": "NAV_SUPPRESSED",
+                    "message": (
+                        "Navigation is handled by continue_presentation right "
+                        "now — do not call scene navigation for a 'continue' "
+                        "request; the presentation is already doing the right "
+                        "thing."
+                    ),
+                }
+            )
+            return
         try:
             # Manifest validation. Scene-nav verbs (SCENE_NAV_VERBS) bypass
             # the manifest check because they're handled by the live-room
