@@ -10,7 +10,7 @@ Layers under test:
   * :class:`services.narration_cue.NarrationCueController` — the cue state
     machine: completion via the shell's ``script_complete`` (stale lineIndex
     ignored), timeout ⇒ ``narration_cancel`` + TTS fallback (never-block),
-    barge-in ⇒ ``narration_pause`` → answer → ``narration_resume``.
+    barge-in ⇒ ``narration_cancel`` + NarrationInterrupted (the abort law).
   * Wire casing — snake ``type`` values, camelCase payload fields (the A1
     census law: an underscore type routes to the shell's general handler).
   * :meth:`SoulXAudioSink.expect_interruption` — the relay barge-in future.
@@ -27,8 +27,12 @@ from unittest.mock import AsyncMock, patch
 from pipecat.frames.frames import InterruptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-import services.narration_cue as cue_mod
-from narration import SceneNarrator, plan_narration_segments
+from narration import (
+    NarrationInterrupted,
+    SceneNarrator,
+    plan_continue_action,
+    plan_narration_segments,
+)
 from services.narration_cue import NarrationCueController
 from services.soulx_audio import SoulXAudioClient, SoulXAudioSink
 
@@ -139,16 +143,14 @@ def test_narrator_without_cue_speaks_everything_diff_zero():
 
 
 class _Harness:
-    def __init__(self, *, bot_speaking=lambda: False, timeout_margin_s=0.4):
+    def __init__(self, *, timeout_margin_s=0.4):
         self.sent: list[dict] = []
         self.spoken: list[str] = []
         self._interruption_waiters: list[asyncio.Future] = []
-        self.bot_speaking = bot_speaking
         self.controller = NarrationCueController(
             send_message=self._send,
             speak_fallback=self._speak,
             expect_interruption=self._expect_interruption,
-            bot_is_speaking=lambda: self.bot_speaking(),
             timeout_margin_s=timeout_margin_s,
         )
         self.controller.begin_run("sc-1")
@@ -248,32 +250,31 @@ def test_timeout_sends_cancel_and_falls_back_to_tts():
     _run(body())
 
 
-def test_barge_in_pauses_then_resumes(monkeypatch):
+def test_barge_in_cancels_clip_and_raises_never_speaks():
+    """Field spec 2026-08-16: a barge-in ABORTS the run (the voice-path law).
+    The clip is cancelled shell-side (crossfade to live/portrait — the live
+    SoulX track then carries the answer), NarrationInterrupted propagates so
+    script_complete is suppressed, and the line is deliberately NOT TTS'd —
+    resumption is explicit (Play button / the continue intent)."""
+
     async def body():
-        monkeypatch.setattr(cue_mod, "CUE_ANSWER_START_S", 0.5)
-        monkeypatch.setattr(cue_mod, "CUE_RESUME_SETTLE_S", 0.1)
-        monkeypatch.setattr(cue_mod, "CUE_MAX_PAUSE_S", 5.0)
-        speaking = {"on": False}
-        h = _Harness(bot_speaking=lambda: speaking["on"], timeout_margin_s=5.0)
+        h = _Harness(timeout_margin_s=5.0)
         task = asyncio.create_task(
             h.controller.cue(
                 line_index=0, url="https://x/a.mp4", duration_seconds=30.0, text="Line"
             )
         )
         await asyncio.sleep(0.05)
-        # Visitor barges in; the bot answers for ~0.3s, then goes quiet.
         h.barge_in()
-        await asyncio.sleep(0.05)
-        assert "narration_pause" in h.types_sent()
-        speaking["on"] = True
-        await asyncio.sleep(0.3)
-        speaking["on"] = False
-        # Resume lands after the settle; the clip then completes.
-        await asyncio.sleep(0.6)
-        assert "narration_resume" in h.types_sent()
-        assert h.controller.on_script_complete({"lineIndex": 0}) is True
-        await asyncio.wait_for(task, timeout=2.0)
-        assert h.spoken == []  # pause/resume — never the abort path
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+            raise AssertionError("expected NarrationInterrupted")
+        except NarrationInterrupted:
+            pass
+        assert h.types_sent() == ["narration_segment", "narration_cancel"]
+        assert "narration_pause" not in h.types_sent()
+        assert "narration_resume" not in h.types_sent()
+        assert h.spoken == []  # never TTS the interrupted line
 
     _run(body())
 
@@ -328,3 +329,42 @@ def test_sink_expect_interruption_resolves_on_interruption_frame():
         assert waiter.done() and waiter.result() is True
 
     _run(body())
+
+
+# ──────────────────────────────────────────────────────────────────────
+# plan_continue_action — the spoken-continue intent's one rule
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_continue_action_vectors():
+    # Unfinished narration (interrupted or never run) → resume from segment 0.
+    assert (
+        plan_continue_action(narration_completed=False, scene_index=0, total_scenes=5)
+        == "resume"
+    )
+    assert (
+        plan_continue_action(narration_completed=False, scene_index=4, total_scenes=5)
+        == "resume"
+    )
+    # Finished + a next scene exists → advance.
+    assert (
+        plan_continue_action(narration_completed=True, scene_index=0, total_scenes=5)
+        == "next_scene"
+    )
+    assert (
+        plan_continue_action(narration_completed=True, scene_index=3, total_scenes=5)
+        == "next_scene"
+    )
+    # Finished at the last scene (and degenerate rooms) → end.
+    assert (
+        plan_continue_action(narration_completed=True, scene_index=4, total_scenes=5)
+        == "end"
+    )
+    assert (
+        plan_continue_action(narration_completed=True, scene_index=0, total_scenes=1)
+        == "end"
+    )
+    assert (
+        plan_continue_action(narration_completed=True, scene_index=0, total_scenes=0)
+        == "end"
+    )
