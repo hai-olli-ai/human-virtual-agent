@@ -105,6 +105,7 @@ from persona import build_system_prompt
 # S64c — Canvas Protocol generic tool surface (registered alongside V2.13 tools
 # until Block 7 cutover). See CLAUDE.md "Coming in S64c".
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from tools.canvas_protocol_tools import (
     CanvasToolContext,
@@ -1508,19 +1509,35 @@ async def run_bot_classic(
             if prev is not None and not prev.done():
                 prev.cancel()
             _start_narration_task(_narrate_and_complete(snap, force=True))
+            # Field fix 2026-08-16 #2: (a) the shell suspended auto-play on
+            # the visitor's speech (every user transcript does) and has no
+            # other way to learn narration resumed — without autoplay_state
+            # the re-narration's script_complete dies at the shell's mode
+            # gate (Hai's ruling: auto-advance proceeds). (b) run_llm=False —
+            # a spoken acknowledgment would play OVER the already-cued clip
+            # (the observed double audio); narration restarting IS the ack.
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message={"type": "autoplay_state", "mode": "playing"}
+                )
+            )
             await params.result_callback(
-                {
-                    "status": "resuming_narration",
-                    "note": "Narration restarts from the top of this scene now; "
-                    "acknowledge in a few words and stop talking.",
-                }
+                {"status": "resuming_narration"},
+                properties=FunctionCallResultProperties(run_llm=False),
             )
         elif action == "next_scene":
             try:
                 await dispatch_canvas_command(
                     canvas_ctx, "control", {"verb": "next_scene"}
                 )
-                await params.result_callback({"status": "advanced_to_next_scene"})
+                # Silent advance (run_llm=False) — an acknowledgment would
+                # race the NEXT scene's auto-narration (the same double-audio
+                # bug one step later). Errors keep the LLM turn so it can
+                # explain what went wrong.
+                await params.result_callback(
+                    {"status": "advanced_to_next_scene"},
+                    properties=FunctionCallResultProperties(run_llm=False),
+                )
             except CanvasCommandError as exc:
                 await params.result_callback(
                     {"error": exc.code, "message": exc.message}
@@ -2890,19 +2907,35 @@ async def run_bot_relay(
             _cancel_active_narration_run()
             await _relay_interrupt_narration_turn()
             _start_narration_task(_narrate_and_complete(snap, force=True))
+            # Field fix 2026-08-16 #2: (a) the shell suspended auto-play on
+            # the visitor's speech (every user transcript does) and has no
+            # other way to learn narration resumed — without autoplay_state
+            # the re-narration's script_complete dies at the shell's mode
+            # gate (Hai's ruling: auto-advance proceeds). (b) run_llm=False —
+            # a spoken acknowledgment would play OVER the already-cued clip
+            # (the observed double audio); narration restarting IS the ack.
+            await output_transport.send_message(
+                OutputTransportMessageFrame(
+                    message={"type": "autoplay_state", "mode": "playing"}
+                )
+            )
             await params.result_callback(
-                {
-                    "status": "resuming_narration",
-                    "note": "Narration restarts from the top of this scene now; "
-                    "acknowledge in a few words and stop talking.",
-                }
+                {"status": "resuming_narration"},
+                properties=FunctionCallResultProperties(run_llm=False),
             )
         elif action == "next_scene":
             try:
                 await dispatch_canvas_command(
                     canvas_ctx, "control", {"verb": "next_scene"}
                 )
-                await params.result_callback({"status": "advanced_to_next_scene"})
+                # Silent advance (run_llm=False) — an acknowledgment would
+                # race the NEXT scene's auto-narration (the same double-audio
+                # bug one step later). Errors keep the LLM turn so it can
+                # explain what went wrong.
+                await params.result_callback(
+                    {"status": "advanced_to_next_scene"},
+                    properties=FunctionCallResultProperties(run_llm=False),
+                )
             except CanvasCommandError as exc:
                 await params.result_callback(
                     {"error": exc.code, "message": exc.message}
