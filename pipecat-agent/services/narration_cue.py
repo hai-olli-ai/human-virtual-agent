@@ -10,9 +10,13 @@ never-block law shapes every exit:
   * timeout     → ``duration + margin`` elapsed with no completion (shell too
                   old, URL 404, tab hidden…) — send ``narration_cancel`` and
                   SPEAK the line through the pipeline's own TTS;
-  * barge-in    → ``narration_pause``, let the conversation answer on the live
-                  path, then ``narration_resume`` at position (§2.6 — pause,
-                  not the abort semantics TTS narration keeps).
+  * barge-in    → ``narration_cancel`` + :class:`NarrationInterrupted` — the
+                  SAME abort law voice narration follows (field spec
+                  2026-08-16, superseding §2.6's pause/resume sketch): the
+                  run dies, ``script_complete`` is suppressed, and resumption
+                  is EXPLICIT — the Play button (``autoplay_control resume``)
+                  or the spoken-continue intent, both re-narrating the scene
+                  from segment 0.
 
 Wire casing (the A1 census law): ``type`` values are snake_case, payload
 FIELDS are camelCase — an underscore type routes to the shell's general
@@ -30,23 +34,14 @@ from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
 
+from narration import NarrationInterrupted
+
 # Timer margin over the clip's own duration before the TTS fallback fires.
 CUE_TIMEOUT_MARGIN_S = 10.0
-# After a barge-in: how long we're willing to hold the paused clip while the
-# conversation answers, before resuming regardless (a stuck detector, not a
-# feature — ☐12 exercises the real path).
-CUE_MAX_PAUSE_S = 180.0
-# The answer must START within this window after a barge-in or we resume
-# (visitor noise with no actual question produces no bot turn at all).
-CUE_ANSWER_START_S = 20.0
-# Settle after the bot's answer finishes before the video resumes.
-CUE_RESUME_SETTLE_S = 2.0
-_POLL_S = 0.25
 
 SendFn = Callable[[dict], Awaitable[None]]
 SpeakFn = Callable[[str], Awaitable[None]]
 ExpectInterruptionFn = Callable[[], "asyncio.Future[Any]"]
-BoolFn = Callable[[], bool]
 
 
 class NarrationCueController:
@@ -59,13 +54,11 @@ class NarrationCueController:
         send_message: SendFn,
         speak_fallback: SpeakFn,
         expect_interruption: ExpectInterruptionFn,
-        bot_is_speaking: BoolFn,
         timeout_margin_s: float = CUE_TIMEOUT_MARGIN_S,
     ):
         self._send = send_message
         self._speak_fallback = speak_fallback
         self._expect_interruption = expect_interruption
-        self._bot_is_speaking = bot_is_speaking
         self._timeout_margin_s = timeout_margin_s
         self._scene_id: Optional[str] = None
         self._active_line: Optional[int] = None
@@ -136,55 +129,27 @@ class NarrationCueController:
             await self._speak_fallback(text)
 
     async def _await_playback(self, duration_seconds: float) -> bool:
-        """Wait out one clip: completion wins; barge-in pauses and resumes;
-        the (re-armed) timer loses to the fallback."""
-        while True:
-            timeout = max(1.0, float(duration_seconds or 0.0)) + self._timeout_margin_s
-            interruption = self._expect_interruption()
-            done, _ = await asyncio.wait(
-                {self._completion, interruption},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if self._completion in done and not self._completion.cancelled():
-                if not interruption.done():
-                    interruption.cancel()
-                return True
-            if interruption in done and not interruption.cancelled():
-                await self._pause_for_answer()
-                # Loop: fresh interruption future + a fresh full timer (the
-                # shell resumed at position; full-duration + margin is a safe
-                # cap, not a schedule).
-                continue
-            # timeout
+        """Wait out one clip: completion wins; barge-in cancels the clip and
+        raises (the run aborts — field spec 2026-08-16); the timer loses to
+        the TTS fallback."""
+        timeout = max(1.0, float(duration_seconds or 0.0)) + self._timeout_margin_s
+        interruption = self._expect_interruption()
+        done, _ = await asyncio.wait(
+            {self._completion, interruption},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if self._completion in done and not self._completion.cancelled():
             if not interruption.done():
                 interruption.cancel()
-            return False
-
-    async def _pause_for_answer(self) -> None:
-        """§2.6 barge-in: pause the clip, let the live path answer, resume."""
-        await self._send({"type": "narration_pause"})
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + CUE_MAX_PAUSE_S
-        answer_start_deadline = loop.time() + CUE_ANSWER_START_S
-        # Phase 1: wait for the answer to START (bot speaking) — a barge-in
-        # that produces no bot turn at all resumes after a short window.
-        while loop.time() < answer_start_deadline:
-            if self._bot_is_speaking():
-                break
-            if self._completion is not None and self._completion.done():
-                return  # shell finished anyway (races are legal)
-            await asyncio.sleep(_POLL_S)
-        # Phase 2: wait for the answer to FINISH (quiet + settle), capped.
-        quiet_since: float | None = None
-        while loop.time() < deadline:
-            if self._completion is not None and self._completion.done():
-                return
-            if self._bot_is_speaking():
-                quiet_since = None
-            elif quiet_since is None:
-                quiet_since = loop.time()
-            elif loop.time() - quiet_since >= CUE_RESUME_SETTLE_S:
-                break
-            await asyncio.sleep(_POLL_S)
-        await self._send({"type": "narration_resume"})
+            return True
+        if interruption in done and not interruption.cancelled():
+            # Clear the clip shell-side (crossfade to live/portrait — the
+            # live SoulX track then carries the ANSWER in talking mode),
+            # then abort the run like any interrupted narration.
+            await self._send({"type": "narration_cancel"})
+            raise NarrationInterrupted()
+        # timeout
+        if not interruption.done():
+            interruption.cancel()
+        return False

@@ -104,6 +104,7 @@ from persona import build_system_prompt
 
 # S64c — Canvas Protocol generic tool surface (registered alongside V2.13 tools
 # until Block 7 cutover). See CLAUDE.md "Coming in S64c".
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from tools.canvas_protocol_tools import (
     CanvasToolContext,
@@ -141,7 +142,25 @@ from narration import (
     NarrationInterrupted,
     SceneNarrator,
     build_script_complete_payload,
+    plan_continue_action,
     run_scene_narration,
+)
+
+# S79 field spec (2026-08-16) — the deterministic spoken-continue intent.
+# One tool, one rule: unfinished narration on the current scene resumes from
+# segment 0; finished narration advances to the next scene when one exists.
+CONTINUE_PRESENTATION_SCHEMA = FunctionSchema(
+    name="continue_presentation",
+    description=(
+        "Call when the visitor asks to continue, resume, or keep going with "
+        "the presentation or narration — e.g. 'continue', 'go on', 'keep "
+        "going', 'resume', 'carry on', or an equivalent in the room's "
+        "language. If this scene's narration hasn't finished it restarts "
+        "from the top of the scene; otherwise it advances to the next scene. "
+        "Returns what happened — acknowledge in a few words and stop talking."
+    ),
+    properties={},
+    required=[],
 )
 
 # S79 — the animated-narration cue controller (shell plays cached MP4s;
@@ -1080,6 +1099,7 @@ async def run_bot_classic(
             # shares the same registration surface.
             GENERATE_QUIZ_SCHEMA,
             AGENT_ANNOTATE_SCHEMA,
+            CONTINUE_PRESENTATION_SCHEMA,  # S79 — spoken-continue intent
         ],
     )
 
@@ -1446,6 +1466,67 @@ async def run_bot_classic(
         make_handle_generate_quiz(api_client, session_context, canvas_ctx),
     )
 
+    # ── S79 — the spoken-continue intent (field spec 2026-08-16) ──
+    # Deterministic: unfinished narration on the current scene resumes from
+    # segment 0 (the frozen resume contract); finished narration advances to
+    # the next scene via the SAME shell-routed nav verb voice-"next" uses.
+    async def handle_continue_presentation(params):
+        from api_client import get_scene_snapshot
+        from tools.canvas_protocol_tools import (
+            CanvasCommandError,
+            dispatch_canvas_command,
+        )
+
+        snap = await get_scene_snapshot(room_id, api_url) if room_id else None
+        if not snap:
+            await params.result_callback(
+                {"error": "no_session", "message": "No active scene to continue."}
+            )
+            return
+        scene_id = (snap.get("current_scene") or {}).get("scene_id")
+        flow_state = snap.get("flow_state") or {}
+        action = plan_continue_action(
+            narration_completed=(
+                scene_id is not None and narration_completed["scene_id"] == scene_id
+            ),
+            scene_index=int(flow_state.get("scene_index") or 0),
+            total_scenes=int(flow_state.get("total_scenes") or 0),
+        )
+        logger.info("[CONTINUE] intent -> {} (scene_id={})", action, scene_id)
+        if action == "resume":
+            # Classic supersede is inline (no helper here — the relay's
+            # _cancel_active_narration_run is relay-scoped).
+            prev = scene_narration_task["task"]
+            if prev is not None and not prev.done():
+                prev.cancel()
+            _start_narration_task(_narrate_and_complete(snap, force=True))
+            await params.result_callback(
+                {
+                    "status": "resuming_narration",
+                    "note": "Narration restarts from the top of this scene now; "
+                    "acknowledge in a few words and stop talking.",
+                }
+            )
+        elif action == "next_scene":
+            try:
+                await dispatch_canvas_command(
+                    canvas_ctx, "control", {"verb": "next_scene"}
+                )
+                await params.result_callback({"status": "advanced_to_next_scene"})
+            except CanvasCommandError as exc:
+                await params.result_callback(
+                    {"error": exc.code, "message": exc.message}
+                )
+        else:
+            await params.result_callback(
+                {
+                    "status": "end_of_presentation",
+                    "note": "No further scenes; tell the visitor the presentation is complete.",
+                }
+            )
+
+    llm.register_function("continue_presentation", handle_continue_presentation)
+
     # ── Block 8 — canvas_annotate (agent overlay annotations) ──
     # Standalone tool (like generate_quiz_from_knowledge), NOT a canvas protocol
     # tool: it emits a session-level agent_annotate message instead of dispatching
@@ -1648,7 +1729,6 @@ async def run_bot_classic(
         send_message=_send_cue_message_classic,
         speak_fallback=_classic_speak,
         expect_interruption=narration_gate.expect_interruption,
-        bot_is_speaking=lambda: narration_gate.bot_is_speaking,
     )
 
     async def _classic_cue_line(idx: int, seg) -> None:
@@ -1753,6 +1833,11 @@ async def run_bot_classic(
     # the visitor's own speech drives the LLM from there, and a
     # belated greeting mid-conversation would be worse than none.
     session_seeded = {"done": False}
+    # S79 continue-intent — which scene's narration ran to a TRUTHFUL
+    # completion (script_complete emitted). An interrupted run never sets
+    # it, so "continue" on that scene resumes narration; a completed scene
+    # advances instead. Reset implicitly by scene change (ids differ).
+    narration_completed = {"scene_id": None}
 
     async def _seed_session_context_once(spoke_script: bool) -> None:
         if session_seeded["done"]:
@@ -1822,6 +1907,11 @@ async def run_bot_classic(
                     )
                 )
             )
+            # S79 — a TRUTHFUL completion (emitted, not suppressed) marks
+            # this scene done for the spoken-continue intent.
+            narration_completed["scene_id"] = (snap.get("current_scene") or {}).get(
+                "scene_id"
+            )
             logger.info(
                 "[NARRATION] run complete spoke_script={} trigger={}",
                 spoke_script,
@@ -1877,6 +1967,9 @@ async def run_bot_classic(
                     )
                 )
             )
+            narration_completed["scene_id"] = (
+                (scene_snapshot or {}).get("current_scene") or {}
+            ).get("scene_id")  # S79 continue-intent
             await _seed_session_context_once(spoke_script)
         except asyncio.CancelledError:
             logger.info(
@@ -2438,6 +2531,7 @@ async def run_bot_relay(
             # S64e — generate_quiz_from_knowledge alongside canvas tools.
             GENERATE_QUIZ_SCHEMA,
             AGENT_ANNOTATE_SCHEMA,
+            CONTINUE_PRESENTATION_SCHEMA,  # S79 — spoken-continue intent
         ],
     )
 
@@ -2748,6 +2842,66 @@ async def run_bot_relay(
         "generate_quiz_from_knowledge",
         make_handle_generate_quiz(api_client, session_context, canvas_ctx),
     )
+
+    # ── S79 — the spoken-continue intent (field spec 2026-08-16) ──
+    # Deterministic: unfinished narration on the current scene resumes from
+    # segment 0 (the frozen resume contract); finished narration advances to
+    # the next scene via the SAME shell-routed nav verb voice-"next" uses.
+    async def handle_continue_presentation(params):
+        from api_client import get_scene_snapshot
+        from tools.canvas_protocol_tools import (
+            CanvasCommandError,
+            dispatch_canvas_command,
+        )
+
+        snap = await get_scene_snapshot(room_id, api_url) if room_id else None
+        if not snap:
+            await params.result_callback(
+                {"error": "no_session", "message": "No active scene to continue."}
+            )
+            return
+        scene_id = (snap.get("current_scene") or {}).get("scene_id")
+        flow_state = snap.get("flow_state") or {}
+        action = plan_continue_action(
+            narration_completed=(
+                scene_id is not None and narration_completed["scene_id"] == scene_id
+            ),
+            scene_index=int(flow_state.get("scene_index") or 0),
+            total_scenes=int(flow_state.get("total_scenes") or 0),
+        )
+        logger.info("[CONTINUE] intent -> {} (scene_id={})", action, scene_id)
+        if action == "resume":
+            # Ordering rule (see _relay_interrupt_narration_turn): cancel the
+            # superseded run FIRST, then interrupt its open turn.
+            _cancel_active_narration_run()
+            await _relay_interrupt_narration_turn()
+            _start_narration_task(_narrate_and_complete(snap, force=True))
+            await params.result_callback(
+                {
+                    "status": "resuming_narration",
+                    "note": "Narration restarts from the top of this scene now; "
+                    "acknowledge in a few words and stop talking.",
+                }
+            )
+        elif action == "next_scene":
+            try:
+                await dispatch_canvas_command(
+                    canvas_ctx, "control", {"verb": "next_scene"}
+                )
+                await params.result_callback({"status": "advanced_to_next_scene"})
+            except CanvasCommandError as exc:
+                await params.result_callback(
+                    {"error": exc.code, "message": exc.message}
+                )
+        else:
+            await params.result_callback(
+                {
+                    "status": "end_of_presentation",
+                    "note": "No further scenes; tell the visitor the presentation is complete.",
+                }
+            )
+
+    llm.register_function("continue_presentation", handle_continue_presentation)
 
     # ── Block 8 — canvas_annotate (agent overlay annotations) ──
     # Standalone tool (like generate_quiz_from_knowledge), NOT a canvas protocol
@@ -3103,7 +3257,6 @@ async def run_bot_relay(
             send_message=_send_cue_message,
             speak_fallback=_narration_speak_tracked,
             expect_interruption=soulx_sink.expect_interruption,
-            bot_is_speaking=lambda: soulx_sink._turn_id is not None,  # noqa: SLF001
         )
 
         async def _relay_cue_line(idx: int, seg) -> None:
@@ -3190,6 +3343,8 @@ async def run_bot_relay(
     # for the full rationale). _queue_greeting seeds on completion;
     # if it was cancelled by a superseding run, that run seeds instead.
     session_seeded = {"done": False}
+    # S79 continue-intent — truthful-completion marker (classic mirror).
+    narration_completed = {"scene_id": None}
 
     async def _seed_session_context_once(spoke_script: bool) -> None:
         if session_seeded["done"]:
@@ -3279,6 +3434,11 @@ async def run_bot_relay(
                         snap, spoke_script=spoke_script, trigger=trigger
                     )
                 )
+            )
+            # S79 — a TRUTHFUL completion (emitted, not suppressed) marks
+            # this scene done for the spoken-continue intent.
+            narration_completed["scene_id"] = (snap.get("current_scene") or {}).get(
+                "scene_id"
             )
             logger.info(
                 "[NARRATION] run complete spoke_script={} trigger={}",
@@ -3381,6 +3541,9 @@ async def run_bot_relay(
                 )
             )
         )
+        narration_completed["scene_id"] = (
+            (scene_snapshot or {}).get("current_scene") or {}
+        ).get("scene_id")  # S79 continue-intent
 
         # Phase A — one-time seeding via the shared helper: if this
         # greeting gets cancelled by a superseding run before reaching

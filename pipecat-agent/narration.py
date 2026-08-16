@@ -261,6 +261,26 @@ def plan_scene_transition_pause_s(snapshot: dict, *, spoke_script: bool) -> floa
     return SCENE_TRANSITION_PAUSE_MS / 1000.0 if (auto and not is_last) else 0.0
 
 
+def plan_continue_action(
+    *,
+    narration_completed: bool,
+    scene_index: int,
+    total_scenes: int,
+) -> str:
+    """S79 field spec (2026-08-16) — the spoken-continue intent's one rule.
+
+    Pure: no I/O. ``resume`` when the current scene's narration never ran to
+    a truthful completion (interrupted / never started — re-narrate from
+    segment 0 per the frozen resume contract); ``next_scene`` when it did and
+    a next scene exists; ``end`` at the last scene.
+    """
+    if not narration_completed:
+        return "resume"
+    if scene_index + 1 < max(0, total_scenes):
+        return "next_scene"
+    return "end"
+
+
 def build_script_complete_payload(
     snapshot: dict | None,
     *,
