@@ -152,12 +152,14 @@ from narration import (
 CONTINUE_PRESENTATION_SCHEMA = FunctionSchema(
     name="continue_presentation",
     description=(
-        "Call when the visitor asks to continue, resume, or keep going with "
-        "the presentation or narration — e.g. 'continue', 'go on', 'keep "
-        "going', 'resume', 'carry on', or an equivalent in the room's "
-        "language. If this scene's narration hasn't finished it restarts "
-        "from the top of the scene; otherwise it advances to the next scene. "
-        "Returns what happened — acknowledge in a few words and stop talking."
+        "The ONLY tool for continue/resume intents: call it — and nothing "
+        "else — when the visitor says 'continue', 'go on', 'keep going', "
+        "'resume', 'carry on', or an equivalent in the room's language. It "
+        "decides everything itself: unfinished narration restarts from the "
+        "top of the scene; finished narration advances to the next scene. "
+        "NEVER pair it with canvas_control navigation — it already "
+        "navigates when appropriate. Returns what happened — acknowledge "
+        "in a few words and stop talking."
     ),
     properties={},
     required=[],
@@ -1477,6 +1479,12 @@ async def run_bot_classic(
             dispatch_canvas_command,
         )
 
+        # S79 continue-guard: this tool owns navigation for its turn (plus a
+        # short chaining window) — a parallel/follow-up scene-nav call gets a
+        # corrective result instead of double-acting. Armed FIRST, before any
+        # await, so the sequential handler run of a same-turn nav call is
+        # already guarded.
+        canvas_ctx.nav_guard_until = time.monotonic() + 3.0
         snap = await get_scene_snapshot(room_id, api_url) if room_id else None
         if not snap:
             await params.result_callback(
@@ -2854,6 +2862,12 @@ async def run_bot_relay(
             dispatch_canvas_command,
         )
 
+        # S79 continue-guard: this tool owns navigation for its turn (plus a
+        # short chaining window) — a parallel/follow-up scene-nav call gets a
+        # corrective result instead of double-acting. Armed FIRST, before any
+        # await, so the sequential handler run of a same-turn nav call is
+        # already guarded.
+        canvas_ctx.nav_guard_until = time.monotonic() + 3.0
         snap = await get_scene_snapshot(room_id, api_url) if room_id else None
         if not snap:
             await params.result_callback(

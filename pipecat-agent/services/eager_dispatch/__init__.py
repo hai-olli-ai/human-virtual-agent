@@ -35,6 +35,7 @@ from typing import Optional
 
 from tools.canvas_protocol_tools import (
     EAGER_DISPATCH_VERBS,
+    SCENE_NAV_VERBS,
     PendingCommandRegistry,
     build_canvas_command,
 )
@@ -90,6 +91,12 @@ class EagerToolCallTracker:
         if idx in self._calls:
             self._calls[idx]["eager_fired"] = True
 
+    def has_tool(self, tool_name: str) -> bool:
+        """S79 continue-guard — whether this stream turn already contains a
+        call to `tool_name` (any index). The tracker is the only component
+        that sees the whole turn while it streams."""
+        return any(c["tool"] == tool_name for c in self._calls.values())
+
     def reset(self):
         self._calls.clear()
 
@@ -112,6 +119,24 @@ async def maybe_fire_eager(
 
     verb = detect_completed_verb(call["args"])
     if not verb or not is_arg_less_verb(verb):
+        return
+
+    # S79 continue-guard (field fix 2026-08-16): a turn that carries
+    # continue_presentation OWNS its navigation — the tool itself advances
+    # when appropriate. LLMs sometimes parallel-call next_scene alongside it
+    # ("continue" reads as both intents), and the eager fire would navigate
+    # before the continue handler even runs — the observed double-action
+    # (narration restarts AND the room jumps). Suppress the eager fire; the
+    # non-eager handler path then hits the nav_guard_until check and returns
+    # a corrective tool result instead. (Residual edge, accepted: a nav call
+    # streamed BEFORE continue_presentation begins can still eager-fire —
+    # rare ordering; the guard converts the common case to single-action.)
+    if verb in SCENE_NAV_VERBS and tracker.has_tool("continue_presentation"):
+        logger.info(
+            "[EAGER] suppressing scene-nav verb %r — continue_presentation "
+            "owns navigation this turn",
+            verb,
+        )
         return
 
     # Fire it. Wire-format tool name is the part after "canvas_" — the
