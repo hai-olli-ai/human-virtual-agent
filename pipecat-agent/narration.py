@@ -1048,3 +1048,83 @@ class NarrationCompletionGate(FrameProcessor):
             self._resolve_deque(self._drain_pending, NARRATION_INTERRUPTED)
             self._resolve_deque(self._interrupt_waiters, None)
         await self.push_frame(frame, direction)
+
+
+# ── S83 (PR-6) — live CTA + handoff: the pure message-contract helpers ──
+#
+# The two S83 inbound app-messages (`cta_completed {}` and
+# `handoff_state {state}`) are handled by nested closures in both
+# pipeline routers; these module-level helpers carry every decision the
+# closures make, so contract-mirror tests machine-verify them (the
+# `request_quiz_ready` precedent). Two laws they encode:
+#
+#   · The spoken ack text comes from the SNAPSHOT ONLY — `cta_completed`
+#     is deliberately an empty payload and `handoff_state` carries only
+#     `state`; wire text is never spoken (a visitor cannot puppet the
+#     twin).
+#   · h6-B "one line, then quiet": each ack speaks at most once per
+#     session, and the handoff hold gates every narration entry point
+#     (all of them funnel through `_start_narration_task`, which asks
+#     `narration_allowed`).
+
+
+def resolve_cta_ack_line(snapshot: dict | None) -> str | None:
+    """The completed-ack line — root `target_action.completed_ack_line`.
+
+    None when the room owns no target or the line is blank (the handler
+    then stays silent; completion UI is the shell's job either way).
+    """
+    target = (snapshot or {}).get("target_action") or {}
+    line = (target.get("completed_ack_line") or "").strip()
+    return line or None
+
+
+def resolve_handoff_ack_line(snapshot: dict | None) -> str | None:
+    """The handoff ack — `live_room.handoff.ack_line` (P-6's h6-B line)."""
+    handoff = ((snapshot or {}).get("live_room") or {}).get("handoff") or {}
+    line = (handoff.get("ack_line") or "").strip()
+    return line or None
+
+
+def take_cta_ack(cta_ack_spoken: dict, snapshot: dict | None) -> str | None:
+    """Consume the once-per-session cta_completed ack.
+
+    Flips the guard on FIRST receipt (line or not) — "once per session"
+    is literal: a re-sent flip after a lineless first receipt must not
+    suddenly speak.
+    """
+    if cta_ack_spoken.get("done"):
+        return None
+    cta_ack_spoken["done"] = True
+    return resolve_cta_ack_line(snapshot)
+
+
+def apply_handoff_state(
+    handoff_quiet: dict,
+    handoff_ack_spoken: dict,
+    state: object,
+    snapshot: dict | None,
+) -> str | None:
+    """Apply one `handoff_state` transition; returns the ack line to
+    speak (open, first time only) or None.
+
+    'open' arms the quiet hold (h6-C — the room holds still); 'closed'
+    lifts it (h6-D — nothing auto-resumes: the shell's Play control owns
+    resumption). Unknown states are ignored.
+    """
+    if state == "open":
+        handoff_quiet["on"] = True
+        if handoff_ack_spoken.get("done"):
+            return None
+        handoff_ack_spoken["done"] = True
+        return resolve_handoff_ack_line(snapshot)
+    if state == "closed":
+        handoff_quiet["on"] = False
+    return None
+
+
+def narration_allowed(handoff_quiet: dict) -> bool:
+    """The `_start_narration_task` gate: no narration while the handoff
+    modal holds the room (scene-entry, session-start, manual replay, and
+    autoplay resume all funnel through the slot)."""
+    return not handoff_quiet.get("on")
