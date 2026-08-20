@@ -142,9 +142,12 @@ from narration import (
     NarrationCompletionGate,
     NarrationInterrupted,
     SceneNarrator,
+    apply_handoff_state,
     build_script_complete_payload,
+    narration_allowed,
     plan_continue_action,
     run_scene_narration,
+    take_cta_ack,
 )
 
 # S79 field spec (2026-08-16) — the deterministic spoken-continue intent.
@@ -1239,6 +1242,15 @@ async def run_bot_classic(
     # a cancelled run never emits script_complete.
     scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
 
+    # S83 — the handoff room-hold (h6-B/C) + the two once-per-session ack
+    # guards. Declared beside the slot (the narration_completed idiom);
+    # the hold gates the slot itself, so every narration entry point —
+    # scene-entry, session-start, manual replay, autoplay resume — is
+    # covered by one check.
+    handoff_quiet = {"on": False}
+    handoff_ack_spoken = {"done": False}
+    cta_ack_spoken = {"done": False}
+
     def _start_narration_task(coro, *, replace: bool = True) -> bool:
         """Put a narration coroutine into the single slot (Phase A).
 
@@ -1247,7 +1259,14 @@ async def run_bot_classic(
         start) yields to an already-active run instead: a run that raced
         ahead already owns narration, and stomping it would
         double-narrate. Returns True iff the task was started.
+
+        S83 — the handoff hold (h6-C) suppresses every start while the
+        modal is open; 'closed' lifts the hold but never auto-resumes.
         """
+        if not narration_allowed(handoff_quiet):
+            coro.close()  # avoid a "never awaited" warning
+            logger.info("[HANDOFF] narration suppressed — modal open")
+            return False
         prev = scene_narration_task["task"]
         if prev is not None and not prev.done():
             if not replace:
@@ -2030,6 +2049,45 @@ async def run_bot_classic(
             narration_cue_classic.on_script_complete(message)
             return
 
+        # ── S83 (PR-6) — live CTA + handoff, early-return before canvas.*.
+        # BOTH acks are TTS-DIRECT (a bare TTSSpeakFrame, the
+        # _soulx_narration_speak rationale): routing them through the LLM
+        # context is the documented double-audio bug (see the
+        # continue_presentation resume comment). The spoken text comes
+        # from the SNAPSHOT ONLY — both payloads carry no speakable
+        # fields, so a visitor cannot puppet the twin.
+        if msg_type == "cta_completed":
+            ack = take_cta_ack(cta_ack_spoken, scene_snapshot)
+            if ack:
+                logger.info("[CTA] completed — speaking the ack line")
+                await task.queue_frames([TTSSpeakFrame(text=ack)])
+            else:
+                logger.info("[CTA] completed — no ack line / already spoken")
+            return
+
+        if msg_type == "handoff_state":
+            state = message.get("state")
+            ack = apply_handoff_state(
+                handoff_quiet, handoff_ack_spoken, state, scene_snapshot
+            )
+            if state == "open":
+                # h6-C — the room holds still: kill the active narration
+                # run + flush queued bot audio (the autoplay-stop idiom),
+                # then say the ONE permitted line (h6-B).
+                prev = scene_narration_task["task"]
+                if prev is not None and not prev.done():
+                    prev.cancel()
+                narration_gate.cancel_all("handoff_open")
+                await _flush_bot_audio("handoff_open")
+                if ack:
+                    await task.queue_frames([TTSSpeakFrame(text=ack)])
+                logger.info("[HANDOFF] open — narration held, ack={}", bool(ack))
+            elif state == "closed":
+                logger.info("[HANDOFF] closed — hold lifted (no auto-resume)")
+            else:
+                logger.warning("[HANDOFF] unknown state {!r} ignored", state)
+            return
+
         # ── S65c Block 5 — manual visitor-action triggers ──
         # Sit BEFORE the canvas.* dispatch as early-return branches: an
         # inbound payload's `type` is the sole discriminator and we want
@@ -2660,6 +2718,15 @@ async def run_bot_relay(
     # a cancelled run never emits script_complete.
     scene_narration_task: dict[str, asyncio.Task | None] = {"task": None}
 
+    # S83 — the handoff room-hold (h6-B/C) + the two once-per-session ack
+    # guards. Declared beside the slot (the narration_completed idiom);
+    # the hold gates the slot itself, so every narration entry point —
+    # scene-entry, session-start, manual replay, autoplay resume — is
+    # covered by one check.
+    handoff_quiet = {"on": False}
+    handoff_ack_spoken = {"done": False}
+    cta_ack_spoken = {"done": False}
+
     def _start_narration_task(coro, *, replace: bool = True) -> bool:
         """Put a narration coroutine into the single slot (Phase A).
 
@@ -2668,7 +2735,14 @@ async def run_bot_relay(
         start) yields to an already-active run instead: a run that raced
         ahead already owns narration, and stomping it would
         double-narrate. Returns True iff the task was started.
+
+        S83 — the handoff hold (h6-C) suppresses every start while the
+        modal is open; 'closed' lifts the hold but never auto-resumes.
         """
+        if not narration_allowed(handoff_quiet):
+            coro.close()  # avoid a "never awaited" warning
+            logger.info("[HANDOFF] narration suppressed — modal open")
+            return False
         prev = scene_narration_task["task"]
         if prev is not None and not prev.done():
             if not replace:
@@ -3654,6 +3728,40 @@ async def run_bot_relay(
             if msg_type == "script_complete":
                 if narration_cue is not None:
                     narration_cue.on_script_complete(message)
+                return
+
+            # ── S83 (PR-6) — live CTA + handoff (see the classic router
+            # for the full rationale). Relay deltas: acks speak via
+            # _narration_speak (soulx-audio queues a TTSSpeakFrame — the
+            # identical direct path; legacy text relay forwards TEXT and
+            # must close its turn, the request_narrate lesson), and the
+            # hold uses the relay cancel + turn-interrupt pair.
+            if msg_type == "cta_completed":
+                ack = take_cta_ack(cta_ack_spoken, scene_snapshot)
+                if ack:
+                    logger.info("[CTA] completed — speaking the ack line")
+                    await _narration_speak(ack)
+                    await _relay_close_turn()
+                else:
+                    logger.info("[CTA] completed — no ack line / already spoken")
+                return
+
+            if msg_type == "handoff_state":
+                state = message.get("state")
+                ack = apply_handoff_state(
+                    handoff_quiet, handoff_ack_spoken, state, scene_snapshot
+                )
+                if state == "open":
+                    _cancel_active_narration_run()
+                    await _relay_interrupt_narration_turn()
+                    if ack:
+                        await _narration_speak(ack)
+                        await _relay_close_turn()
+                    logger.info("[HANDOFF] open — narration held, ack={}", bool(ack))
+                elif state == "closed":
+                    logger.info("[HANDOFF] closed — hold lifted (no auto-resume)")
+                else:
+                    logger.warning("[HANDOFF] unknown state {!r} ignored", state)
                 return
 
             # ── S65c Block 5 — manual visitor-action triggers ──
