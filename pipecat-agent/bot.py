@@ -49,6 +49,8 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TextFrame,
     UserAudioRawFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -113,6 +115,7 @@ from tools.canvas_protocol_tools import (
     make_handlers as make_canvas_protocol_handlers,
     make_tool_schemas as make_canvas_protocol_schemas,
 )
+from tools.user_text import clean_user_text
 from context.canvas_manifest import CanvasManifestRegistry
 from context.transcript_aggregator import WordBoundaryAggregator
 from context.prompt_builder import (
@@ -2088,6 +2091,29 @@ async def run_bot_classic(
                 logger.warning("[HANDOFF] unknown state {!r} ignored", state)
             return
 
+        # ── S83 PR-13 — the panel's typed question. The VAD trio makes it
+        # byte-equivalent to speech: same aggregator turn, same barge-in
+        # interruption, same TranscriptForwarder echo to the shell.
+        if msg_type == "user_text":
+            typed = clean_user_text(message)
+            if not typed:
+                return
+            logger.info("[USER_TEXT] typed question ({} chars)", len(typed))
+            from datetime import UTC, datetime
+
+            await task.queue_frames(
+                [
+                    UserStartedSpeakingFrame(),
+                    TranscriptionFrame(
+                        text=typed,
+                        user_id="visitor",
+                        timestamp=datetime.now(UTC).isoformat(),
+                    ),
+                    UserStoppedSpeakingFrame(),
+                ]
+            )
+            return
+
         # ── S65c Block 5 — manual visitor-action triggers ──
         # Sit BEFORE the canvas.* dispatch as early-return branches: an
         # inbound payload's `type` is the sole discriminator and we want
@@ -3762,6 +3788,29 @@ async def run_bot_relay(
                     logger.info("[HANDOFF] closed — hold lifted (no auto-resume)")
                 else:
                     logger.warning("[HANDOFF] unknown state {!r} ignored", state)
+                return
+
+            # ── S83 PR-13 — typed question (see the classic router; the
+            # relay pipeline runs the same STT→aggregator→LLM chain, so
+            # the VAD trio behaves identically).
+            if msg_type == "user_text":
+                typed = clean_user_text(message)
+                if not typed:
+                    return
+                logger.info("[USER_TEXT] typed question ({} chars)", len(typed))
+                from datetime import UTC, datetime
+
+                await task.queue_frames(
+                    [
+                        UserStartedSpeakingFrame(),
+                        TranscriptionFrame(
+                            text=typed,
+                            user_id="visitor",
+                            timestamp=datetime.now(UTC).isoformat(),
+                        ),
+                        UserStoppedSpeakingFrame(),
+                    ]
+                )
                 return
 
             # ── S65c Block 5 — manual visitor-action triggers ──

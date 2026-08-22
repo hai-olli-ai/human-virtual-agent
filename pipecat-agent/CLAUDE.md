@@ -786,3 +786,7 @@ PR-6's whole footprint: **`cta_completed {}`** and **`handoff_state {state}`** h
 - `canvas_page_type='cta'` needs no tolerance work: `scene_context.py`'s neutral unknown-page-type fallback (post-S64d) already covers it, and `api_client`'s setdefaults tolerate the additive snapshot keys.
 - Image **0.17** pinned in BOTH tomls; deploy = build + `pcc deploy` staging-first (★ operator).
 
+### PR-13 addendum — `user_text` (image 0.18)
+
+The panel's typed question (P-11's deferred half, lifted by Hai): `user_text {text}` in BOTH routers queues the VAD trio (`UserStartedSpeaking → Transcription → UserStoppedSpeaking`) — byte-equivalent to speech: same aggregator→LLM→TTS turn, same barge-in interruption, and the existing `TranscriptForwarder` echoes the bubble to the shell (no second echo path). Validation in `tools/user_text.py` (strip · 500-char cap · silent ignore on blank/non-string); tests `tests/test_user_text.py`.
+
