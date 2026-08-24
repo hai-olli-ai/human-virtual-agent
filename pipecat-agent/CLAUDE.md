@@ -790,3 +790,14 @@ PR-6's whole footprint: **`cta_completed {}`** and **`handoff_state {state}`** h
 
 The panel's typed question (P-11's deferred half, lifted by Hai): `user_text {text}` in BOTH routers queues the VAD trio (`UserStartedSpeaking → Transcription → UserStoppedSpeaking`) — byte-equivalent to speech: same aggregator→LLM→TTS turn, same barge-in interruption, and the existing `TranscriptForwarder` echoes the bubble to the shell (no second echo path). Validation in `tools/user_text.py` (strip · 500-char cap · silent ignore on blank/non-string); tests `tests/test_user_text.py`.
 
+### S83 close (2026-08-23) — image 0.19 on staging; prod stays 0.16
+
+Hai built/pushed/deployed the #25 code as tag **0.19** (0.18 was pinned
+but never pushed — the fresh-tag law absorbed the skip; PR #26 trued
+both tomls to 0.19). The S83 agent footprint stayed exactly PR-6 +
+PR-13: two inbound message types + `user_text` — the rest of the Canvas
+Actions arc (types retired D-15, verify dismissed D-16, link-only
+checkout D-19, Stage+Dock D-20) landed with ZERO further agent changes.
+**Prod runs 0.16 until the S83 GO** (image promotion 0.16 → 0.19 rides
+it; platform-verify BOTH tiers post-deploy — the S78 D-10 lesson).
+Session record: backend `guidelines/SESSION_83_COMPLETION.md`.
