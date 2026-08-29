@@ -1,4 +1,4 @@
-"""HTTP client for fetching data from api.hv.ai."""
+"""HTTP client for fetching data from api.maika.ai."""
 
 import httpx
 from loguru import logger

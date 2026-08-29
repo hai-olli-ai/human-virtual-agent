@@ -81,7 +81,7 @@ def test_plan_drops_cached_audio_for_translated_lines():
     A line served as a translation must NOT replay cached bytes — the
     visitor would hear the wrong language. Base-text lines keep theirs."""
     audio = {
-        "url": "https://media.hv.ai/narration-cache/x.pcm",
+        "url": "https://media.maika.ai/narration-cache/x.pcm",
         "format": "pcm_s16le",
         "sample_rate": 24000,
         "duration_ms": 900,

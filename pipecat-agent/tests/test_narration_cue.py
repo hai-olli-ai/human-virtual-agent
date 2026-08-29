@@ -58,7 +58,7 @@ def test_plan_carries_animation_on_both_pipelines():
         {
             "text": "Hello",
             "animation": {
-                "url": "https://media.hv.ai/animations/video/a.mp4",
+                "url": "https://media.maika.ai/animations/video/a.mp4",
                 "duration_seconds": 4.2,
             },
         }
@@ -68,7 +68,7 @@ def test_plan_carries_animation_on_both_pipelines():
             _snapshot(lines), primary_voice_id="v1", is_relay=is_relay
         )
         assert plan[0].animation == {
-            "url": "https://media.hv.ai/animations/video/a.mp4",
+            "url": "https://media.maika.ai/animations/video/a.mp4",
             "duration_seconds": 4.2,
         }
 
